@@ -162,6 +162,7 @@ impl Middleware for Authenticate {
 ///
 /// | 状況 | 返すもの |
 /// |---|---|
+/// | セッションが無い（`StartSession` の登録し忘れ） | 500（直し方を書いたエラー） |
 /// | ログインしていない | そのまま通す |
 /// | JSON を期待している | 403 |
 /// | 転送先を指定していない | 403 |
@@ -202,6 +203,16 @@ impl Default for RedirectIfAuthenticated {
 
 impl Middleware for RedirectIfAuthenticated {
     fn handle(&self, req: Request, next: Next) -> BoxFuture {
+        // セッションが無いと、ログイン中の人も「ログインしていない」に見えて黙って通る。
+        // `Authenticate` と同じく、登録し忘れを知らせる。
+        if req.try_session().is_none() {
+            return Box::pin(async {
+                Err(Error::msg(
+                    "ログイン中かの確認にはセッションが要ります。bootstrap/app.rs で \
+                     StartSession を RedirectIfAuthenticated（guest）より前に登録してください",
+                ))
+            });
+        }
         if req.auth().guest() {
             return next.run(req);
         }
@@ -291,6 +302,26 @@ mod tests {
         }));
         let options = crate::http::response::RenderOptions::new(false, false);
         let error = Authenticate::new()
+            .handle(req, Next::new(stack, handler, options))
+            .await
+            .unwrap_err();
+        assert_eq!(error.status(), 500);
+        assert!(error.to_string().contains("StartSession"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn guestもセッションが無ければ登録し忘れを知らせる() {
+        use crate::http::handler::Erased;
+        use std::sync::Arc;
+
+        // StartSession を付け忘れると、ログイン中の人も黙って通っていた。
+        let req = Request::new("POST", "/login");
+        let stack: Arc<[Arc<dyn Middleware>]> = Arc::from(Vec::new());
+        let handler = Arc::new(Erased::<_, ()>::new(|| async {
+            Ok(crate::http::Response::text("ok"))
+        }));
+        let options = crate::http::response::RenderOptions::new(false, false);
+        let error = RedirectIfAuthenticated::new()
             .handle(req, Next::new(stack, handler, options))
             .await
             .unwrap_err();

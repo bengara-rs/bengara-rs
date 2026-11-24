@@ -23,6 +23,7 @@ bengara = { version = "0.1", features = ["sqlite", "websocket"] }
 
 - フラグが無いと、`req.websocket()` が「features に "websocket" を足してください」のエラー（500）を返します。
 - `Broadcast::publish` はフラグが無くても呼べます。定期処理だけのプロセスなどで使えます。
+  ただし接続を受ける口が無いので、`memory` で送った分はどこにも届きません（`serve` の中でも、警告を 1 回出します）。
 - 使う型は `prelude` に入っていません。`use` で取り込みます。
 
 ```rust
@@ -41,28 +42,52 @@ Route::get("/gateway", GatewayController::connect).name("gateway");
 
 ```rust
 // app/Http/Controllers/GatewayController.rs
-pub async fn connect(req: Request) -> Result<Response> {
-    // 1. 切り替える前に、普通の HTTP として確かめる。
-    let ticket = req.query("ticket").ok_or_else(|| Error::http(401, "チケットがありません"))?;
-    let user_id = consume_ticket(&ticket).await?;   // アプリの関数
+pub struct GatewayController;
 
-    // 2. 切り替える。戻り値は 101 の応答。クロージャは切り替えの後に別のタスクで動く。
-    req.websocket()?.on_upgrade(move |mut socket: WebSocket| async move {
-        socket.join(&format!("user.{user_id}"));
-        while let Some(message) = socket.recv().await {
-            match message {
-                Ok(Message::Text(text)) => { /* 受け取った文を扱う */ }
-                Ok(Message::Binary(_)) => {
-                    socket.close(1003, "テキストだけを受け付けます").await;
-                    break;
+impl GatewayController {
+    pub async fn connect(req: Request) -> Result<Response> {
+        // 1. 切り替える前に、普通の HTTP として確かめる。
+        let ticket = req.query("ticket").ok_or_else(|| Error::http(401, "チケットがありません"))?;
+        let user_id = consume_ticket(&ticket).await?;   // アプリの関数
+
+        // 2. 切り替える。戻り値は 101 の応答。クロージャは切り替えの後に別のタスクで動く。
+        req.websocket()?.on_upgrade(move |mut socket: WebSocket| async move {
+            socket.join(&format!("user.{user_id}"));
+            while let Some(message) = socket.recv().await {
+                match message {
+                    Ok(Message::Text(text)) => { /* 受け取った文を扱う */ }
+                    Ok(Message::Binary(_)) => {
+                        socket.close(1003, "テキストだけを受け付けます").await;
+                        break;
+                    }
+                    Err(_) => break,
                 }
-                Err(_) => break,
             }
-        }
-        // ここで抜けると接続は閉じ、入っていたチャンネルからも外れる
-    })
+            // ここで抜けると接続は閉じ、入っていたチャンネルからも外れる
+        })
+    }
 }
 ```
+
+> **`Origin`（接続元のページ）は bengara が確かめません。アプリで確かめてください。**
+> 切り替えは GET なので、CSRF の確認も掛かりません。確かめないと、別のサイトのページから
+> 利用者の Cookie 付きで接続されます（CSWSH: 別サイトからの WebSocket の乗っ取り）。
+
+```rust
+// 切り替える前に、Origin がアプリの URL と同じ接続先かを確かめる。
+if let Some(origin) = req.header("origin") {
+    if !same_origin(origin, &config::<AppConfig>().url) {   // アプリの関数
+        return abort_with(403, "接続元が許可されていません");
+    }
+}
+```
+
+- `same_origin` はアプリで書きます。「方式・ホスト・ポート」だけを比べます。パスは見ません。
+  ポートを省いたときは方式の既定（http は 80、https は 443）として比べます。
+- 文字列の前方一致（`starts_with`）で比べないでください。`https://example.com.evil.test` が通ります。
+- ブラウザは `Origin` を必ず付けます。付いていないのはブラウザ以外（`curl` など）からの接続です。
+  そこも断るかはアプリで決めます。**Origin だけに頼らず、認証（チケットなど）もしてください。**
+- `APP_URL` を本番の URL にしておきます。違うと、正しいページからの接続も断られます。
 
 - **認証は切り替える前にします。** ここで `Err` を返せば、普通のエラー応答（401 など）になります。
 - 切り替えの要求か知りたいだけなら、`req.wants_websocket()` を使います。
@@ -372,7 +397,7 @@ async fn 投稿すると配信される() {
 | `Broadcast::assert_nothing_published()`       | 何か記録があればパニック           |
 
 - 札を手放すと、fake は終わり、記録も空になります。
-- fake の間は `memory` にも `database` にも送りません。`disconnect` は名前を確かめるだけで、記録もしません。
+- fake の間は `memory` にも `database` にも送りません。**fake の間の `disconnect` は記録されません。** 名前を確かめるだけです（`published` にも出ません）。
 
 ## 関連
 

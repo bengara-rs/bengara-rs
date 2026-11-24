@@ -58,13 +58,17 @@ impl PostPolicy {
 use crate::app::models::{Post, User};
 use crate::app::policies::PostPolicy;
 
-pub async fn destroy(req: Request) -> Result<Response> {
-    let user = req.auth().user_or_fail::<User>().await?;   // 401
-    let post = req.model::<Post>("post").await?;           // 404
-    authorize(PostPolicy::delete(&user, &post))?;          // 403
+pub struct MyArticleController;
 
-    let removed = post.delete().await?;
-    json(&json!({ "deleted": removed }))
+impl MyArticleController {
+    pub async fn destroy(req: Request) -> Result<Response> {
+        let user = req.auth().user_or_fail::<User>().await?;   // 401
+        let post = req.model::<Post>("post").await?;           // 404
+        authorize(PostPolicy::delete(&user, &post))?;          // 403
+
+        let removed = post.delete().await?;
+        json(&json!({ "deleted": removed }))
+    }
 }
 ```
 

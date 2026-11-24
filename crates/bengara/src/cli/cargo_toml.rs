@@ -46,11 +46,16 @@ impl CargoToml {
     }
 
     /// 変わっていれば書き戻す。
+    ///
+    /// 一時ファイルに書いてから置き換えます（`kernel_impl::replace_file`）。
+    /// `std::fs::write` は切り詰めてから書くので、途中で落ちると `Cargo.toml` が
+    /// 空か途中までになり、`cargo` 自体が動かなくなります。
+    /// 改行と BOM は [`Self::to_text`] が、権限とリンクは `replace_file` が保ちます。
     pub(crate) fn save(&self, path: &Path) -> Result<bool> {
         if !self.changed {
             return Ok(false);
         }
-        std::fs::write(path, self.to_text())
+        crate::kernel_impl::replace_file(path, &self.to_text())
             .map_err(|e| Error::msg(format!("{} を書けません: {e}", path.display())))?;
         Ok(true)
     }
@@ -579,9 +584,22 @@ fn key_of(line: &str) -> Option<String> {
 }
 
 /// `key = value` の `value`。行末のコメントと引用符を外します。
+///
+/// 1 行に収まった複数行の文字列（`"""myapp"""` と `'''myapp'''`）も外します。
+/// TOML では正しい書き方で、cargo も読みます。以前は引用符を 1 組しか外さず、
+/// パッケージ名が `""myapp""` になっていました。
 fn value_of(line: &str) -> Option<String> {
     let (_, value) = line.split_once('=')?;
-    Some(unquote(strip_comment(value).trim()).to_string())
+    let value = strip_comment(value).trim();
+    for quote in ["\"\"\"", "'''"] {
+        if let Some(inner) = value
+            .strip_prefix(quote)
+            .and_then(|v| v.strip_suffix(quote))
+        {
+            return Some(inner.to_string());
+        }
+    }
+    Some(unquote(value).to_string())
 }
 
 /// 値から、引用符の外にある `#` 以降を落とす。
@@ -892,6 +910,40 @@ artisan = []
         assert_eq!(d.package_name().as_deref(), Some("myapp"));
         let d = doc("[package]\nname = \"my#app\"\n");
         assert_eq!(d.package_name().as_deref(), Some("my#app"));
+    }
+
+    #[test]
+    fn 一行の複数行文字列は引用符を全部外す() {
+        // 以前は 1 組しか外さず、`""myapp""` になっていた。
+        let d = doc("[package]\nname = \"\"\"myapp\"\"\"\n");
+        assert_eq!(d.package_name().as_deref(), Some("myapp"));
+        let d = doc("[package]\nname = '''myapp''' # 開発用\n");
+        assert_eq!(d.package_name().as_deref(), Some("myapp"));
+        // 普通の文字列は今までどおり。
+        let d = doc("[package]\nname = 'myapp'\n");
+        assert_eq!(d.package_name().as_deref(), Some("myapp"));
+    }
+
+    #[test]
+    fn 書き戻すときは一時ファイルから置き換える() {
+        // 以前は `std::fs::write` で、途中で落ちると Cargo.toml が壊れた。
+        let dir = std::env::temp_dir().join(format!("bengara-cargo-toml-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("Cargo.toml");
+        std::fs::write(&path, "\u{feff}[package]\r\nname = \"myapp\"\r\n").unwrap();
+
+        let mut manifest = CargoToml::load(&path).unwrap();
+        manifest.add_line("package", "edition = \"2021\"");
+        assert!(manifest.save(&path).unwrap());
+        // BOM と改行は保つ。一時ファイルは残らない。
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "\u{feff}[package]\r\nname = \"myapp\"\r\nedition = \"2021\"\r\n"
+        );
+        let names: Vec<_> = std::fs::read_dir(&dir).unwrap().flatten().collect();
+        assert_eq!(names.len(), 1, "{names:?}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

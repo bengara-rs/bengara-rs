@@ -189,8 +189,10 @@ impl Throttle {
             bucket.resets_at = now + self.window;
         }
         if bucket.count >= self.max {
-            let wait = bucket.resets_at.saturating_duration_since(now).as_secs() + 1;
-            return Err(wait);
+            // 秒に切り上げる。`as_secs() + 1` だと、ちょうど 60 秒のときに 61 を返す。
+            let left = bucket.resets_at.saturating_duration_since(now);
+            let wait = left.as_secs() + u64::from(left.subsec_nanos() > 0);
+            return Err(wait.max(1));
         }
         bucket.count += 1;
         Ok(self.max - bucket.count)
@@ -598,7 +600,27 @@ mod tests {
         let now = Instant::now();
         let _ = throttle.hit("a", now);
         let wait = throttle.hit("a", now).unwrap_err();
-        assert!((1..=61).contains(&wait), "待ち時間は {wait} 秒");
+        assert!((1..=60).contains(&wait), "待ち時間は {wait} 秒");
+    }
+
+    #[test]
+    fn 待ち時間はちょうどなら足さず端数は切り上げる() {
+        let throttle = Throttle::new(1, Duration::from_secs(60));
+        let now = Instant::now();
+        let _ = throttle.hit("a", now);
+        assert_eq!(
+            throttle.hit("a", now),
+            Err(60),
+            "ちょうど 60 秒なら 61 にしない"
+        );
+        let later = now + Duration::from_millis(500);
+        assert_eq!(
+            throttle.hit("a", later),
+            Err(60),
+            "59.5 秒は 60 に切り上げる"
+        );
+        let last = now + Duration::from_millis(59_999);
+        assert_eq!(throttle.hit("a", last), Err(1), "1 秒未満でも 0 にしない");
     }
 
     #[test]

@@ -112,7 +112,9 @@ Laravel の `->where('views', '>', 100)` は `where_op("views", ">", 100)` で�
 - `>` などで NULL と比べると必ず 0 件です。`where_null` を使います。
 - `where_in` に空の一覧を渡すと 0 件です。渡せるのは 30,000 件までです。
 - `where_group` の中では、条件だけが使われます。
-- `where_raw` の `?` は値の置き場所です。文字列の中の `?` も数えます。
+- `where_raw` の `?` は値の置き場所です。文字列（`'...'`）と引用した名前（`"..."`・`` `...` ``）の中の `?` は数えません。
+- PostgreSQL の JSONB の演算子 `?` `?|` `?&` も値の置き場所として数えます。`jsonb_exists(列, 'キー')` のような関数で書きます。
+- MySQL の `\'` の逃がしは見ません。文字列の中の `'` は `''` と重ねて書きます。
 - 列には、モデルの型付きの列（`Post::TITLE`）も渡せます。値の型をコンパイルのときに確かめます（[models.md](models.md)
   の「型付きの列」）。
 
@@ -303,7 +305,7 @@ let affected = DB::statement("update posts set views = views + 1", &[]).await?;
 | `DB::select(sql, &[値])`    | `Vec<Row>`                                                         |
 | `DB::statement(sql, &[値])` | `Affected`（`rows` は変わった行の数、`last_insert_id` は採番の値） |
 
-- 値の置き場所は、どのドライバでも `?` です。数が合わないとエラーです。
+- 値の置き場所は、どのドライバでも `?` です。数が合わないとエラーです。数え方は `where_raw` と同じです（文字列の中の `?` は数えない）。
 - トランザクションの中では `tx.select(...)` / `tx.statement(...)` です。
 - PostgreSQL で `?` を 1 つも書かないときは、`$1` を直に書けます。
 - 組み立てた SQL は `.to_sql()` で見られます（`DB::table("posts").where_("id", 1).to_sql()`）。接続はしません。

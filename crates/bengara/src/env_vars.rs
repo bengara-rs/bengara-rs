@@ -107,7 +107,7 @@ pub(crate) fn load_dotenv(base: &Path) -> (Option<std::path::PathBuf>, Vec<Strin
             .filter(|value| !value.trim().is_empty())
     };
     let (pairs, warnings) = parse_dotenv(text, &real);
-    for (key, value) in pairs {
+    for (key, value) in first_wins(pairs) {
         if is_unset(std::env::var_os(&key).as_deref()) {
             // SAFETY: 起動直後、スレッドを作る前に1回だけ呼ぶ。
             // edition 2021 では set_var は安全な関数なので unsafe は余る。
@@ -118,6 +118,20 @@ pub(crate) fn load_dotenv(base: &Path) -> (Option<std::path::PathBuf>, Vec<Strin
         }
     }
     (Some(path), warnings)
+}
+
+/// 同じキーが 2 回以上あれば、先の行だけを残す。
+///
+/// **先の行が空でも先の行が勝ちます。** 環境変数を見て「未設定なら入れる」だけに
+/// すると、`APP_KEY=` の次に `APP_KEY=abc` がある `.env` で、1 行目が空を入れ、
+/// 2 行目が「空は未設定」と見て `abc` で上書きしていました。`${VAR}` の展開と
+/// `key:generate`（最初の `APP_KEY` の行を見る）は先の行を採るので、食い違います。
+fn first_wins(pairs: Vec<(String, String)>) -> Vec<(String, String)> {
+    let mut seen = std::collections::HashSet::new();
+    pairs
+        .into_iter()
+        .filter(|(key, _)| seen.insert(key.clone()))
+        .collect()
 }
 
 /// 実際の環境変数が「未設定」かどうか。無いか、空白だけなら未設定。
@@ -558,6 +572,19 @@ mod tests {
         assert_eq!(dotenv_value("\"\""), "");
         assert_eq!(dotenv_value(" # 後で"), "");
         assert_eq!(dotenv_value("abc # コメント"), "abc");
+    }
+
+    #[test]
+    fn 同じキーは先の行が空でも先の行が勝つ() {
+        // 以前は 1 行目が空を入れ、2 行目が「空は未設定」と見て上書きしていた。
+        let v = first_wins(pairs("APP_KEY=\nA=1\nAPP_KEY=abc\nA=2\n"));
+        assert_eq!(
+            v,
+            vec![
+                ("APP_KEY".to_string(), String::new()),
+                ("A".to_string(), "1".to_string()),
+            ]
+        );
     }
 
     #[test]

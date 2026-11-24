@@ -325,6 +325,12 @@ impl Redirect {
     ///
     /// 空白と ASCII 以外の文字は `%XX` にしてから入れます（`/記事 1` → `/%E8%A8%98%E4%BA%8B%201`）。
     /// すでに `%XX` になっている所は二重にしません。
+    ///
+    /// **行き先は確かめません。** `//evil.com` や `https://evil.com` もそのまま
+    /// `Location` に入ります（Laravel の `redirect()->to()` と同じ）。`?next=` のような
+    /// 利用者の入力をそのまま渡すと、他のサイトへ飛ばす踏み台になります（開いたリダイレクト）。
+    /// 外から来た値を使うときは、内部のパスか（`/` で始まる・`//` で始まらない・
+    /// `\` を含まない）確かめてから渡してください。
     pub fn to(self, path: impl Into<String>) -> Result<Response> {
         if !is_redirect_status(self.status) {
             return Err(Error::msg(format!(

@@ -558,11 +558,12 @@ impl WebSocketUpgrade {
     ///
     /// 相手が申し出た順に見て、ここに並べたものと最初に一致したものを選びます。
     /// 一致しなければ選びません（ヘッダーを返しません）。
-    pub fn protocols(mut self, offered: &[&str]) -> Self {
+    pub fn protocols(mut self, supported: &[&str]) -> Self {
+        // `self.offered` が相手の申し出、`supported` がこちらの受け付けるもの。
         self.protocol = self
             .offered
             .iter()
-            .find(|wanted| offered.iter().any(|ours| ours == wanted))
+            .find(|wanted| supported.iter().any(|ours| ours == wanted))
             .cloned();
         self
     }

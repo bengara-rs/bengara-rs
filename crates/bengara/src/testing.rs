@@ -594,6 +594,9 @@ impl Drop for ExclusiveGuard {
         // `Broadcast::fake()` はこの札の間だけ効く。手放すときに終えて、記録も空にする。
         // 残すと、後から走るテストの publish が黙って記録に吸われる。
         crate::broadcast::reset_fake();
+        // 溜まったメールも空にする（配信の記録とそろえる）。残すと、`clear_sent` を
+        // 書き忘れた次のテストが、前のテストのメールを見てしまう。
+        crate::mail::Mail::clear_sent();
         HOLDS_EXCLUSIVE.set(false);
     }
 }
@@ -603,6 +606,9 @@ impl Drop for ExclusiveGuard {
 /// `Mail::sent()` / `Mail::clear_sent()` と `Lang` はプロセス共通なので、
 /// 並列に走ると互いに干渉します。`tests/Feature` は 1 つのバイナリで
 /// 並列に走るので、**触るテストはこの札を取ってください。**
+///
+/// 札を手放すと、`Broadcast::fake()` は終わって記録が空になり、
+/// `Mail::sent()` も空になります。
 ///
 /// ```ignore
 /// #[bengara::test]
@@ -655,6 +661,25 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn 札を手放すと溜まったメールも空になる() {
+        use crate::mail::{ArrayMailer, Mail, Mailer as _};
+        {
+            let _lock = exclusive().await;
+            Mail::clear_sent();
+            let message = Mail::to("a@example.com")
+                .subject("件名")
+                .text("本文")
+                .message()
+                .clone();
+            ArrayMailer.send(&message).unwrap();
+            assert_eq!(Mail::sent().len(), 1);
+        }
+        // 配信の fake と同じく、残さない。以前は次のテストに持ち越していた。
+        let _lock = exclusive().await;
+        assert!(Mail::sent().is_empty());
+    }
 
     #[test]
     fn 期限切れのクッキーを見分ける() {

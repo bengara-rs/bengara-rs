@@ -1250,6 +1250,7 @@ mod tests {
         assert_eq!(defs[0].path, "/posts");
         assert_eq!(defs[0].middleware, vec!["auth".to_string()]);
     }
+
     #[test]
     fn パス引数はパーセントデコードされる() {
         let defs = collect(|| {

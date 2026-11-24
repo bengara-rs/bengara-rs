@@ -73,8 +73,6 @@
 | `schedule:list` | 定期処理の一覧                 | [scheduling.md](scheduling.md)     |
 | `lang:list`     | 読み込まれている言語の一覧     | [localization.md](localization.md) |
 
--
-
 データベースとキューのコマンドには、データベースの機能フラグが要ります（[configuration.md](configuration.md#機能フラグ)）。
 
 - `app/Console/Commands/` に置いた自分のコマンドも、同じ一覧に並びます（[console-commands.md](console-commands.md)）。
@@ -105,7 +103,7 @@ $ cargo artisan cache:clear --tries=9
 
 | `queue:work` の指定 | 既定      | 意味                                                       |
 |---------------------|-----------|------------------------------------------------------------|
-| `--queue=名前`      | `default` | 処理するキュー                                             |
+| `--queue=名前`      | `default` | 処理するキュー。空の名前（`--queue=`）は断る               |
 | `--tries=3`         | 3         | 諦めるまでに試す回数（1 以上）                             |
 | `--sleep=1`         | 1         | ジョブが無いときに待つ秒数                                 |
 | `--timeout=60`      | 60        | 1 件のジョブを待つ上限の秒数。`0` は無制限（起動時に警告） |
@@ -155,6 +153,7 @@ $ cargo artisan cache:clear --tries=9
 ```sh
 cargo artisan serve
 cargo artisan serve --host 0.0.0.0 --port 8124
+cargo artisan --port 8124          # serve を省いた形。見張りもする
 ```
 
 ホストとポートの既定は、`.env` の `APP_HOST`（`127.0.0.1`）と `APP_PORT`（`8000`）です。
@@ -203,9 +202,13 @@ cargo artisan serve --host 0.0.0.0 --port 8124
 
 Ctrl+C で止めます。
 
-- **`serve` は本体をすぐに止めます。** 処理中のリクエストは待ちません。
-- 待ってから止まる動き（`APP_SHUTDOWN_TIMEOUT`）を確かめるときは、`cargo run -- serve`
-  で動かします（[deployment.md](deployment.md#止める)）。
+| 場面                  | 本体の止まり方                                                                                                |
+|-----------------------|---------------------------------------------------------------------------------------------------------------|
+| Ctrl+C                | 本体にも届き、処理中のリクエストを待って止まる（上限は `APP_SHUTDOWN_TIMEOUT`）。`serve` はそれを待って終わる |
+| 待っている間の Ctrl+C | **本体をすぐに止める。** 処理中のリクエストは待たない                                                         |
+| 変更して作り直すとき  | **前の本体をすぐに止める。** 処理中のリクエストは待たない                                                     |
+
+- 待ってから止まる動きは [deployment.md](deployment.md#止める) にあります。
 - `serve` を強制終了したとき（`kill -9`、タスクマネージャ）は、本体が残ります。手で止めてください。
 
 ## 関連

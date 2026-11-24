@@ -53,9 +53,13 @@ bengara = { version = "0.1", features = ["sqlite", "view"] }
 use bengara::prelude::*;
 use bengara::serde_json::json;
 
-pub async fn index(req: Request) -> Result<Response> {
-    let posts = Post::query().latest().get().await?;
-    req.view("posts.index", json!({ "posts": posts }))
+pub struct PostController;
+
+impl PostController {
+    pub async fn index(req: Request) -> Result<Response> {
+        let posts = Post::query().latest().get().await?;
+        req.view("posts.index", json!({ "posts": posts }))
+    }
 }
 ```
 

@@ -167,12 +167,17 @@ const TEMP_STALE_SECS: u64 = 300;
 /// プロセスを2つ以上動かすときは、全プロセスで同じ場所を指してください。
 pub struct FileCache {
     dir: PathBuf,
+    /// 置き場所の権限を直したか。直すのはプロセスで 1 回だけです。
+    restricted: std::sync::Once,
 }
 
 impl FileCache {
     /// 置き場所を決めて作る。
     pub fn new(dir: impl Into<PathBuf>) -> Self {
-        Self { dir: dir.into() }
+        Self {
+            dir: dir.into(),
+            restricted: std::sync::Once::new(),
+        }
     }
 
     /// `storage/framework/cache/` に置く（既定）。
@@ -214,6 +219,10 @@ impl FileCache {
 
     fn ensure_dir(&self) -> Result<()> {
         if self.dir.is_dir() {
+            // 既にあるときも権限を直す（セッションの置き場所と同じ）。tar の展開などで
+            // 0755 のまま置かれると、ファイルの名前＝鍵を一覧できてしまいます。
+            // 書き込みごとに直す意味は無いので、1回だけにします。
+            self.restricted.call_once(|| restrict_dir(&self.dir));
             return Ok(());
         }
         // storage/ そのものが無いなら、作らずに知らせる（決定記録 #023）。
@@ -248,15 +257,28 @@ fn create_dir_restricted(dir: &Path) -> Result<()> {
     Ok(())
 }
 
+/// 既にある置き場所を、所有者だけが入れるようにする（Unix のみ）。
+///
+/// 失敗しても止めません。権限を変えられない置き場所（共有ディスクなど）もあります。
+/// セッションの置き場所（`session/store.rs`）と同じ扱いです。
+fn restrict_dir(dir: &Path) {
+    if let Err(e) = crate::ops::restrict(dir) {
+        tracing::warn!("{} の権限を変えられませんでした: {e}", dir.display());
+    }
+}
+
 impl CacheStore for FileCache {
     fn put(&self, key: &str, value: &str, seconds: Option<u64>) -> Result<()> {
         self.ensure_dir()?;
         let path = self.path_of(key);
         // 書いている途中の中身を読まれないよう、別の名前で書いてから置き換える。
         let temp = self.temp_path_of(key);
+        // 中身は所有者だけが読めるようにする（Unix で 0600。セッションと同じ）。
+        // キャッシュには利用者の情報が入ることがあり、umask まかせだと
+        // ほかの利用者にも読めてしまいます。
         // Windows の「使用中」のやり直しと、失敗時の片付けは `write_atomic` が持ちます。
         let body = Entry::encode(value, seconds);
-        write_atomic(&temp, &path, body.as_bytes(), Access::Default)?;
+        write_atomic(&temp, &path, body.as_bytes(), Access::Private)?;
         Ok(())
     }
 
@@ -749,6 +771,29 @@ mod tests {
             }
         }
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn 書いた中身と既にある置き場所は所有者だけに絞る() {
+        let dir = temp_dir("private-put");
+        std::fs::create_dir_all(&dir).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            // tar の展開などで、ほかの利用者も入れる権限のまま置かれた形。
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let store = FileCache::new(&dir);
+        store.put("secret", "値", None).unwrap();
+        assert_eq!(store.get("secret").unwrap().as_deref(), Some("値"));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = |path: &Path| std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode(&dir.join("secret")), 0o600, "中身は 0600");
+            assert_eq!(mode(&dir), 0o700, "既にある置き場所も 0700 に直す");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

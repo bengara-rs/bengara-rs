@@ -117,7 +117,6 @@ jobs:
         with:
           path: bengara
       - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
       - name: cargo new してフレームワークを手元のソースに差し替える
         shell: bash
         run: |
@@ -131,6 +130,11 @@ jobs:
           printf 'bengara-build = { path = "../bengara/crates/bengara-build" }\n' >> Cargo.toml
           printf 'bengara-macros = { path = "../bengara/crates/bengara-macros" }\n' >> Cargo.toml
           printf 'fn main() { bengara::run() }\n' > src/main.rs
+      # ルートに Cargo.toml が無いので、ビルドする myapp を指す。
+      # myapp を作った後に置く（無い場所では、キャッシュの鍵を作れない）。
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: myapp -> target
       - name: init してビルドとテスト
         shell: bash
         working-directory: myapp

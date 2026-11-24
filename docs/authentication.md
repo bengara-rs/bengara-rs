@@ -235,6 +235,8 @@ Route::post("/register", AuthController::register)
 
 - `prelude` には入っていません。`bengara::auth` から `use` します。
 - 転送先を決めないと 403 です（Laravel と違います）。
+- `StartSession` を登録していないと、`Authenticate` と同じく 500 を返し、直し方をログに出します。
+  黙って通すと、ログイン中の人も「ログインしていない」に見えるためです。
 - `Throttle` はログイン中の人を ID で数えます。登録し直すたびに新しい枠ができるので、`guest` で止めるか `by_ip()` で数えます。
 
 ## パスワードの再設定

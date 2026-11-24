@@ -16,11 +16,15 @@
 //!   アプリを動かすだけで、テストは走らせないためです。テストを足したときは
 //!   `cargo test` を実行してください。`build.rs` は `tests/` も見張っているので、
 //!   そちらでは自動で見つかります。
-//! - **`serve` は本体を即座に止めます。** `APP_SHUTDOWN_TIMEOUT` の猶予を確かめたいときは、
-//!   `serve` を使わずに本体を直接動かしてください（`cargo run -- serve`）。
+//! - **作り直すときは、前の本体を即座に止めます**（処理中のリクエストは待ちません）。
+//! - **Ctrl+C では、本体が自分で止まるのを待ってから終わります。** Ctrl+C は本体にも
+//!   届くので、本体は `APP_SHUTDOWN_TIMEOUT` の猶予のとおりに止まります。待っている間に
+//!   もう一度 Ctrl+C を押すと、即座に止めます。以前は `artisan` が先に終わり、
+//!   本体が親の無いまま止まる途中で残っていました（[`watch_interrupts`]）。
 
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, SystemTime};
 
 use super::cargo_command;
@@ -93,10 +97,11 @@ pub(crate) fn run(root: &Path, args: &[String]) -> Result<()> {
     // （`RunDir`）。`storage/` には置かない。
     let mut run_dir = RunDir::new(startup_prefix(&name));
 
+    watch_interrupts();
     println!("bengara serve: {name} を見張ります（Ctrl+C で終了）");
     println!(
-        "serve は本体を即座に止めます。停止の猶予（APP_SHUTDOWN_TIMEOUT）を確かめるときは、\n\
-         本体を直接動かしてください。\n"
+        "作り直すときは、前の本体を即座に止めます。Ctrl+C では本体が止まるのを待ちます\n\
+         （停止の猶予は APP_SHUTDOWN_TIMEOUT。もう一度 Ctrl+C を押すと即座に止めます）。\n"
     );
 
     let mut generation: u32 = 0;
@@ -125,8 +130,11 @@ pub(crate) fn run(root: &Path, args: &[String]) -> Result<()> {
         }
     }
 
-    loop {
+    while !interrupted() {
         std::thread::sleep(POLL);
+        if interrupted() {
+            break;
+        }
 
         // 本体が自分で終わっていたら知らせる（ポートが使われているときなど）。
         if let Some(running) = child.as_mut() {
@@ -151,10 +159,13 @@ pub(crate) fn run(root: &Path, args: &[String]) -> Result<()> {
         loop {
             std::thread::sleep(SETTLE);
             let again = snapshot(root);
-            if again == current {
+            if again == current || interrupted() {
                 break;
             }
             current = again;
+        }
+        if interrupted() {
+            break;
         }
         watched = current;
 
@@ -162,6 +173,10 @@ pub(crate) fn run(root: &Path, args: &[String]) -> Result<()> {
         let built = build(root, &bin);
         // 失敗したビルドも `Cargo.lock` を書き換えることがあるので、結果を見る前に取り直す。
         watched.accept_lock(root);
+        // ビルド中の Ctrl+C は cargo も止める。新しい版は起動せずに終わる。
+        if interrupted() {
+            break;
+        }
         match built {
             Ok(exe) => {
                 stop(&mut child);
@@ -190,6 +205,63 @@ pub(crate) fn run(root: &Path, args: &[String]) -> Result<()> {
                 }
             }
         }
+    }
+
+    // Ctrl+C を受け取った。本体が止まるのを待ってから、自分のコピーを片付けて終わる。
+    if let Some(running) = child.as_mut() {
+        if running.finished().is_none() {
+            println!("\n本体が止まるのを待っています（もう一度 Ctrl+C を押すと即座に止めます）…");
+            wait_for_exit(running, || INTERRUPTS.load(Ordering::SeqCst) >= 2);
+        }
+    }
+    stop(&mut child);
+    if let Some(dir) = run_dir.current() {
+        clean_old_copies(dir, |file| file.starts_with(&prefix));
+    }
+    println!("bengara serve を終了しました。");
+    Ok(())
+}
+
+/// Ctrl+C を受け取った回数。
+static INTERRUPTS: AtomicUsize = AtomicUsize::new(0);
+
+/// Ctrl+C を受け取ったか。
+fn interrupted() -> bool {
+    INTERRUPTS.load(Ordering::SeqCst) > 0
+}
+
+/// Ctrl+C を数える。**数え始めると、Ctrl+C で `artisan` は即座には終わらなくなります。**
+///
+/// Ctrl+C は端末（Windows ではコンソール）越しに、`artisan` と本体の両方に届きます。
+/// 何もしないと `artisan` は即座に終わり、`Drop`（[`Running`]）も走りません。
+/// 本体は猶予（`APP_SHUTDOWN_TIMEOUT`）のとおりに止まる途中で、親を失っていました。
+/// 数えるようにして、見張りの輪を抜けて本体を待つ（[`wait_for_exit`]）ようにします。
+///
+/// 依存を足さないため、本体のサーバーでも使っている tokio の `ctrl_c` を、
+/// 小さな実行環境で待ちます。数え始められなかったときは、今までどおり
+/// Ctrl+C で即座に終わります。
+fn watch_interrupts() {
+    std::thread::spawn(|| {
+        let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+        else {
+            return;
+        };
+        runtime.block_on(async {
+            while tokio::signal::ctrl_c().await.is_ok() {
+                INTERRUPTS.fetch_add(1, Ordering::SeqCst);
+            }
+        });
+    });
+}
+
+/// 本体が自分で終わるまで待つ。`give_up` が真になったら待つのをやめる。
+///
+/// 止めるのは呼び出し側です（[`stop`]。まだ動いていれば即座に止めます）。
+fn wait_for_exit(running: &mut Running, give_up: impl Fn() -> bool) {
+    while running.finished().is_none() && !give_up() {
+        std::thread::sleep(Duration::from_millis(100));
     }
 }
 
@@ -387,7 +459,8 @@ fn start(
 /// 「address in use」で落ち、古いビルドが動いたままになります。
 ///
 /// **届かない場合**: `artisan` を `kill -9`（Windows なら強制終了）したときは
-/// `Drop` も走りません。Ctrl+C はコンソール越しに子にも届くので、普通はそちらで止まります。
+/// `Drop` も走りません。Ctrl+C は `artisan` が受け取り、本体が止まるのを待ちます
+/// （[`watch_interrupts`]）。
 struct Running(Child);
 
 impl Running {
@@ -399,7 +472,7 @@ impl Running {
 
 impl Drop for Running {
     /// **即座に止めます**（SIGKILL / TerminateProcess）。処理中のリクエストは待ちません。
-    /// `APP_SHUTDOWN_TIMEOUT` の猶予を確かめたいときは、本体を直接動かしてください。
+    /// 猶予を守って止めたいときは、先に [`wait_for_exit`] で待ちます（Ctrl+C のとき）。
     fn drop(&mut self) {
         // すでに終わっていれば何もしない（終了コードを拾い終えている）。
         if matches!(self.0.try_wait(), Ok(Some(_))) {
@@ -510,7 +583,19 @@ impl Snapshot {
     }
 }
 
-/// 見張る対象をひとまわり見て、数と最大の更新時刻を数える。
+/// 見張る対象をひとまわり見て、[`Snapshot`] を作る。
+///
+/// 数えるのは次の 4 つです。
+///
+/// | 欄       | 中身                                      | 見つかる変更        |
+/// |----------|-------------------------------------------|---------------------|
+/// | `count`  | 見張っているファイルの数                  | 追加と削除          |
+/// | `latest` | 更新時刻のうち、いちばん新しいもの        | 中身の変更          |
+/// | `paths`  | パスのハッシュの和（順番に関係しない）    | 名前の変更と移動    |
+/// | `lock`   | `Cargo.lock` の更新時刻（ほかと別に持つ） | `cargo update` など |
+///
+/// `Cargo.lock` を別に持つのは、ビルドそのものが書き換えるためです
+/// （[`LOCK_FILE`] と [`Snapshot::accept_lock`]）。
 fn snapshot(root: &Path) -> Snapshot {
     let mut snapshot = Snapshot::default();
     for dir in WATCH_DIRS {
@@ -896,6 +981,29 @@ mod tests {
         let spawned = command.spawn().expect("子プロセスを起動できません");
         let mut running = Running(spawned);
         let _ = running.0.wait();
+        drop(running);
+    }
+
+    #[test]
+    fn ctrl_cでは本体が自分で終わるのを待つ() {
+        // 以前は Ctrl+C で `artisan` が先に終わり、本体が親の無いまま残っていた。
+        let mut command = Command::new(if cfg!(windows) { "cmd" } else { "true" });
+        if cfg!(windows) {
+            command.args(["/C", "exit 3"]);
+        }
+        let mut running = Running(command.spawn().expect("子プロセスを起動できません"));
+        wait_for_exit(&mut running, || false);
+        assert!(running.finished().is_some(), "終わるまで待っていない");
+
+        // もう一度 Ctrl+C を押した形（`give_up` が真）。待たずに戻り、手放すと止まる。
+        let mut running = Running(sleeper().spawn().expect("子プロセスを起動できません"));
+        let started = std::time::Instant::now();
+        wait_for_exit(&mut running, || true);
+        assert!(started.elapsed() < Duration::from_secs(5));
+        assert!(
+            running.finished().is_none(),
+            "眠っている本体はまだ動いている"
+        );
         drop(running);
     }
 

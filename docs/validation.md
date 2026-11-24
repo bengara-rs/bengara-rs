@@ -75,12 +75,17 @@ impl FormRequest for StorePost {
 ```
 
 ```rust
-// コントローラ
+// app/Http/Controllers/PostController.rs
+use bengara::prelude::*;
 use crate::app::http::requests::StorePost;
 
-pub async fn store(req: Request) -> Result<Response> {
-    let input: StorePost = req.validate_as()?;
-    // input.title, input.age ...
+pub struct PostController;
+
+impl PostController {
+    pub async fn store(req: Request) -> Result<Response> {
+        let input: StorePost = req.validate_as()?;
+        // input.title, input.age ...
+    }
 }
 ```
 
@@ -171,8 +176,11 @@ pub async fn store(req: Request) -> Result<Response> {
 | `url`        | `http://` か `https://` で始まり、直後にホストがある。空白を含まない      |
 | `alpha` など | 「文字」かどうかを見る。**ひらがな・漢字も通る**（Laravel と同じ）        |
 | `confirmed`  | `項目名_confirmation` と同じか（`password` なら `password_confirmation`） |
-| `date`       | `YYYY-MM-DD` か `YYYY-MM-DD HH:MM:SS`（`Carbon::parse` が読める形）       |
+| `date`       | `YYYY-MM-DD` か `YYYY-MM-DD HH:MM(:SS)`（`Carbon::parse` が読める形）     |
 
+- `boolean` は Laravel より広く、`on` `off` `yes` `no` も通します（Laravel は `1` `0` と JSON の `true` `false` だけ。文字列の `"true"` も落とす）。
+  大文字小文字は区別します（`TRUE` は落ちる）。
+- `date` の秒は省けます（`2026-11-20 09:30` は 09:30:00）。
 - `date` は Laravel より狭く、`2026/11/20`・`2026-1-5`・`+09:00` などの時差付きは落とします。
 - 区切りの `T`・末尾の `Z`・小数の秒は通ります。
 - 英数字だけに限りたいときは、自分で確かめます。

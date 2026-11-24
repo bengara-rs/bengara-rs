@@ -27,6 +27,7 @@
 //! 資格情報を黙って書き換えてしまいます。`password` の `min:8` / `max:72` は、
 //! 前後の空白も数えた長さで測ります。これも Laravel と同じです。
 
+use std::cmp::Ordering;
 use std::collections::BTreeMap;
 
 use crate::error::{Error, Result};
@@ -224,9 +225,9 @@ enum Rule {
     Alpha,
     AlphaNum,
     AlphaDash,
-    Min(f64),
-    Max(f64),
-    Between(f64, f64),
+    Min(Bound),
+    Max(Bound),
+    Between(Bound, Bound),
     Size(usize),
     In(Vec<String>),
     Confirmed,
@@ -255,12 +256,10 @@ impl Rule {
         // 読めるので、素のままだと `max:nan` が通り、比較が全部 false になって
         // **何も検査しなくなります**（`max:255` が黙って無制限になる形）。
         // 規則の書き間違いなので、引数忘れと同じ扱いで 500 にします。
-        let number = |what: &str| -> Result<f64> {
-            arg.and_then(|a| a.parse::<f64>().ok())
-                .filter(|n| n.is_finite())
-                .ok_or_else(|| {
-                    Error::msg(format!("規則 `{what}` には数値が要ります（例: {what}:10）"))
-                })
+        let number = |what: &str| -> Result<Bound> {
+            arg.and_then(Bound::parse).ok_or_else(|| {
+                Error::msg(format!("規則 `{what}` には数値が要ります（例: {what}:10）"))
+            })
         };
         let text = |what: &str| -> Result<String> {
             arg.map(str::to_string)
@@ -288,13 +287,14 @@ impl Rule {
             // `usize::MAX` に化けます。書き間違いを黙って通さないよう、
             // 0 以上の整数であることを確かめます（引数忘れと同じ扱いで 500）。
             "size" => {
-                let n = number("size")?;
-                if !(n.is_finite() && n >= 0.0 && n.fract() == 0.0 && n <= usize::MAX as f64) {
-                    return Err(Error::msg(
-                        "規則 `size` には 0 以上の整数が要ります（例: size:10）",
-                    ));
-                }
-                Rule::Size(n as usize)
+                // `f64` を通さずに整数で読みます（2^53 を超える数で下の桁を落とさない）。
+                let n = number("size")?
+                    .int
+                    .and_then(|n| usize::try_from(n).ok())
+                    .ok_or_else(|| {
+                        Error::msg("規則 `size` には 0 以上の整数が要ります（例: size:10）")
+                    })?;
+                Rule::Size(n)
             }
             "between" => {
                 let raw = text("between")?;
@@ -302,19 +302,15 @@ impl Rule {
                     Error::msg("規則 `between` は between:1,10 の形で書いてください")
                 })?;
                 // 2 つの引数も `min` / `max` と同じで、有限の数だけを通します。
-                let lo = lo
-                    .trim()
-                    .parse::<f64>()
-                    .ok()
-                    .filter(|n| n.is_finite())
+                let lo = Bound::parse(lo.trim())
                     .ok_or_else(|| Error::msg("規則 `between` の下限が数値ではありません"))?;
-                let hi = hi
-                    .trim()
-                    .parse::<f64>()
-                    .ok()
-                    .filter(|n| n.is_finite())
+                let hi = Bound::parse(hi.trim())
                     .ok_or_else(|| Error::msg("規則 `between` の上限が数値ではありません"))?;
-                if lo > hi {
+                let reversed = match (lo.int, hi.int) {
+                    (Some(lo), Some(hi)) => lo > hi,
+                    _ => lo.num > hi.num,
+                };
+                if reversed {
                     return Err(Error::msg("規則 `between` の下限が上限より大きいです"));
                 }
                 Rule::Between(lo, hi)
@@ -1022,54 +1018,42 @@ fn check(
         // `numeric` か `integer` が付いているときだけ値そのもの、
         // そうでなければ文字数で比べる（Laravel と同じ考え方）。
         Rule::Min(min) => match measure(value, rules) {
-            Measure::Number(n) if n < *min => {
-                errors.add(
-                    field,
-                    format!("{field} は {} 以上にしてください。", trim_num(*min)),
-                );
+            m if m.value_cmp(min) == Some(Ordering::Less) => {
+                errors.add(field, format!("{field} は {min} 以上にしてください。"));
             }
-            Measure::Length(len) if (len as f64) < *min => {
+            Measure::Length(len) if (len as f64) < min.num => {
                 errors.add(
                     field,
-                    format!("{field} は {} 文字以上で入力してください。", trim_num(*min)),
+                    format!("{field} は {min} 文字以上で入力してください。"),
                 );
             }
             _ => {}
         },
         Rule::Max(max) => match measure(value, rules) {
-            Measure::Number(n) if n > *max => {
-                errors.add(
-                    field,
-                    format!("{field} は {} 以下にしてください。", trim_num(*max)),
-                );
+            m if m.value_cmp(max) == Some(Ordering::Greater) => {
+                errors.add(field, format!("{field} は {max} 以下にしてください。"));
             }
-            Measure::Length(len) if (len as f64) > *max => {
+            Measure::Length(len) if (len as f64) > max.num => {
                 errors.add(
                     field,
-                    format!("{field} は {} 文字以内で入力してください。", trim_num(*max)),
+                    format!("{field} は {max} 文字以内で入力してください。"),
                 );
             }
             _ => {}
         },
         Rule::Between(lo, hi) => match measure(value, rules) {
-            Measure::Number(n) if n < *lo || n > *hi => {
+            m if m.value_cmp(lo) == Some(Ordering::Less)
+                || m.value_cmp(hi) == Some(Ordering::Greater) =>
+            {
                 errors.add(
                     field,
-                    format!(
-                        "{field} は {} から {} の間にしてください。",
-                        trim_num(*lo),
-                        trim_num(*hi)
-                    ),
+                    format!("{field} は {lo} から {hi} の間にしてください。"),
                 );
             }
-            Measure::Length(len) if (len as f64) < *lo || (len as f64) > *hi => {
+            Measure::Length(len) if (len as f64) < lo.num || (len as f64) > hi.num => {
                 errors.add(
                     field,
-                    format!(
-                        "{field} は {} 文字から {} 文字で入力してください。",
-                        trim_num(*lo),
-                        trim_num(*hi)
-                    ),
+                    format!("{field} は {lo} 文字から {hi} 文字で入力してください。"),
                 );
             }
             _ => {}
@@ -1079,6 +1063,9 @@ fn check(
         // 数値として読めない値のときは何も言いません（`integer` が言います）。
         Rule::Size(size) => match measure(value, rules) {
             Measure::Number(n) if n != *size as f64 => {
+                errors.add(field, format!("{field} は {size} にしてください。"));
+            }
+            Measure::Integer(n) if i128::from(n) != *size as i128 => {
                 errors.add(field, format!("{field} は {size} にしてください。"));
             }
             Measure::Length(len) if len != *size => {
@@ -1134,7 +1121,7 @@ fn check(
                 errors.add(
                     field,
                     format!(
-                        "{field} は日付（YYYY-MM-DD か YYYY-MM-DD HH:MM:SS）で入力してください。"
+                        "{field} は日付（YYYY-MM-DD か YYYY-MM-DD HH:MM(:SS)）で入力してください。"
                     ),
                 );
             }
@@ -1143,9 +1130,15 @@ fn check(
 }
 
 /// `min` / `max` / `between` が何と比べるか。
+#[derive(Clone, Copy)]
 enum Measure {
     /// 値そのもの。
     Number(f64),
+    /// 値そのもの（`integer` が付いていて、整数として読めたとき）。
+    ///
+    /// `f64` に直すと 2^53 を超える整数で下の桁が落ち、
+    /// `9007199254740993` が `max:9007199254740992` を通ってしまいます。整数のまま比べます。
+    Integer(i64),
     /// 文字数。
     Length(usize),
     /// どちらでも測れない。**何も言いません。**
@@ -1172,9 +1165,60 @@ fn measure(value: &str, rules: &[Rule]) -> Measure {
     if !by_value {
         return Measure::Length(value.chars().count());
     }
+    if rules.contains(&Rule::Integer) {
+        if let Ok(n) = value.parse::<i64>() {
+            return Measure::Integer(n);
+        }
+    }
     match value.parse::<f64>().ok().filter(|n| n.is_finite()) {
         Some(n) => Measure::Number(n),
         None => Measure::Invalid,
+    }
+}
+
+impl Measure {
+    /// 値と規則の数を比べる。値で測らないとき（文字数・読めない）は `None`。
+    fn value_cmp(self, bound: &Bound) -> Option<Ordering> {
+        match self {
+            Measure::Number(n) => n.partial_cmp(&bound.num),
+            Measure::Integer(n) => match bound.int {
+                Some(b) => Some(i128::from(n).cmp(&b)),
+                // 端数のある数（`min:1.5`）は 2^52 より小さいので、`f64` で比べてもずれません。
+                None => (n as f64).partial_cmp(&bound.num),
+            },
+            Measure::Length(_) | Measure::Invalid => None,
+        }
+    }
+}
+
+/// `min` / `max` / `between` の数。
+///
+/// 整数で書かれていれば `int` にも持ちます。`integer` の付いた値と、
+/// `f64` に直さずに比べるためです（2^53 を超えると `f64` では下の桁が落ちる）。
+#[derive(Debug, Clone, PartialEq)]
+struct Bound {
+    num: f64,
+    int: Option<i128>,
+}
+
+impl Bound {
+    /// 有限の数だけを通す。`nan` と `inf` は `None`。
+    fn parse(raw: &str) -> Option<Self> {
+        let num = raw.parse::<f64>().ok().filter(|n| n.is_finite())?;
+        let int = raw.parse::<i128>().ok().or_else(|| {
+            // `10.0` や `1e3` も整数として持つ。`i128` に収まらなければ持たない。
+            (num.fract() == 0.0 && num.abs() < 1e38).then_some(num as i128)
+        });
+        Some(Self { num, int })
+    }
+}
+
+impl std::fmt::Display for Bound {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.int {
+            Some(n) => write!(f, "{n}"),
+            None => f.write_str(&trim_num(self.num)),
+        }
     }
 }
 
@@ -1780,6 +1824,24 @@ mod tests {
     }
 
     #[test]
+    fn integerの付いた大きな数は整数のまま比べる() {
+        // 2^53 = 9007199254740992。`f64` で比べると 1 つ上と区別できない。
+        let over = input(&[("n", "9007199254740993")]);
+        assert!(!errors_of(&over, &[("n", "integer|max:9007199254740992")]).is_empty());
+        assert!(errors_of(&over, &[("n", "integer|max:9007199254740993")]).is_empty());
+        assert!(!errors_of(&over, &[("n", "integer|min:9007199254740994")]).is_empty());
+        assert!(!errors_of(&over, &[("n", "integer|between:1,9007199254740992")]).is_empty());
+        assert!(!errors_of(&over, &[("n", "integer|size:9007199254740992")]).is_empty());
+        assert!(errors_of(&over, &[("n", "integer|size:9007199254740993")]).is_empty());
+        // 端数のある数とも比べられる。
+        assert!(!errors_of(&input(&[("n", "1")]), &[("n", "integer|min:1.5")]).is_empty());
+        assert!(errors_of(&input(&[("n", "2")]), &[("n", "integer|min:1.5")]).is_empty());
+        // 案内の数も丸めずに出す。
+        let e = errors_of(&over, &[("n", "integer|max:9007199254740992")]);
+        assert_eq!(e.get("n"), ["n は 9007199254740992 以下にしてください。"]);
+    }
+
+    #[test]
     fn sizeの書き間違いはエラーになる() {
         // `as usize` の飽和変換で黙って `0` や `usize::MAX` にしない。
         let i = input(&[("n", "1")]);
@@ -2135,7 +2197,7 @@ mod tests {
             let e = errors_of(&input(&[("at", ng)]), &[("at", "date")]);
             assert_eq!(
                 e.get("at"),
-                ["at は日付（YYYY-MM-DD か YYYY-MM-DD HH:MM:SS）で入力してください。"],
+                ["at は日付（YYYY-MM-DD か YYYY-MM-DD HH:MM(:SS)）で入力してください。"],
                 "{ng:?} は落ちる"
             );
         }

@@ -585,7 +585,7 @@ pub(crate) fn normalize_key(value: Value) -> Value {
 pub(crate) fn prepare_raw_sql(driver: Driver, sql: &str, bindings: &[Value]) -> Result<String> {
     let holes = grammar::count_placeholders(sql);
     if holes != bindings.len() {
-        if driver == Driver::Postgres && holes == 0 && sql.contains('$') {
+        if driver == Driver::Postgres && holes == 0 && grammar::has_dollar(sql) {
             return Ok(sql.to_string());
         }
         return Err(Error::msg(format!(
@@ -617,6 +617,13 @@ pub(crate) fn test_backend() -> Option<Arc<dyn Backend>> {
 ///     return Err(error);
 /// }
 /// ```
+///
+/// **トランザクションの中で重なりを見て、そのまま続けることはできません。**
+/// トランザクションの中の問い合わせが 1 つでも失敗すると、そのトランザクションは
+/// 使えなくなり、中身は巻き戻されます（以後の問い合わせも `commit()` もエラー。
+/// PostgreSQL がそう扱うのに、どのドライバでもそろえています）。重なりを見て
+/// 別の処理に切り替えたいときは、トランザクションの外で試すか、
+/// `DB::begin()` からやり直してください。
 ///
 /// `Error` の列挙に腕は足しません。利用者が書いた `match` を壊さないためです。
 pub fn is_unique_violation(error: &Error) -> bool {
@@ -964,6 +971,22 @@ mod tests {
             .to_string();
         assert!(error.contains("合っていません"), "{error}");
         assert!(prepare_raw_sql(Driver::Postgres, "select 1", &bindings).is_err());
+    }
+
+    #[test]
+    fn 生のsqlの文字列の中の_question_と_dollar_は数えない() {
+        // 以前は `'?'` も数えて「合っていません」と断っていた。
+        let one = [Value::Int(1)];
+        assert_eq!(
+            prepare_raw_sql(Driver::Postgres, "select '?' where id = ?", &one).unwrap(),
+            "select '?' where id = $1"
+        );
+        // 文字列の中の `$` だけでは、`$1` の直書きとみなさない（数が合わないので断る）。
+        assert!(prepare_raw_sql(Driver::Postgres, "select '$100'", &one).is_err());
+        assert_eq!(
+            prepare_raw_sql(Driver::Postgres, "select '$100'", &[]).unwrap(),
+            "select '$100'"
+        );
     }
 
     #[test]

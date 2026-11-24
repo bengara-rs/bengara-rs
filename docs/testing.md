@@ -212,6 +212,7 @@ get("/").await
 | 配信の記録（`Broadcast::fake()` / `published()`）       | `exclusive()`        |
 
 - 札は変数で受け取ります（`let _db = ...`）。受け取らないと、その場で手放されます。
+- `exclusive()` の札を手放すと、溜まったメール（`Mail::sent()`）は空になります。配信の fake も終わります。
 - 1 つのテストで同じ札を 2 回取ると、パニックします。
 - **両方要るときは `refresh_database()` → `exclusive()` の順です。** 逆に取ると、`refresh_database()` がパニックして知らせます。
 
@@ -279,6 +280,7 @@ async fn 投稿すると配信される() {
 | `Broadcast::assert_nothing_published()`       | 何か記録があればパニック           |
 
 - 札を手放すと、fake は終わり、記録も空になります。
+- **fake の間の `Broadcast::disconnect` は記録されません。** チャンネルの名前を確かめるだけで、送りもしません。
 - `Broadcast` は `prelude` に入っていません。`use` で取り込みます。
 
 ### WebSocket の受け口を確かめる

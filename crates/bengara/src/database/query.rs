@@ -76,6 +76,15 @@ enum Where {
         boolean: Glue,
         wheres: Vec<Where>,
     },
+    /// ドライバで中身が変わる条件。いまのドライバが `driver` なら `then`、ほかは `otherwise`。
+    ///
+    /// どちらを使うかは、SQL を組み立てるとき（終端）に決めます。`using(&tx)` で
+    /// ドライバが替わっても、替えた先で決まります。つなぎ方は `then` のものを使います。
+    ByDriver {
+        driver: Driver,
+        then: Box<Where>,
+        otherwise: Box<Where>,
+    },
 }
 
 impl Where {
@@ -88,6 +97,7 @@ impl Where {
             | Where::Column { boolean, .. }
             | Where::Raw { boolean, .. }
             | Where::Nested { boolean, .. } => *boolean,
+            Where::ByDriver { then, .. } => then.boolean(),
         }
     }
 }
@@ -372,6 +382,8 @@ impl QueryBuilder {
     /// `where_raw("views > $1", &[])` と書くと、値は1つしか渡っていないので
     /// `views > 'published'` を比べることになります。
     ///
+    /// 文字列リテラルと引用した名前の中の `$`（`'$100'` など）は見ません。
+    ///
     /// `DB::select` / `DB::statement` は値をその SQL だけに渡すので、
     /// そちらでは `$1` の直書きを通します。
     ///
@@ -380,7 +392,7 @@ impl QueryBuilder {
     /// SQLite の接続で組み立ててから `using(&tx)` で PostgreSQL の
     /// トランザクションへ替えたときに、検査を抜けていました。
     fn check_raw_dollar(&mut self, place: &str, sql: &str) {
-        if self.raw_dollar.is_none() && sql.contains('$') {
+        if self.raw_dollar.is_none() && grammar::has_dollar(sql) {
             self.raw_dollar = Some(place.to_string());
         }
     }
@@ -667,6 +679,44 @@ impl QueryBuilder {
         self
     }
 
+    /// ドライバで中身が変わる条件を 1 つ足す。モデルのクエリから使います。
+    ///
+    /// いまのドライバが `driver` なら `then` で足した条件、ほかでは `otherwise` で
+    /// 足した条件になります。**どちらにするかは終端で決めます**（`Where::ByDriver`）。
+    /// 組み立てのときのドライバで決めると、`using(&tx)` で別のドライバへ替えたときに
+    /// 食い違うためです。
+    ///
+    /// `then` と `otherwise` は、それぞれ条件をちょうど 1 つ、同じつなぎ方で足してください。
+    pub(crate) fn where_by_driver(
+        mut self,
+        driver: Driver,
+        then: impl FnOnce(QueryBuilder) -> QueryBuilder,
+        otherwise: impl FnOnce(QueryBuilder) -> QueryBuilder,
+    ) -> Self {
+        let then = then(QueryBuilder::new(self.source.clone(), self.table.clone()));
+        let otherwise = otherwise(QueryBuilder::new(self.source.clone(), self.table.clone()));
+        for nested in [&then, &otherwise] {
+            if let Some(message) = &nested.deferred_error {
+                self.defer(message.clone());
+            }
+        }
+        match (
+            <[Where; 1]>::try_from(then.wheres),
+            <[Where; 1]>::try_from(otherwise.wheres),
+        ) {
+            (Ok([then]), Ok([otherwise])) => {
+                debug_assert_eq!(then.boolean(), otherwise.boolean());
+                self.wheres.push(Where::ByDriver {
+                    driver,
+                    then: Box::new(then),
+                    otherwise: Box::new(otherwise),
+                });
+            }
+            _ => self.defer("ドライバで変わる条件の組み立てを誤りました（bengara の不具合です）"),
+        }
+        self
+    }
+
     fn push_basic(
         mut self,
         place: &str,
@@ -821,11 +871,23 @@ impl QueryBuilder {
     /// ```
     ///
     /// 列名は英数字と `_` `.` だけ、演算子は許可一覧で照合します。
-    pub fn having_op(mut self, column: &str, operator: &str, value: impl IntoValue) -> Self {
+    ///
+    /// 列には、`where_op` と同じくモデルの型付きの列（`Post::VIEWS`）も渡せます。
+    pub fn having_op<C: ColumnRef>(
+        mut self,
+        column: C,
+        operator: &str,
+        value: impl Bind<C::Accepts>,
+    ) -> Self {
         self.check_value_operator("having_op", operator);
         // `NULL` の読み替えと `is` の検査は `where_op` と同じ（`basic_condition`）。
-        let condition =
-            self.basic_condition("having_op", Glue::And, column, operator, value.into_value());
+        let condition = self.basic_condition(
+            "having_op",
+            Glue::And,
+            column.column_name(),
+            operator,
+            value.bind(),
+        );
         self.havings.push(condition);
         self
     }
@@ -1156,6 +1218,14 @@ impl QueryBuilder {
                 c.sql.push('(');
                 self.render_conditions(c, wheres);
                 c.sql.push(')');
+            }
+            Where::ByDriver {
+                driver: only,
+                then,
+                otherwise,
+            } => {
+                let chosen = if *only == driver { then } else { otherwise };
+                self.render_condition(c, chosen);
             }
         }
     }
@@ -1846,7 +1916,7 @@ impl QueryBuilder {
     /// `update` と同じく、**`updated_at` は自動で入れません。**
     /// 使えない指定（`join` / `limit` など）は `update` と同じです。
     pub async fn increment<C: ColumnRef>(&self, column: C, amount: i64) -> Result<u64> {
-        self.step("increment", column.column_name(), '+', amount)
+        self.step("increment", column.column_name(), '+', amount, &[])
             .await
     }
 
@@ -1856,15 +1926,25 @@ impl QueryBuilder {
     /// DB::table("posts").where_("id", id).decrement("stock", 1).await?;
     /// ```
     pub async fn decrement<C: ColumnRef>(&self, column: C, amount: i64) -> Result<u64> {
-        self.step("decrement", column.column_name(), '-', amount)
+        self.step("decrement", column.column_name(), '-', amount, &[])
             .await
     }
 
     /// `increment` と `decrement` の中身。
-    async fn step(&self, place: &str, column: &str, sign: char, amount: i64) -> Result<u64> {
+    ///
+    /// `extra` は一緒に書き込む列です。モデルのクエリが `updated_at` を足すのに使います
+    /// （Laravel の `increment($column, $amount, $extra)` の `$extra`）。
+    pub(crate) async fn step(
+        &self,
+        place: &str,
+        column: &str,
+        sign: char,
+        amount: i64,
+        extra: &[(&str, Value)],
+    ) -> Result<u64> {
         self.check()?;
         self.check_write(place)?;
-        let (sql, bindings) = self.step_sql(place, column, sign, amount)?;
+        let (sql, bindings) = self.step_sql(place, column, sign, amount, extra)?;
         let affected = self.run(&sql, &bindings).await?;
         Ok(affected.rows)
     }
@@ -1876,6 +1956,7 @@ impl QueryBuilder {
         column: &str,
         sign: char,
         amount: i64,
+        extra: &[(&str, Value)],
     ) -> Result<(String, Vec<Value>)> {
         // 書き込む列なので、表名付き（`posts.views`）は断る。
         ensure_write_column(place, column)?;
@@ -1892,6 +1973,13 @@ impl QueryBuilder {
         c.sql.push(' ');
         // 増やす量もプレースホルダで渡す。SQL に埋め込まない。
         c.push_value(Value::Int(amount));
+        for (name, value) in extra {
+            ensure_write_column(place, name)?;
+            c.sql.push_str(", ");
+            c.sql.push_str(&grammar::quote(self.driver, name));
+            c.sql.push_str(" = ");
+            c.push_value(value.clone());
+        }
         self.compile_wheres(&mut c);
         Ok((c.sql, c.bindings))
     }
@@ -2713,7 +2801,7 @@ mod tests {
 
         for sign in ['+', '-'] {
             let message = builder()
-                .step_sql("increment", "posts.views", sign, 1)
+                .step_sql("increment", "posts.views", sign, 1, &[])
                 .expect_err("断られる")
                 .to_string();
             assert!(message.contains("表名は付けられません"), "{message}");
@@ -3205,6 +3293,26 @@ mod tests {
     }
 
     #[test]
+    fn 生のsqlの文字列の中の_question_と_dollar_は数えない() {
+        // 以前は `'$100'` を `$1` の直書きとして断り、`'?'` も値の置き場所として数えていた。
+        let postgres = || QueryBuilder {
+            driver: Driver::Postgres,
+            ..builder()
+        };
+        let query = postgres()
+            .where_raw("label = '$100'", &[])
+            .where_raw("note = '?' and id = ?", &[Value::Int(1)])
+            .order_by_raw(r#""price$" desc"#);
+        query.check().expect("文字列と引用した名前の中は数えない");
+        let (sql, bindings) = query.to_sql();
+        assert!(
+            sql.contains("label = '$100' and note = '?' and id = $1"),
+            "{sql}"
+        );
+        assert_eq!(bindings, vec![Value::Int(1)]);
+    }
+
+    #[test]
     fn 値の置き場所はドライバごとに変わる() {
         // `push_value` を `?` の直書きに変えても、出る SQL は同じこと。
         for (driver, expected) in [
@@ -3617,7 +3725,7 @@ mod tests {
     fn 増減のsqlは列を自分に足す形() {
         let (sql, bindings) = builder()
             .where_("id", 1)
-            .step_sql("increment", "views", '+', 1)
+            .step_sql("increment", "views", '+', 1, &[])
             .expect("組み立てられる");
         assert_eq!(
             sql,
@@ -3626,13 +3734,13 @@ mod tests {
         assert_eq!(bindings, vec![Value::Int(1), Value::Int(1)]);
 
         let (sql, _) = builder()
-            .step_sql("decrement", "stock", '-', 3)
+            .step_sql("decrement", "stock", '-', 3, &[])
             .expect("組み立てられる");
         assert_eq!(sql, "update \"posts\" set \"stock\" = \"stock\" - ?");
 
         // 列名は検査する。
         let message = builder()
-            .step_sql("increment", "views = 0, title", '+', 1)
+            .step_sql("increment", "views = 0, title", '+', 1, &[])
             .expect_err("断られる")
             .to_string();
         assert!(message.contains("使えません"), "{message}");

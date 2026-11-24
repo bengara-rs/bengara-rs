@@ -41,7 +41,7 @@ bengara-build = { path = "../bengara/crates/bengara-build" }
 bengara-macros = { path = "../bengara/crates/bengara-macros" }
 ```
 
-`src/main.rs` の中身を、次の 1 行だけにします。
+`src/main.rs` の中身を、次の 1 行だけにします。`init` を動かすための仮の入口です。
 
 ```rust
 fn main() { bengara::run() }
@@ -52,6 +52,8 @@ cargo run -- init          # 骨組みを作る
 cargo artisan serve        # 起動する → http://127.0.0.1:8000
 ```
 
+- `init` は入口を直下の `main.rs` と `artisan.rs` に作り、`src/main.rs` を消します。空になった `src/` も消えます。
+- `src/main.rs` を書き換えていると消しません。案内が出るので、中身を確かめてから消してください。
 - データベースを使わないなら、`features` は要りません。
 - くわしい手順は [docs/getting-started.md](docs/getting-started.md) にあります。
 
@@ -81,7 +83,7 @@ impl HomeController {
 }
 ```
 
-`mod` を書き並べる必要はありません。`src/` もありません。
+`mod` を書き並べる必要はありません。`init` の後は `src/` もありません。
 置き場所は [docs/directory-structure.md](docs/directory-structure.md) にあります。
 
 ## 本番に置くもの

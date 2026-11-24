@@ -97,6 +97,8 @@ pub fn config() -> StorageConfig {
 ### 一覧を取る
 
 `files` は下のディレクトリまで全部見て、ディスクからの相対パスを返します。
+**Laravel と違います。** Laravel の `files` はその階だけで、下まで見るのは `allFiles` です。
+bengara の `files` は Laravel の `allFiles` に当たります。その階だけの一覧はありません。
 
 ```rust
 Storage::default_disk()?.files("notes").await?;
@@ -167,6 +169,8 @@ pub async fn upload(req: Request) -> Result<Response> {
 - **どの OS でもエラーにします。** 開発機で通ったコードが、本番で失敗しないようにするためです。
 - 装置の名前は `CON` `PRN` `AUX` `NUL` `COM0`〜`COM9` `LPT0`〜`LPT9` などです。大文字小文字は見ません。
 - リンクは実体の場所で確かめます。置き場所そのものがリンクなのは構いません。
+- **`path()` は文字列だけを確かめます。** リンクの実体は見ません。返ったパスが外を指すリンクを
+  通ることがあります。自分で開くときは気をつけてください（`read` などはディスクのメソッドを使えば確かめます）。
 - 外を指すリンクには、`has` や `size` もエラーを返します。`delete` はリンクそのものを消します。
 
 ```rust

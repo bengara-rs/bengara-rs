@@ -56,8 +56,6 @@ impl AppCommand {
 enum Target {
     Standalone(Standalone),
     App(AppCommand),
-    /// どれでもない。
-    Unknown,
 }
 
 /// このファイルが受け持つコマンド 1 つ。
@@ -177,18 +175,15 @@ fn builtin(name: &str) -> Option<Target> {
     None
 }
 
-/// 打たれた名前から、動かすものを決める。
+/// 打たれた名前から、動かすものを決める。どれでもなければ `None`。
 ///
 /// **フレームワークのコマンドが必ず先です**（`docs/console-commands.md`）。
 /// 自作コマンドを見るのは、フレームワークのどのコマンドでもなかったときだけです。
-fn resolve(name: &str, custom: &[Command]) -> Target {
+fn resolve(name: &str, custom: &[Command]) -> Option<Target> {
     if let Some(target) = builtin(name) {
-        return target;
+        return Some(target);
     }
-    if crate::console::find(custom, name).is_some() {
-        return Target::App(AppCommand::Custom);
-    }
-    Target::Unknown
+    crate::console::find(custom, name).map(|_| Target::App(AppCommand::Custom))
 }
 
 /// フレームワークのコマンドと同じ名前の自作コマンド。**これらは呼ばれません。**
@@ -219,11 +214,13 @@ pub fn main(hooks: Hooks, factory: fn() -> Application) {
     // 知らない名前は、置き場所を確かめる**前**にヘルプを出して終える。
     // 先に確かめると、打ち間違いでも「基準ディレクトリが決まりません」と言われ、
     // 本当の原因（そんなコマンドは無い）が見えないため。
-    if resolve(command, (hooks.commands)()) == Target::Unknown {
+    //
+    // 振り分けもここで 1 回だけ決め、[`dispatch`] へ渡す。
+    let Some(target) = resolve(command, (hooks.commands)()) else {
         eprintln!("`{command}` というコマンドはありません。");
         print_help(hooks);
         std::process::exit(1);
-    }
+    };
 
     // 置き場所が決まらないまま動き出さない（決定記録 #064）。
     // **`.env` を読む前**に確かめる。読む場所そのものが決まっていないため。
@@ -272,7 +269,7 @@ pub fn main(hooks: Hooks, factory: fn() -> Application) {
     // 埋め込んだ resources/views/ も固定する。
     crate::view::install_embedded((hooks.views)());
 
-    if let Err(error) = dispatch(&args, hooks, factory) {
+    if let Err(error) = dispatch(target, &args, hooks, factory) {
         eprintln!("エラー: {error}");
         std::process::exit(1);
     }
@@ -293,24 +290,27 @@ fn split_command(args: &[String]) -> (&str, &[String]) {
 }
 
 /// `serve` の旗か（`--host` `--port` と、`=` で値を続けた形）。
-fn is_serve_flag(arg: &str) -> bool {
+///
+/// `artisan` も同じ読み方をします（`cli::split_artisan`）。
+pub(crate) fn is_serve_flag(arg: &str) -> bool {
     ["--host", "--port"]
         .iter()
         .any(|flag| arg == *flag || arg.strip_prefix(flag).is_some_and(|r| r.starts_with('=')))
 }
 
-fn dispatch(args: &[String], hooks: Hooks, factory: fn() -> Application) -> Result<()> {
+/// `target` は [`main`] が [`resolve`] で決めたもの（フレームワークのコマンドが必ず先）。
+/// 知らない名前は `main` が先に弾いているので、ここには来ません。
+fn dispatch(
+    target: Target,
+    args: &[String],
+    hooks: Hooks,
+    factory: fn() -> Application,
+) -> Result<()> {
     // 引数なしと、旗から始まる引数はサーバーの起動。
     let (command, rest) = split_command(args);
 
-    // 振り分けは [`resolve`] に任せる。フレームワークのコマンドが必ず先。
-    let kind = match resolve(command, (hooks.commands)()) {
+    let kind = match target {
         Target::Standalone(standalone) => return run_standalone(standalone, hooks),
-        Target::Unknown => {
-            eprintln!("`{command}` というコマンドはありません。");
-            print_help(hooks);
-            std::process::exit(1);
-        }
         Target::App(kind) => kind,
     };
 
@@ -414,7 +414,7 @@ fn shadowed_message(name: &str) -> String {
 /// この関数は、その対応をテストで名前から確かめるためのものです。
 #[cfg(test)]
 fn needs_application(command: &str, custom: &[Command]) -> bool {
-    matches!(resolve(command, custom), Target::App(kind) if kind.builds_application())
+    matches!(resolve(command, custom), Some(Target::App(kind)) if kind.builds_application())
 }
 
 /// `bootstrap/app.rs` を呼んでアプリを固定する。
@@ -566,7 +566,10 @@ fn app_key_is_set(body: &str) -> bool {
 /// - **権限は元のファイルから引き継ぎます。** 一時ファイルは、中身を書く前に
 ///   所有者だけに絞ります（鍵が入るため）。
 /// - 読み取り専用のファイルは、これまでどおり書き込まずにエラーにします。
-fn replace_file(path: &std::path::Path, body: &str) -> Result<()> {
+///
+/// `init` が `Cargo.toml` に足りない行を足すときも使います（`cli::cargo_toml`）。
+/// 途中で落ちて `Cargo.toml` が壊れると、`cargo` 自体が動かなくなるためです。
+pub(crate) fn replace_file(path: &std::path::Path, body: &str) -> Result<()> {
     let target = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
     let permissions = std::fs::metadata(&target)?.permissions();
     if permissions.readonly() {
@@ -851,8 +854,10 @@ fn app_key_label(app: &crate::config_registry::AppConfig) -> String {
 ///
 /// セッションもキャッシュも `memory`（別名 `array`）と `file` だけを知っていて、
 /// 知らない名前は警告を出して `file` にします（`session/middleware.rs`・`cache/mod.rs`）。
+/// 読む側（`StartSession`・`Cache`）と同じく、前後の空白を落とし、大文字小文字を区別しない。
 fn driver_label(driver: &str) -> String {
-    match driver {
+    let driver = driver.trim();
+    match driver.to_ascii_lowercase().as_str() {
         "memory" | "array" => "memory".to_string(),
         "file" => "file".to_string(),
         other => format!("file（`{other}` は知らないため）"),
@@ -927,6 +932,11 @@ fn kernel_help() -> String {
 ///
 /// 出力の細かさは `RUST_LOG` で決めます。設定がなければ、`APP_DEBUG` が真なら
 /// `debug`、そうでなければ `info` にします。
+///
+/// **見るのは環境変数の `APP_DEBUG` だけで、`config/app.rs` の `debug` は見ません。**
+/// 起動の順番の都合です。ログの購読は設定（`config/*.rs`）を組み立てる**前**に
+/// 立てます。組み立ての中の警告も拾うためです。`config/app.rs` で `debug` を
+/// `env("APP_DEBUG", …)` 以外から決めても、ログの細かさには効きません。
 ///
 /// 機能フラグ `log-filter`（既定で入っています）があると、`RUST_LOG=myapp=debug` のような
 /// 細かい絞り込みが使えます。外した場合は `trace` / `debug` / `info` / `warn` / `error` /
@@ -1160,12 +1170,12 @@ mod tests {
         let commands = [custom("my-command")];
         assert_eq!(
             resolve("my-command", &commands),
-            Target::App(AppCommand::Custom)
+            Some(Target::App(AppCommand::Custom))
         );
         assert!(needs_application("my-command", &commands));
         assert!(needs_base("my-command"));
         // 登録していなければ知らない名前。組み立てずにヘルプを出して終わる。
-        assert_eq!(resolve("my-command", &[]), Target::Unknown);
+        assert_eq!(resolve("my-command", &[]), None);
         assert!(!needs_application("my-command", &[]));
     }
 
@@ -1174,7 +1184,10 @@ mod tests {
         // `bootstrap/app.rs` の組み立てがパニックしても（ルートの重複など）、
         // 新しい環境の準備に要るこの 2 つは動く。置き場所は要る。
         for command in ["key:generate", "storage:init"] {
-            assert!(matches!(resolve(command, &[]), Target::App(_)), "{command}");
+            assert!(
+                matches!(resolve(command, &[]), Some(Target::App(_))),
+                "{command}"
+            );
             assert!(!needs_application(command, &[]), "{command}");
             assert!(needs_base(command), "{command}");
         }
@@ -1247,34 +1260,43 @@ mod tests {
         ];
         assert_eq!(
             resolve("list", &commands),
-            Target::Standalone(Standalone::Help)
+            Some(Target::Standalone(Standalone::Help))
         );
         assert_eq!(
             resolve("help", &commands),
-            Target::Standalone(Standalone::Help)
+            Some(Target::Standalone(Standalone::Help))
         );
         assert_eq!(
             resolve("init", &commands),
-            Target::Standalone(Standalone::Init)
+            Some(Target::Standalone(Standalone::Init))
         );
         assert_eq!(
             resolve("version", &commands),
-            Target::Standalone(Standalone::Version)
+            Some(Target::Standalone(Standalone::Version))
         );
-        assert_eq!(resolve("serve", &commands), Target::App(AppCommand::Serve));
-        assert_eq!(resolve("about", &commands), Target::App(AppCommand::About));
+        assert_eq!(
+            resolve("serve", &commands),
+            Some(Target::App(AppCommand::Serve))
+        );
+        assert_eq!(
+            resolve("about", &commands),
+            Some(Target::App(AppCommand::About))
+        );
         assert_eq!(
             resolve("migrate", &commands),
-            Target::App(AppCommand::Database)
+            Some(Target::App(AppCommand::Database))
         );
         assert_eq!(
             resolve("queue:work", &commands),
-            Target::App(AppCommand::Extra)
+            Some(Target::App(AppCommand::Extra))
         );
         // ぶつからない名前は自作コマンドに届く。
-        assert_eq!(resolve("greet", &commands), Target::App(AppCommand::Custom));
-        assert_eq!(resolve("nope", &commands), Target::Unknown);
-        assert_eq!(resolve("greet", &[]), Target::Unknown);
+        assert_eq!(
+            resolve("greet", &commands),
+            Some(Target::App(AppCommand::Custom))
+        );
+        assert_eq!(resolve("nope", &commands), None);
+        assert_eq!(resolve("greet", &[]), None);
 
         // 同名の自作コマンドがあっても、置き場所の要否は変わらない
         // （以前は `list` が置き場所の確認を飛ばしたまま自作コマンドを動かした）。
@@ -1570,6 +1592,8 @@ mod tests {
         assert_eq!(driver_label("memory"), "memory");
         assert_eq!(driver_label("array"), "memory");
         assert_eq!(driver_label("file"), "file");
+        // 読む側と同じく、空白と大文字小文字は気にしない。
+        assert_eq!(driver_label(" Memory "), "memory");
         // 知らない名前は file で動くので、書いた名前のまま出さない。
         let label = driver_label("redis");
         assert!(

@@ -56,10 +56,7 @@ fn before_init_exit_code(command: &str) -> i32 {
 pub(crate) fn artisan() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let root = project_root();
-    let (command, rest) = match args.split_first() {
-        Some((first, rest)) => (first.as_str(), rest),
-        None => ("list", &[] as &[String]),
-    };
+    let (command, rest) = split_artisan(&args);
 
     let result = match command {
         name if is_help(name) => {
@@ -84,6 +81,20 @@ pub(crate) fn artisan() {
     if let Err(error) = result {
         eprintln!("エラー: {error}");
         std::process::exit(1);
+    }
+}
+
+/// 引数を「コマンドの名前」と「残り」に分ける（`artisan` 用）。
+///
+/// - 引数なしは `list`（Laravel の `php artisan` と同じ）。
+/// - 最初が `serve` の旗（`--host` / `--port`）なら、名前を省いた `serve` と見る。
+///   本体（`kernel_impl::split_command`）と同じ読み方です。以前は本体へ素通しし、
+///   本体が旗だけの形を `serve` と読むので、**見張りの無い**サーバーが立っていました。
+fn split_artisan(args: &[String]) -> (&str, &[String]) {
+    match args.split_first() {
+        Some((first, _)) if crate::kernel_impl::is_serve_flag(first) => ("serve", args),
+        Some((first, rest)) => (first.as_str(), rest),
+        None => ("list", &[]),
     }
 }
 
@@ -239,11 +250,13 @@ bengara {version} — cargo artisan
 
   serve [--host <ホスト>] [--port <ポート>]
                           サーバーを起動し、変更があれば再ビルドして再起動する
+                          （名前は省ける。例: --port 9000）
   init                    Laravel と同じ構成のファイルを作る（最初の1回だけ）
   list                    この一覧を出す
   version                 bengara の版を出す（--version / -V も同じ）
 
-  serve は本体を即座に止めます。停止の猶予を確かめるときは本体を直接動かしてください。
+  serve は、作り直すときは前の本体を即座に止めます。Ctrl+C では本体が止まるのを
+  待ちます（停止の猶予は APP_SHUTDOWN_TIMEOUT。もう一度押すと即座に止めます）。
 ",
         version = env!("CARGO_PKG_VERSION")
     );
@@ -320,6 +333,21 @@ mod tests {
         for word in ["", "serve", "init", "migrate", "-v"] {
             assert!(!is_help(word) && !is_version(word), "{word}");
         }
+    }
+
+    #[test]
+    fn 旗から始まる引数は見張りつきのserveと読む() {
+        // 以前は本体へ素通しし、見張りの無いサーバーが立っていた。
+        let args: Vec<String> = ["--port", "9000"].map(String::from).to_vec();
+        assert_eq!(split_artisan(&args), ("serve", &args[..]));
+        let args = vec!["--host=0.0.0.0".to_string()];
+        assert_eq!(split_artisan(&args), ("serve", &args[..]));
+        // 名前があればそのまま。旗に似た別の言葉は名前として扱う（本体へ渡す）。
+        let args: Vec<String> = ["migrate", "--force"].map(String::from).to_vec();
+        assert_eq!(split_artisan(&args), ("migrate", &args[1..]));
+        let args = vec!["--portx".to_string()];
+        assert_eq!(split_artisan(&args).0, "--portx");
+        assert_eq!(split_artisan(&[]), ("list", &[] as &[String]));
     }
 
     #[test]

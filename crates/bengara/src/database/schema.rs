@@ -273,6 +273,9 @@ impl Blueprint {
 
     /// 複合主キー。
     ///
+    /// `Schema::table`（alter）の中では**実行の前のエラー**になります。
+    /// 後から主キーは足せないので、表を作り直してください。
+    ///
     /// 2 回呼ぶと置き換えます。以前は 1 回目が黙って消えていたので警告を出します。
     pub fn primary(&mut self, columns: &[&str]) {
         if !self.primary.is_empty() {
@@ -291,6 +294,9 @@ impl Blueprint {
     /// ```ignore
     /// t.foreign("post_id").references("id").on("posts").on_delete("cascade");
     /// ```
+    ///
+    /// SQLite の `Schema::table`（alter）の中では**実行の前のエラー**になります。
+    /// SQLite は後から外部キーを足せないので、表を作り直してください。
     pub fn foreign(&mut self, column: &str) -> ForeignKeyDefinition<'_> {
         self.foreigns.push(ForeignKey {
             column: column.to_string(),
@@ -331,8 +337,15 @@ impl Blueprint {
     /// - `Schema::table`（alter）の中の列の `.primary()`。`add column .. primary key` は
     ///   SQLite では必ず、MySQL と PostgreSQL では主キーが既にあると失敗します。
     ///   表の `primary(&[..])` が SQL を出さないのに、こちらだけ出していました。
+    /// - `Schema::table`（alter）の中の表の `primary(&[..])`。後から主キーを足す
+    ///   移植できる書き方がありません。以前は警告だけで SQL を出さず、
+    ///   migrate が成功して主キーの無い表が残っていました。
+    /// - SQLite の `Schema::table`（alter）の中の `foreign()`。SQLite の `alter table` に
+    ///   `add constraint` がありません。以前は警告だけで、外部キーの無い表が残っていました。
     /// - `Schema::create` の中の 2 つ目の主キー（`id()` と `primary(&[..])` など）。
     ///   `primary key` が 2 回出て、どのドライバでも必ず失敗します。
+    /// - SQL に書けない既定値（バイト列、`NaN` / `inf`）。バイト列は以前 `null` に
+    ///   置き換えていたので、既定値の違う列が黙ってできていました。
     fn collect_errors(&mut self) -> Vec<String> {
         let table = self.table.clone();
         let alter = self.mode == Mode::Alter;
@@ -370,8 +383,48 @@ impl Blueprint {
                 }
                 true
             });
+            if !self.primary.is_empty() {
+                errors.push(format!(
+                    "{table} の primary(&[{}]) は alter table では使えません。\
+                     後から主キーは足せないので、Schema::create で表を作り直してください",
+                    self.primary.join(", ")
+                ));
+                self.primary.clear();
+            }
+            if self.driver == Driver::Sqlite && !self.foreigns.is_empty() {
+                let columns: Vec<&str> = self.foreigns.iter().map(|f| f.column.as_str()).collect();
+                errors.push(format!(
+                    "{table} の foreign({}) は SQLite の alter table では使えません。\
+                     SQLite では後から外部キーを足せません。\
+                     Schema::create で表を作り直し、その中で foreign() を書いてください",
+                    columns.join(", ")
+                ));
+                self.foreigns.clear();
+            }
         } else {
             self.check_single_primary(&mut errors);
+        }
+
+        for column in &mut self.columns {
+            let Some(DefaultValue::Value(value)) = &column.default else {
+                continue;
+            };
+            let problem = match value {
+                Value::Bytes(_) => {
+                    "バイト列は既定値に書けません（ドライバごとに書き方が違うため）。\
+                                    .nullable() にして、値は保存するときに入れてください"
+                        .to_string()
+                }
+                Value::Float(v) if !v.is_finite() => {
+                    format!("{v} は SQL に書けません。有限の数を渡すか、.nullable() にしてください")
+                }
+                _ => continue,
+            };
+            errors.push(format!(
+                "{table}.{} の default(..) は使えません。{problem}",
+                column.name
+            ));
+            column.default = None;
         }
 
         errors
@@ -496,32 +549,15 @@ impl Blueprint {
 
         // 以前はここで `self.foreigns` と `self.primary` を読んでいませんでした。
         // 成功を報告して、制約だけ無い表ができていました。
-        if !self.primary.is_empty() {
-            // 移植できる書き方がありません。`id()` を alter で使ったときと同じ扱いです。
-            tracing::warn!(
-                "{} の primary() は alter table では使えません。\
-                 後から主キーは足せないので、表を作り直してください（{}）",
-                self.table,
-                self.primary.join(", ")
-            );
-        }
-        if self.driver == Driver::Sqlite && !self.foreigns.is_empty() {
-            // SQLite の `alter table` に `add constraint` がありません。
-            // 流せない SQL になるので、ここでは出しません。
-            tracing::warn!(
-                "{} の foreign() は SQLite では使えません。\
-                 SQLite では後から外部キーを足せません。表を作り直してください",
-                self.table
-            );
-        } else {
-            for foreign in &self.foreigns {
-                // 制約の名前は `foreign_sql` が付けます。作るときと同じ名前です。
-                statements.push(format!(
-                    "alter table {} add {}",
-                    grammar::quote(driver, &self.table),
-                    self.foreign_sql(foreign)
-                ));
-            }
+        // 表の `primary(&[..])` と SQLite の `foreign()` は、ここへ来る前に
+        // collect_errors() がエラーにして外しています。
+        for foreign in &self.foreigns {
+            // 制約の名前は `foreign_sql` が付けます。作るときと同じ名前です。
+            statements.push(format!(
+                "alter table {} add {}",
+                grammar::quote(driver, &self.table),
+                self.foreign_sql(foreign)
+            ));
         }
         statements
     }
@@ -684,7 +720,7 @@ impl Blueprint {
         }
         if let Some(default) = &column.default {
             sql.push_str(" default ");
-            sql.push_str(&default_sql(driver, &column.name, default));
+            sql.push_str(&default_sql(driver, default));
         }
         // `unique` はここには書きません。名前付きの索引として別に出します
         // （`index_targets`）。列の指定に入れると名前をデータベースが決めるので、
@@ -1207,21 +1243,13 @@ fn type_sql(driver: Driver, kind: &PlainType) -> String {
 }
 
 /// 既定値の書き方。値は SQL に直接書くので、文字列は引用符を重ねて逃がす。
-fn default_sql(driver: Driver, name: &str, default: &DefaultValue) -> String {
+fn default_sql(driver: Driver, default: &DefaultValue) -> String {
     match default {
         DefaultValue::Raw(sql) => sql.clone(),
         DefaultValue::Value(Value::Null) => "null".into(),
         DefaultValue::Value(Value::Int(v)) => v.to_string(),
-        DefaultValue::Value(Value::Float(v)) => {
-            if !v.is_finite() {
-                // `NaN` / `inf` と書いた SQL は流せない。組み立ては `Result` を
-                // 返せないので、警告を出してそのまま流し、実行のときに失敗させる。
-                tracing::warn!(
-                    "既定値 {v} は SQL に書けません。この文は実行のときに失敗します（列: {name}）"
-                );
-            }
-            v.to_string()
-        }
+        // `NaN` / `inf` は、ここへ来る前に collect_errors() がエラーにして外しています。
+        DefaultValue::Value(Value::Float(v)) => v.to_string(),
         DefaultValue::Value(Value::Bool(v)) => match driver {
             Driver::Postgres => v.to_string(),
             _ => i32::from(*v).to_string(),
@@ -1235,12 +1263,10 @@ fn default_sql(driver: Driver, name: &str, default: &DefaultValue) -> String {
             };
             format!("'{escaped}'")
         }
-        DefaultValue::Value(Value::Bytes(_)) => {
-            // ドライバごとに書き方が違う（`x'..'` / `'\x..'` / `0x..`）ので、
-            // バイト列の既定値は書きません。黙って消えないように知らせます。
-            tracing::warn!("バイト列の既定値は SQL に書けません。値は無視します（列: {name}）");
-            "null".into()
-        }
+        // ドライバごとに書き方が違う（`x'..'` / `'\x..'` / `0x..`）ので、
+        // バイト列の既定値は書きません。ここへ来る前に collect_errors() が
+        // エラーにして外しています。
+        DefaultValue::Value(Value::Bytes(_)) => "null".into(),
     }
 }
 
@@ -2091,8 +2117,9 @@ mod tests {
     }
 
     #[test]
-    fn sqlite_では後から外部キーを足さない() {
-        // SQLite の `alter table` に `add constraint` が無い。警告だけ出して SQL は出さない。
+    fn sqlite_で後から外部キーを足すと実行の前のエラーになる() {
+        // SQLite の `alter table` に `add constraint` が無い。
+        // 以前は警告だけで、migrate が成功して外部キーの無い表が残っていた。
         let mut schema = sqlite();
         schema.table("comments", |t| {
             t.foreign_id("post_id");
@@ -2101,19 +2128,80 @@ mod tests {
         let sql = schema.to_sql();
         assert_eq!(sql.len(), 1, "{sql:?}");
         assert!(!sql[0].contains("foreign key"), "{sql:?}");
+        let errors = schema.take_errors();
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        assert!(
+            errors[0].contains("comments の foreign(post_id)"),
+            "{}",
+            errors[0]
+        );
+        assert!(errors[0].contains("Schema::create"), "{}", errors[0]);
+
+        // MySQL と PostgreSQL は今までどおり `add constraint` を出す。
+        for driver in [Driver::MySql, Driver::Postgres] {
+            let mut schema = Schema::new(driver);
+            schema.table("comments", |t| {
+                t.foreign("post_id").on("posts");
+            });
+            assert!(schema.take_errors().is_empty(), "{driver}");
+        }
     }
 
     #[test]
-    fn 表を変えるときの主キーは_sql_にしない() {
-        // 後から主キーは足せない。警告だけ出す。
+    fn 表を変えるときの表の_primary_は実行の前のエラーになる() {
+        // 以前は警告だけで、migrate が成功して主キーの無い表が残っていた。
+        // 列の `.primary()` と扱いをそろえた。
+        for driver in [Driver::Sqlite, Driver::MySql, Driver::Postgres] {
+            let mut schema = Schema::new(driver);
+            schema.table("posts", |t| {
+                t.string("slug");
+                t.primary(&["slug"]);
+            });
+            let sql = schema.to_sql();
+            assert_eq!(sql.len(), 1, "{driver}: {sql:?}");
+            assert!(!sql[0].contains("primary key"), "{driver}: {sql:?}");
+            let errors = schema.take_errors();
+            assert_eq!(errors.len(), 1, "{driver}: {errors:?}");
+            assert!(
+                errors[0].contains("posts の primary(&[slug])"),
+                "{}",
+                errors[0]
+            );
+            assert!(errors[0].contains("Schema::create"), "{}", errors[0]);
+        }
+    }
+
+    #[test]
+    fn 書けない既定値は実行の前のエラーになる() {
+        // 以前はバイト列を黙って null に置き換え、NaN はそのまま SQL に出していた。
+        for driver in [Driver::Sqlite, Driver::MySql, Driver::Postgres] {
+            let mut schema = Schema::new(driver);
+            schema.create("files", |t| {
+                t.binary("data").default(vec![1u8, 2, 3]);
+                t.double("ratio").default(f64::NAN);
+                t.double("limit").default(f64::INFINITY);
+                t.double("ok").default(1.5);
+            });
+            let sql = &schema.to_sql()[0];
+            assert!(
+                !sql.contains("NaN") && !sql.contains("inf"),
+                "{driver}: {sql}"
+            );
+            assert!(sql.contains("default 1.5"), "{driver}: {sql}");
+            let errors = schema.take_errors();
+            assert_eq!(errors.len(), 3, "{driver}: {errors:?}");
+            assert!(errors[0].contains("files.data"), "{}", errors[0]);
+            assert!(errors[0].contains("バイト列"), "{}", errors[0]);
+            assert!(errors[1].contains("files.ratio"), "{}", errors[1]);
+            assert!(errors[2].contains("files.limit"), "{}", errors[2]);
+        }
+
+        // 表を変えるときも同じ。
         let mut schema = sqlite();
-        schema.table("posts", |t| {
-            t.string("slug");
-            t.primary(&["slug"]);
+        schema.table("files", |t| {
+            t.double("ratio").nullable().default(f64::NAN);
         });
-        let sql = schema.to_sql();
-        assert_eq!(sql.len(), 1, "{sql:?}");
-        assert!(!sql[0].contains("primary key"), "{sql:?}");
+        assert_eq!(schema.take_errors().len(), 1);
     }
 
     #[test]
