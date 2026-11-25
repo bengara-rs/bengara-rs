@@ -1120,6 +1120,12 @@ mod tests {
             claim(&dir, &schedule.tasks()[0]).await.unwrap(),
             Claim::Busy
         );
+        // 錠を置き直して、古い錠（10 秒）と見なされないようにする。`claim` は
+        // 100 回試すので、Windows ではファイルの作成が遅く 1 回で数秒かかる。
+        // 2 回分で 10 秒を超えると、下の `run_in` が錠を外して動かしていた。
+        drop(held);
+        let held = crate::support::lock::FileLock::acquire(&lock_path(&dir, &schedule.tasks()[0]))
+            .unwrap();
 
         let outcome = run_in(&dir, &schedule).await;
         assert_eq!(outcome.busy, vec!["重なった処理".to_string()]);

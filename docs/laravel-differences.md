@@ -20,15 +20,16 @@ Laravel から来た人がつまずきやすい違いを、分野ごとに並べ
 
 ## コマンド
 
-| Laravel                                | bengara                                                   |
-|----------------------------------------|-----------------------------------------------------------|
-| `php artisan ...`                      | `cargo artisan ...`。本番は `./myapp ...`                 |
-| `serve` はすぐ動く                     | ビルドしてから起動する。ソースが変わると作り直す          |
-| 旗の扱いが緩い                         | **知らない旗や余分な引数はエラー**                        |
-| 同じ名前の自作コマンドが勝つ           | **フレームワークのコマンドが先。** 自作のほうは呼ばれない |
-| 本番の `migrate` には `--force` が要る | 要らない（付けても通る）                                  |
-| `migrate:fresh` などは本番で確認する   | 本番では `--force` が無いと止まる                         |
-| `schedule:run`                         | 同じ。**失敗が 1 件でもあれば終了コード 1**               |
+| Laravel                                | bengara                                                                     |
+|----------------------------------------|-----------------------------------------------------------------------------|
+| `php artisan ...`                      | `cargo artisan ...`。本番は `./myapp ...`                                   |
+| `serve` はすぐ動く                     | ビルドしてから起動する。ソースが変わると作り直す                            |
+| `serve` は見張らない                   | 見張って作り直す。作り直しは本体をすぐ止め、Ctrl+C では本体が止まるのを待つ |
+| 旗の扱いが緩い                         | **知らない旗や余分な引数はエラー**                                          |
+| 同じ名前の自作コマンドが勝つ           | **フレームワークのコマンドが先。** 自作のほうは呼ばれない                   |
+| 本番の `migrate` には `--force` が要る | 要らない（付けても通る）                                                    |
+| `migrate:fresh` などは本番で確認する   | 本番では `--force` が無いと止まる                                           |
+| `schedule:run`                         | 同じ。**失敗が 1 件でもあれば終了コード 1**                                 |
 
 くわしくは [artisan.md](artisan.md) にあります。
 
@@ -63,12 +64,16 @@ Laravel から来た人がつまずきやすい違いを、分野ごとに並べ
 
 ## リクエストとレスポンス
 
-| Laravel                             | bengara                                                            |
-|-------------------------------------|--------------------------------------------------------------------|
-| `$request->route('post')`           | `req.param("post")`。数にするなら `req.param_as::<i64>("post")?`   |
-| パス引数の型が合わない              | `param_as` は **404**。ルートに無い名前なら **500**                |
-| `abort(403)`                        | `return abort(403);`                                               |
-| 本文の上限は PHP の `post_max_size` | `.env` の `APP_MAX_BODY_BYTES`（既定 2 MiB）とルートの `.max_body` |
+| Laravel                                        | bengara                                                                                                          |
+|------------------------------------------------|------------------------------------------------------------------------------------------------------------------|
+| `$request->route('post')`                      | `req.param("post")`。数にするなら `req.param_as::<i64>("post")?`                                                 |
+| パス引数の型が合わない                         | `param_as` は **404**。ルートに無い名前なら **500**                                                              |
+| `abort(403)`                                   | `return abort(403);`                                                                                             |
+| 本文の上限は PHP の `post_max_size`            | `.env` の `APP_MAX_BODY_BYTES`（既定 2 MiB）とルートの `.max_body`                                               |
+| `$request->file('avatar')->store('avatars')`   | `req.file("avatar")` → `file.store("avatars").await?`。ディスクを選ぶなら `Storage::disk("public").put_file(..)` |
+| アップロードの数の上限を超えた分は黙って捨てる | **413 で断る**（ファイル 20・欄 1000・欄の見出し 8 KiB）                                                         |
+| `mimes` は送られた名前や MIME も見る           | **中身だけで判定する。** 書けるのは jpg・jpeg・png・gif・webp・bmp だけ。SVG はいつも通さない                    |
+| 通ったファイルも `validated()` に入る          | **入らない。** `req.file()` で読む                                                                               |
 
 くわしくは [requests-and-responses.md](requests-and-responses.md) にあります。
 
@@ -76,32 +81,35 @@ Laravel から来た人がつまずきやすい違いを、分野ごとに並べ
 
 機能フラグ `view` で使います。書き方は **Jinja 系**です。**Blade の構文は使えません。**
 
-| Laravel                            | bengara                                             |
-|------------------------------------|-----------------------------------------------------|
-| `welcome.blade.php`                | `welcome.html`                                      |
-| `view("welcome")`                  | `view("welcome", ())`。値が無くても第 2 引数を書く  |
-| `{{ $title }}`                     | `{{ title }}`（`$` は付けない）                     |
-| `{!! $html !!}`                    | `{{ html\|safe }}`                                  |
-| `@extends` / `@section` / `@yield` | `{% extends %}` / `{% block %}`                     |
-| `@csrf`                            | `{{ csrf_field() }}`。`req.view(..)` で描くときだけ |
-| エラーページを Blade で作る        | エラーページはテンプレートにならない                |
+| Laravel                            | bengara                                                                                          |
+|------------------------------------|--------------------------------------------------------------------------------------------------|
+| `welcome.blade.php`                | `welcome.html`                                                                                   |
+| `view("welcome")`                  | `view("welcome", ())`。値が無くても第 2 引数を書く                                               |
+| `{{ $title }}`                     | `{{ title }}`（`$` は付けない）                                                                  |
+| `{!! $html !!}`                    | `{{ html\|safe }}`                                                                               |
+| `@extends` / `@section` / `@yield` | `{% extends %}` / `{% block %}`                                                                  |
+| `@csrf`                            | `{{ csrf_field() }}`。`req.view(..)` で描くときだけ                                              |
+| エラーページを Blade で作る        | エラーページはテンプレートにならない                                                             |
+| `$errors`（袋の名前分けもできる）  | `errors`（`any`・`has`・`first`・`get`・`all`）。袋は 1 つ。`context` に `errors` を書くとエラー |
 
 くわしくは [views.md](views.md) にあります。
 
 ## 入力とバリデーション
 
-| Laravel                                  | bengara                                                              |
-|------------------------------------------|----------------------------------------------------------------------|
-| 落ちると前の画面に戻す（`$errors`）      | **422 を返す。** JSON を求めた相手には JSON                          |
-| 規則は配列でも文字列でも書ける           | **文字列だけ**（`"required\|max:255"`）                              |
-| 規則の書き間違いは実行して分かる         | `rules!` で書けば**コンパイルが止まる**                              |
-| FormRequest のクラス                     | トレイト `FormRequest` と `const RULES`。`req.validate_as()?` で読む |
-| メッセージは言語ファイルで変える         | **日本語で固定**                                                     |
-| `TrimStrings` で全部の入力の空白を落とす | **検査する値だけ**落とす。`req.input()` は落とさない                 |
-| `nullable` で飛ばした値はそのまま        | **空文字が入る**                                                     |
-| `alpha` 系は空文字を通す                 | **落とす**                                                           |
-| `date` はいろいろな形を通す              | **`YYYY-MM-DD` と `YYYY-MM-DD HH:MM(:SS)` だけ**。時差付きは落とす   |
-| 重なりは `unique:` 規則で止める          | 表の `unique` で止め、`is_unique_violation` で見分ける               |
+| Laravel                                  | bengara                                                                                                        |
+|------------------------------------------|----------------------------------------------------------------------------------------------------------------|
+| 落ちると前の画面に戻す（`$errors`）      | **`Referer` の画面へ 302 で戻す。** JSON を求めた相手・Cookie の無い相手・`Referer` が無いか別オリジンなら 422 |
+| 戻り先は `url()->previous()`             | **`Referer` だけ。** セッションに覚えた前の URL には落ちない                                                   |
+| 規則は配列でも文字列でも書ける           | **文字列だけ**（`"required\|max:255"`）                                                                        |
+| 規則の書き間違いは実行して分かる         | `rules!` で書けば**コンパイルが止まる**                                                                        |
+| FormRequest のクラス                     | トレイト `FormRequest` と `const RULES`。`req.validate_as()?` で読む                                           |
+| メッセージは言語ファイルで変える         | **日本語で固定**                                                                                               |
+| `TrimStrings` で全部の入力の空白を落とす | **検査する値だけ**落とす。`req.input()` は落とさない                                                           |
+| `nullable` で飛ばした値はそのまま        | **空文字が入る**                                                                                               |
+| `alpha` 系は空文字を通す                 | **落とす**                                                                                                     |
+| `boolean` は `true` `false` `1` `0` だけ | **`on` `off` `yes` `no` と、文字の `true` `false` も通す**（大文字小文字は区別）                               |
+| `date` はいろいろな形を通す              | **`YYYY-MM-DD` と `YYYY-MM-DD HH:MM(:SS)` だけ**。時差付きは落とす                                             |
+| 重なりは `unique:` 規則で止める          | 表の `unique` で止め、`is_unique_violation` で見分ける                                                         |
 
 くわしくは [validation.md](validation.md) にあります。
 
@@ -123,12 +131,16 @@ CSRF は、別のサイトからの なりすまし送信のことです。
 
 ## ミドルウェアと回数の制限
 
-| Laravel                           | bengara                                                    |
-|-----------------------------------|------------------------------------------------------------|
-| `throttle:60,1`                   | `Throttle::from_spec("60,1")?` を `alias` に登録する       |
-| 制限はキャッシュで共有される      | **プロセスごとに数える**（2 プロセスなら上限は約 2 倍）    |
-| 名前の無い `throttle` は 1 つの枠 | **ルートごとに別の枠**                                     |
-| `TrustProxies` ミドルウェア       | 環境変数 `TRUSTED_PROXIES`。範囲（`10.0.0.0/8`）は書けない |
+| Laravel                                      | bengara                                                                            |
+|----------------------------------------------|------------------------------------------------------------------------------------|
+| `throttle:60,1`                              | `Throttle::from_spec("60,1")?` を `alias` に登録する                               |
+| 制限はキャッシュで共有される                 | **プロセスごとに数える**（2 プロセスなら上限は約 2 倍）                            |
+| 名前の無い `throttle` は 1 つの枠            | **ルートごとに別の枠**                                                             |
+| `TrustProxies` ミドルウェア                  | 環境変数 `TRUSTED_PROXIES`。範囲（`10.0.0.0/8`）は書けない                         |
+| `HandleCors` が既定で共通の並びに入っている  | **入っていない。** `m.prepend(bengara::HandleCors::from_config())` で足す          |
+| `supports_credentials` と `*` を一緒に書ける | **起動時にパニックする**（どのサイトにも Cookie 付きの呼び出しを許してしまうため） |
+| `allowed_origins_patterns`（正規表現）       | 無い。`https://*.example.com` の形だけ                                             |
+| 413 などにも CORS の見出しが付く             | **413・400・408 とパニックの 500 には付かない**                                    |
 
 くわしくは [middleware.md](middleware.md) にあります。
 
@@ -147,6 +159,7 @@ CSRF は、別のサイトからの なりすまし送信のことです。
 | `DB::transaction(fn () => ...)`              | `DB::begin().await?` で始めて `tx.commit().await?`           |
 | トランザクションの中の `truncate()`（MySQL） | **エラー。** `delete()` を使う                               |
 | `ilike` や `<=>` をどこでも書ける            | `ilike` は PostgreSQL だけ、`<=>` は MySQL だけ              |
+| `whereRaw` に JSONB の `?` 演算子を書ける    | **書けない。** `?` は値の置き場所として数える。関数で書く    |
 
 ### 日時（Carbon）
 
@@ -163,36 +176,42 @@ CSRF は、別のサイトからの なりすまし送信のことです。
 
 ## モデルとマイグレーション
 
-| Laravel                               | bengara                                                   |
-|---------------------------------------|-----------------------------------------------------------|
-| `class Post extends Model`            | `#[derive(Model)]` ＋ `#[model(table = "posts")]`         |
-| 表の名前はクラス名から推測            | **書く。** 推測しない                                     |
-| `$post->comments` で自動的に読む      | `comments()` メソッドを自分で書き、`.get().await?` で読む |
-| `with('comments')` でまとめ読み       | `where_in` で読み、`bengara::database::group_by` で束ねる |
-| `Post::create([...])`                 | 構造体を作って `post.save().await?`                       |
-| `save()` は変わった属性だけを書く     | **主キーと `created_at` 以外の全列を書き戻す**            |
-| `save()` は 0 件の更新でも成功        | **`Err` になる**                                          |
-| トランザクションの中の `save()`       | `post.save_using(&tx).await?`                             |
-| `Post::factory()->count(3)->create()` | `database/factories/` にただの関数を書く                  |
-| `up()` / `down()`                     | 同じ。ただし**同期の関数**                                |
+| Laravel                               | bengara                                                       |
+|---------------------------------------|---------------------------------------------------------------|
+| `class Post extends Model`            | `#[derive(Model)]` ＋ `#[model(table = "posts")]`             |
+| 表の名前はクラス名から推測            | **書く。** 推測しない                                         |
+| `$post->comments` で自動的に読む      | `comments()` メソッドを自分で書き、`.get().await?` で読む     |
+| `with('comments')` でまとめ読み       | `where_in` で読み、`bengara::database::group_by` で束ねる     |
+| `Post::create([...])`                 | 構造体を作って `post.save().await?`                           |
+| `save()` は変わった属性だけを書く     | **主キーと `created_at` 以外の全列を書き戻す**                |
+| `save()` は 0 件の更新でも成功        | **`Err` になる**                                              |
+| トランザクションの中の `save()`       | `post.save_using(&tx).await?`                                 |
+| `Post::factory()->count(3)->create()` | `database/factories/` にただの関数を書く                      |
+| `up()` / `down()`                     | 同じ。ただし**同期の関数**                                    |
+| SQLite でも後から外部キーを足せる     | **流す前のエラー。** 後から主キーを足すのも同じ。表を作り直す |
 
 **`save()` は全列を書き戻します。** 読んだ後に別の場所で増えた列（`views` など）は、古い値に戻ります。
 変える列だけを書くなら `save_only(&["title"])` を使います（[models.md](models.md)）。
 
 ## 認証と認可
 
-| Laravel                               | bengara                                                             |
-|---------------------------------------|---------------------------------------------------------------------|
-| `Hash::make()` の既定は bcrypt        | 既定は PBKDF2。`HASH_DRIVER=argon2id` も使える（フラグ `argon2`）   |
-| bcrypt（`$2y$`）の値で照合する        | **照合できない。** Argon2id（`$argon2id$`）の値は照合できる         |
-| 非同期の中でも `Hash::make`           | `Hash::make_async` / `Hash::check_async` を使う                     |
-| `Auth::user()`                        | `req.auth().user::<User>().await?`。**`req` から読む**              |
-| `Auth::logoutOtherDevices($password)` | `req.auth().logout_other_devices_async()`。パスワードの確認は自分で |
-| `redirect()->intended('/')`           | `req.session().intended()` を読んで、自分で転送する                 |
-| `$this->authorize('update', $post)`   | `authorize(PostPolicy::update(&user, &post))?`（ただの関数）        |
-| `encrypt()` / `decrypt()`             | 同じ名前。機能フラグ `encryption` が要る                            |
-| `Password::sendResetLink()`           | `PasswordReset::create()` ＋ `link()`。送信は自分で書く             |
-| `APP_KEY` は base64 の 32 バイト      | **64 文字以上**の文字列                                             |
+| Laravel                                     | bengara                                                                                                                           |
+|---------------------------------------------|-----------------------------------------------------------------------------------------------------------------------------------|
+| `Hash::make()` の既定は bcrypt              | 既定は PBKDF2。`HASH_DRIVER=argon2id` も使える（フラグ `argon2`）                                                                 |
+| bcrypt（`$2y$`）の値で照合する              | フラグ `bcrypt` で照合できる。ログインのついでに設定の方式へ移る。**作ることはできない**。NUL を含むパスワードと cost 17 以上は偽 |
+| `$user->createToken('n')`（Sanctum）        | `use bengara::auth::HasApiTokens;` して `user.create_token("n", &["*"], None).await?`。能力と期限は毎回書く                       |
+| `auth:sanctum` / `abilities:a,b`            | `Authenticate::token()` / `CheckAbilities::new(["a", "b"])` を `alias` で登録する。転送せず 401                                   |
+| `Auth::validate($credentials)` は真偽を返す | `req.auth().validate::<User>(列, 値, パスワード)` は**照合した利用者**を返す（ログインしない）                                    |
+| `last_used_at` は要求のたびに書く           | **60 秒以内なら書かない**                                                                                                         |
+| SPA の Cookie 認証（Sanctum の stateful）   | 無い                                                                                                                              |
+| 非同期の中でも `Hash::make`                 | `Hash::make_async` / `Hash::check_async` を使う                                                                                   |
+| `Auth::user()`                              | `req.auth().user::<User>().await?`。**`req` から読む**                                                                            |
+| `Auth::logoutOtherDevices($password)`       | `req.auth().logout_other_devices_async()`。パスワードの確認は自分で                                                               |
+| `redirect()->intended('/')`                 | `req.session().intended()` を読んで、自分で転送する                                                                               |
+| `$this->authorize('update', $post)`         | `authorize(PostPolicy::update(&user, &post))?`（ただの関数）                                                                      |
+| `encrypt()` / `decrypt()`                   | 同じ名前。機能フラグ `encryption` が要る                                                                                          |
+| `Password::sendResetLink()`                 | `PasswordReset::create()` ＋ `link()`。送信は自分で書く                                                                           |
+| `APP_KEY` は base64 の 32 バイト            | **64 文字以上**の文字列。`base64:...` の鍵は使えない（`key:generate` で作り直す）                                                 |
 
 くわしくは [authentication.md](authentication.md) と [authorization.md](authorization.md) にあります。
 
@@ -214,6 +233,7 @@ CSRF は、別のサイトからの なりすまし送信のことです。
 |------------------------------------------|------------------------------------------------------------|
 | `Cache::increment` は期限を引き継ぐ      | **引き継がない。** 期限なしになる                          |
 | `Storage::append` が挟む改行             | **どの OS でも `\n`**。挟まないなら `append_bytes`         |
+| `Storage::files()` はその階だけ          | **下の階まで返す**（Laravel の `allFiles()` に当たる）     |
 | `SendWelcome::dispatch()`                | `Queue::push("SendWelcome", &payload)`。ジョブは名前で呼ぶ |
 | ジョブの `public $timeout = 120;`        | `config/queue.rs` の `QueueConfig`。無ければ `--timeout`   |
 | `retry_after` は設定ファイル             | `queue:work --retry-after=`（既定 90 秒）                  |

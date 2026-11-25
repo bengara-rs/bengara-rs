@@ -19,7 +19,9 @@ pub struct Request {
     query: String,
     headers: Vec<(String, String)>,
     params: Vec<(String, String)>,
-    body: Vec<u8>,
+    /// 本文。`Arc` なのは、アップロードされたファイル（[`UploadedFile`](crate::UploadedFile)）が
+    /// 写さずに中身を指すためです。`Request` の複製も本文を写しません。
+    body: Arc<Vec<u8>>,
     /// 当たったルートの名前。
     ///
     /// `Arc<str>` なのは、1リクエストごとに `String` を作らないためです
@@ -47,6 +49,11 @@ pub struct Request {
     input_cache: OnceLock<Vec<(String, String)>>,
     cookie_cache: OnceLock<Vec<(String, String)>>,
     query_cache: OnceLock<Vec<(String, String)>>,
+    /// `multipart/form-data` の本文を読んだ結果（文字の欄とファイル）。
+    ///
+    /// ふつうは [`receive_body`](Self::receive_body) が本文を受けた直後に入れます
+    /// （壊れた本文をそこで 400・413 にするため）。
+    multipart_cache: OnceLock<crate::http::multipart::Multipart>,
     /// WebSocket への切り替えの口（`server.rs` が載せる）。取り出せるのは 1 回だけ。
     ///
     /// ふつうのリクエストでは空で、確保もしません。
@@ -60,6 +67,16 @@ pub struct Request {
     stream: crate::websocket::Slot<crate::http::body::BodyStream>,
     /// `.stream_body()` のルートに当たったか。`body_stream()` のエラー文を分けるために持ちます。
     streaming: bool,
+    /// 検査に落ちたときに前の画面へ戻す材料（[`validation_redirect`](Self::validation_redirect)）。
+    ///
+    /// ミドルウェアの段ごとに作り直さないよう、最初に作ったものを覚えます。
+    /// セッションが無い・`Referer` が無い要求では作りません。
+    back: OnceLock<Option<Arc<ValidationRedirect>>>,
+    /// この要求を認証した API のトークン（`Authenticate::token()` が載せる）。
+    ///
+    /// 要求ごとの欄です。共有の表には置きません。`Arc` なので、載せた後の複製は
+    /// 同じ行を指します。ふつうの要求では空で、確保もしません。
+    access_token: Option<Arc<crate::auth::PersonalAccessToken>>,
 }
 
 /// ログに出してよい形だけを出す。
@@ -131,7 +148,7 @@ impl Request {
             query: String::new(),
             headers: Vec::new(),
             params: Vec::new(),
-            body: Vec::new(),
+            body: Arc::default(),
             route_name: None,
             route_path: None,
             matched: false,
@@ -141,10 +158,13 @@ impl Request {
             input_cache: OnceLock::new(),
             cookie_cache: OnceLock::new(),
             query_cache: OnceLock::new(),
+            multipart_cache: OnceLock::new(),
             upgrade: crate::websocket::Slot::default(),
             pending: crate::websocket::Slot::default(),
             stream: crate::websocket::Slot::default(),
             streaming: false,
+            back: OnceLock::new(),
+            access_token: None,
         }
     }
 
@@ -158,8 +178,8 @@ impl Request {
     ///
     /// | ルート | すること |
     /// |---|---|
-    /// | ふつう | 全部読んで `body` に入れる（上限・30 秒） |
-    /// | `.stream_body()` | 読まずに `body_stream()` で取り出せるようにする |
+    /// | ふつう | 全部読んで `body` に入れる（上限・30 秒）。`multipart/form-data` はここで欄に分ける |
+    /// | `.stream_body()` | 読まずに `body_stream()` で取り出せるようにする（`multipart` も分けない） |
     ///
     /// 長さの申告（`Content-Length`）が上限を超えていれば、どちらも読まずに 413 です。
     /// エラー（413・400・408）はミドルウェアを通さずに返します。
@@ -173,6 +193,7 @@ impl Request {
             // 中身を直に載せた `Request`（枠組みの単体テスト）。読むものは無い。
             if policy.stream {
                 let bytes = std::mem::take(&mut self.body);
+                let bytes = Arc::try_unwrap(bytes).unwrap_or_else(|shared| shared.to_vec());
                 self.stream = crate::websocket::Slot::new(BodyStream::new(
                     PendingBody::memory(bytes),
                     policy.limit,
@@ -194,7 +215,13 @@ impl Request {
             self.streaming = true;
             return Ok(());
         }
-        self.body = read_all(pending, policy.limit, declared).await?;
+        self.body = Arc::new(read_all(pending, policy.limit, declared).await?);
+        // `multipart/form-data` はここで読む。壊れた本文（400）と上限超え（413）を、
+        // 本文の受け取りの失敗と同じく、ミドルウェアもハンドラも通さずに返すためです。
+        if self.is_multipart() {
+            let parsed = crate::http::multipart::parse(&self.body, self.content_type())?;
+            let _ = self.multipart_cache.set(parsed);
+        }
         Ok(())
     }
 
@@ -274,7 +301,7 @@ impl Request {
     /// サーバーとテストのクライアントは [`with_pending_body`](Self::with_pending_body) を使います。
     #[cfg(test)]
     pub(crate) fn with_body(mut self, body: Vec<u8>) -> Self {
-        self.body = body;
+        self.body = Arc::new(body);
         self
     }
 
@@ -334,6 +361,24 @@ impl Request {
         )
     }
 
+    /// この要求を認証したトークンを載せる。`Authenticate::token()` が呼びます。
+    pub(crate) fn set_access_token(&mut self, token: Arc<crate::auth::PersonalAccessToken>) {
+        self.access_token = Some(token);
+    }
+
+    /// `Authorization: Bearer ..` の値。Laravel の `bearerToken()` に当たります。
+    ///
+    /// - `Bearer` は大文字小文字を区別しません。
+    /// - ヘッダーが無い・`Bearer` で始まらない・値が空なら `None` です。
+    ///
+    /// **値をログに出さないでください。** そのまま使えるトークンです。
+    pub fn bearer_token(&self) -> Option<&str> {
+        let value = self.header("authorization")?.trim();
+        let (scheme, token) = value.split_once(' ')?;
+        let token = token.trim();
+        (scheme.eq_ignore_ascii_case("bearer") && !token.is_empty()).then_some(token)
+    }
+
     /// セッションがあれば返す。無くてもよい場面で使います。
     pub fn try_session(&self) -> Option<&crate::session::Session> {
         self.session.as_ref()
@@ -346,6 +391,7 @@ impl Request {
     /// ```
     pub fn auth(&self) -> crate::auth::Auth<'_> {
         crate::auth::Auth::new(self.session.as_ref())
+            .with_access_token(self.access_token.as_deref())
     }
 
     /// パス引数の値でモデルを1件読む。見つからなければ 404。
@@ -388,11 +434,11 @@ impl Request {
     /// ```
     ///
     /// [`bengara::view`](crate::view()) と同じです。加えて、テンプレートの中で
-    /// `csrf_field()`・`csrf_token()`・`old(key)` が使えます。
+    /// `csrf_field()`・`csrf_token()`・`old(key)` と、検査に落ちた理由の `errors` が使えます。
     /// セッションが無い（`StartSession` を通っていない）ときは、`csrf_field()` と
     /// `csrf_token()` が描画のエラーになり、`old()` は既定値を返します。
     ///
-    /// `context` に `csrf_token`・`csrf_field`・`old` の鍵があると 500 です。
+    /// `context` に `csrf_token`・`csrf_field`・`old`・`errors` の鍵があると 500 です。
     pub fn view(
         &self,
         name: &str,
@@ -619,6 +665,71 @@ impl Request {
         self.header("content-type").is_some_and(json_content_type)
     }
 
+    /// `Content-Type` の値。無ければ空文字。
+    fn content_type(&self) -> &str {
+        self.header("content-type").unwrap_or("")
+    }
+
+    /// 本文が `multipart/form-data` か。
+    fn is_multipart(&self) -> bool {
+        crate::http::multipart::is_multipart(self.content_type())
+    }
+
+    /// `multipart/form-data` の本文を読んだ結果。それ以外の要求では空です。
+    ///
+    /// ふつうは [`receive_body`](Self::receive_body) が入れたものを返します。
+    /// 本文を直に載せた単体テストでは、ここで読みます（壊れていれば空）。
+    /// `.stream_body()` のルートでは読みません。
+    fn multipart(&self) -> &crate::http::multipart::Multipart {
+        self.multipart_cache.get_or_init(|| {
+            if self.streaming || !self.is_multipart() {
+                return Default::default();
+            }
+            crate::http::multipart::parse(&self.body, self.content_type()).unwrap_or_default()
+        })
+    }
+
+    /// アップロードされたファイル。Laravel の `$request->file('avatar')` に当たります。
+    ///
+    /// ```ignore
+    /// if let Some(avatar) = req.file("avatar") {
+    ///     let path = avatar.store("avatars").await?;
+    /// }
+    /// ```
+    ///
+    /// 名前が `avatar[]` の欄も `avatar` で引けます（最初の 1 つを返します）。
+    /// 全部を受け取るときは [`files`](Self::files) を使ってください。
+    ///
+    /// 本文が `multipart/form-data` のときだけ入ります。`.stream_body()` のルートでは
+    /// 読まないので、いつも `None` です。ファイルを選ばずに送った欄も `None` です。
+    pub fn file(&self, name: &str) -> Option<&crate::http::UploadedFile> {
+        self.uploaded_files()
+            .iter()
+            .find(|(field, _)| file_field_is(field, name))
+            .map(|(_, file)| file)
+    }
+
+    /// 同じ名前のファイルを全部（送られてきた順）。`<input type="file" name="photos[]" multiple>` を受けます。
+    ///
+    /// `photos` と `photos[]` は同じに扱います。無ければ空です。
+    pub fn files(&self, name: &str) -> Vec<&crate::http::UploadedFile> {
+        self.uploaded_files()
+            .iter()
+            .filter(|(field, _)| file_field_is(field, name))
+            .map(|(_, file)| file)
+            .collect()
+    }
+
+    /// その名前のファイルが送られてきたか。Laravel の `hasFile` に当たります。
+    pub fn has_file(&self, name: &str) -> bool {
+        self.file(name).is_some()
+    }
+
+    /// アップロードされたファイルの全部（名前は送られてきたまま）。検査が使います。
+    pub(crate) fn uploaded_files(&self) -> &[(String, crate::http::UploadedFile)] {
+        &self.multipart().files
+    }
+
     /// フォームの値（最初に見つかったもの）。
     pub fn form(&self, key: &str) -> Option<String> {
         self.form_pairs()
@@ -628,12 +739,17 @@ impl Request {
     }
 
     /// フォームの一覧。本文がフォームでなければ空。
+    ///
+    /// `multipart/form-data` では文字の欄だけです（ファイルは [`file`](Self::file) で読みます）。
     pub fn form_all(&self) -> Vec<(String, String)> {
         self.form_pairs().to_vec()
     }
 
     /// フォームを解析した結果。1リクエストに1回だけ解析します。
     fn form_pairs(&self) -> &[(String, String)] {
+        if self.is_multipart() {
+            return &self.multipart().fields;
+        }
         self.form_cache.get_or_init(|| {
             if self.is_form() {
                 parse_query(&self.body_text())
@@ -648,6 +764,7 @@ impl Request {
     /// 優先する順は **本文 → クエリ** です。同じ名前なら本文が勝ちます。
     /// 本文は、フォームなら組として、JSON なら最上位の値だけを読みます
     /// （入れ子は `req.json::<T>()` で読んでください）。
+    /// `multipart/form-data` では文字の欄を送られてきた順に読み、ファイルは入れません。
     pub fn input_all(&self) -> Vec<(String, String)> {
         self.input_pairs().to_vec()
     }
@@ -659,7 +776,9 @@ impl Request {
     pub(crate) fn input_pairs(&self) -> &[(String, String)] {
         self.input_cache.get_or_init(|| {
             let mut out = Vec::new();
-            if self.is_form() {
+            // ファイルの欄は入れない。CSRF の `_token` と `validate` の文字の欄はここから読み、
+            // 検査に落ちたときに覚える入力（`old`）にもファイルが入らない。
+            if self.is_form() || self.is_multipart() {
                 out.extend_from_slice(self.form_pairs());
             } else if self.is_json_body() {
                 if let Ok(serde_json::Value::Object(map)) =
@@ -716,10 +835,20 @@ impl Request {
     /// ])?;
     /// ```
     ///
-    /// 落ちると `Error::Validation` になり、422 と理由の一覧が返ります。
-    /// 戻り値には**検査した項目だけ**が入ります。
+    /// 落ちると `Error::Validation` になります。戻り値には**検査した項目だけ**が入ります。
     /// 落ちたとき、**置き場所から読めたセッション**があれば入力を覚えておきます
     /// （`session.old("title")` で読めます）。
+    ///
+    /// 落ちたときの応答は次のとおりです（手で作った `Error::Validation` も同じ）。
+    ///
+    /// | 相手 | 応答 |
+    /// |---|---|
+    /// | JSON を求めている | 422 と理由の JSON |
+    /// | セッションが置き場所から読めた・`Referer` から戻り先が決まる | 302 で前の画面へ。理由と入力を flash する |
+    /// | それ以外 | 422 の画面 |
+    ///
+    /// 戻り先は `Referer` のパスとクエリだけです。オリジンが `APP_URL` か要求の `Host` と
+    /// 同じときだけ使います。GET と HEAD では、今の URL と同じなら戻しません。
     ///
     /// 値は前後の空白を落としてから検査します（Laravel の `TrimStrings` と同じ）。
     ///
@@ -728,7 +857,8 @@ impl Request {
     /// CSRF の確認を外した口に投げ続けると、ファイルが限りなく増えました。
     /// 「無いページではセッションを配らない」という判断と同じ理由です。
     pub fn validate(&self, rules: &[(&str, &str)]) -> Result<crate::validation::Validated> {
-        let input = crate::validation::Input::new(self.input_pairs().to_vec());
+        let input = crate::validation::Input::new(self.input_pairs().to_vec())
+            .with_files(self.uploaded_files().to_vec());
         match crate::validation::validate(&input, rules) {
             Ok(ok) => Ok(ok),
             Err(e) => {
@@ -761,6 +891,178 @@ impl Request {
         const { crate::validation::check_rules(T::RULES) };
         self.validate(T::RULES)?.to_typed()
     }
+
+    /// 検査に落ちたときに前の画面へ戻す材料。戻さない要求では `None` です。
+    ///
+    /// `Next::run` が、要求をミドルウェアやハンドラへ渡す**前**に呼びます。
+    /// エラーを応答に変える所には要求が残っていないので、ここで先に作っておきます。
+    /// 手で作った `Error::Validation` も同じく戻せるのはこのためです。
+    ///
+    /// 次のどれかなら作りません（今と同じ 422 になります）。
+    ///
+    /// | 条件 | 理由 |
+    /// |---|---|
+    /// | JSON を求めている | API の相手には 422 の JSON を返す |
+    /// | セッションが無い・置き場所から読めていない | 判断 121 と同じ。Cookie の無い相手にファイルを作らない |
+    /// | `Referer` が無い・戻り先が決まらない | 開いたリダイレクトを作らない |
+    /// | GET・HEAD で、戻り先が今の URL | 自分へ戻り続けるのを防ぐ |
+    ///
+    /// 作るのはこの要求で最初の 1 回だけで、あとは覚えたものを返します。
+    /// 入力（`redact` を通したもの）を写すので、セッションと `Referer` の両方が
+    /// ある要求だけにします。
+    pub(crate) fn validation_redirect(&self, wants_json: bool) -> Option<Arc<ValidationRedirect>> {
+        if wants_json {
+            return None;
+        }
+        let session = self.session.as_ref().filter(|s| s.was_loaded())?;
+        let referer = self.header("referer")?;
+        self.back
+            .get_or_init(|| {
+                let app_url = &crate::config_registry::app_config().url;
+                let location = back_location(referer, app_url, self.header("host"))?;
+                if matches!(self.method.as_str(), "GET" | "HEAD") && self.is_current(&location) {
+                    return None;
+                }
+                Some(Arc::new(ValidationRedirect {
+                    session: session.clone(),
+                    location,
+                    input: self.input_to_remember(),
+                }))
+            })
+            .clone()
+    }
+
+    /// `location`（パスとクエリ）が今の URL と同じか。
+    fn is_current(&self, location: &str) -> bool {
+        let (path, query) = location.split_once('?').unwrap_or((location, ""));
+        path == self.path && query == self.query
+    }
+
+    /// 前の画面に戻すときに覚える入力。`redact` を通します。
+    ///
+    /// 合計が上限を超えるときは写しません（`flash_input` が覚えないので、写すだけ無駄です）。
+    fn input_to_remember(&self) -> Option<Vec<(String, String)>> {
+        let pairs = self.input_pairs();
+        let total: usize = pairs
+            .iter()
+            .filter(|(k, _)| !is_sensitive(k))
+            .map(|(k, v)| k.len() + v.len())
+            .sum();
+        (total <= crate::session::MAX_OLD_INPUT_BYTES).then(|| redact(pairs))
+    }
+}
+
+/// 検査に落ちたときに前の画面へ戻す材料（[`Request::validation_redirect`]）。
+pub(crate) struct ValidationRedirect {
+    /// 理由と入力を flash するセッション。`StartSession` が保存するものと同じ中身を指します。
+    session: crate::session::Session,
+    /// 戻り先（パスとクエリだけ）。
+    location: String,
+    /// 覚える入力。上限を超えたときは `None`。
+    input: Option<Vec<(String, String)>>,
+}
+
+impl ValidationRedirect {
+    /// 理由と入力を flash して、302 の応答を返す。
+    ///
+    /// 理由が大きすぎて覚えられないときは `None` を返します（呼ぶ側は 422 にする）。
+    /// flash は `StartSession` が保存する**前**に書かれます。エラーを応答に変えるのは
+    /// `Next::run` の中で、`StartSession` はその `next.run` が返ってから保存するためです。
+    pub(crate) fn respond(
+        &self,
+        errors: &crate::validation::ValidationErrors,
+    ) -> Option<crate::http::Response> {
+        if !self.session.flash_errors(errors) {
+            return None;
+        }
+        if let Some(input) = &self.input {
+            self.session.flash_input(input);
+        }
+        Some(crate::http::Response::new(302).with_header("location", self.location.clone()))
+    }
+}
+
+/// `Referer` から、検査に落ちたときの戻り先（パスとクエリ）を決める。決まらなければ `None`。
+///
+/// | 項目 | 決めたこと |
+/// |---|---|
+/// | 形 | `http://` か `https://` で始まる絶対 URL。利用者の情報（`user@`）は断る |
+/// | 一致 | オリジン（スキーム・ホスト・ポート）が `APP_URL` と同じか、ホストとポートが要求の `Host` と同じ |
+/// | 返す形 | パスとクエリだけ。スキームとホストは入れない。`#` から後ろは落とす |
+/// | 断る形 | `//` で始まるパス・`\` を含む・制御文字や空白・ASCII でない文字を含む |
+///
+/// `Host` との一致も見るのは、開発中に `APP_URL=http://localhost:8000` のまま
+/// `127.0.0.1:8000` から開くことがあるためです。`Location` にはパスしか入れないので、
+/// `Host` を偽っても外のサイトへは飛ばせません。
+pub(crate) fn back_location(referer: &str, app_url: &str, host: Option<&str>) -> Option<String> {
+    // `\` はブラウザが `/` に直す。制御文字・空白・ASCII でない文字は Location に入れない。
+    if referer
+        .bytes()
+        .any(|b| b == b'\\' || !(0x21..=0x7e).contains(&b))
+    {
+        return None;
+    }
+    let (origin, rest) = split_origin(referer)?;
+    let same_app = split_origin(app_url).is_some_and(|(app, _)| app == origin);
+    let same_host = host.is_some_and(|host| {
+        let host = host.trim();
+        // `Host` にはスキームが無い。`Referer` のスキームの既定のポートで補う。
+        split_origin(&format!("{}://{host}", origin.scheme))
+            .is_some_and(|(given, rest)| rest.is_empty() && given == origin)
+    });
+    if !same_app && !same_host {
+        return None;
+    }
+    let rest = rest.split('#').next().unwrap_or_default();
+    let location = if rest.is_empty() {
+        "/".to_string()
+    } else if rest.starts_with('?') {
+        format!("/{rest}")
+    } else {
+        rest.to_string()
+    };
+    crate::auth::is_internal_path(&location).then_some(location)
+}
+
+/// URL のオリジン（スキーム・ホスト・ポート）。比べるためだけに使います。
+#[derive(PartialEq, Eq)]
+struct Origin {
+    scheme: &'static str,
+    host: String,
+    port: u16,
+}
+
+/// 絶対 URL をオリジンと残り（パス・クエリ・`#`）に分ける。http と https だけを読みます。
+fn split_origin(url: &str) -> Option<(Origin, &str)> {
+    let (scheme, rest) = url.split_once("://")?;
+    let (scheme, default_port) = if scheme.eq_ignore_ascii_case("http") {
+        ("http", 80)
+    } else if scheme.eq_ignore_ascii_case("https") {
+        ("https", 443)
+    } else {
+        return None;
+    };
+    let end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let (authority, rest) = rest.split_at(end);
+    // `user@host` は読まない（見た目のホストと実際のホストを食い違わせる手口）。
+    if authority.is_empty() || authority.contains('@') {
+        return None;
+    }
+    // `[::1]:8000` のような IPv6 も、最後の `:` の後ろが数字ならポートとして読む。
+    let (host, port) = match authority.rsplit_once(':') {
+        Some((host, port)) if !host.is_empty() && !port.contains(']') => {
+            (host, port.parse::<u16>().ok()?)
+        }
+        _ => (authority, default_port),
+    };
+    Some((
+        Origin {
+            scheme,
+            host: host.to_ascii_lowercase(),
+            port,
+        },
+        rest,
+    ))
 }
 
 /// セッションに残してはいけない語。
@@ -911,6 +1213,13 @@ pub(crate) fn json_content_type(value: &str) -> bool {
     )
 }
 
+/// ファイルの欄の名前 `field` が、`name` で引けるか（`name` そのものか `name[]`）。
+///
+/// `req.file`・`req.files` と、検査（`validation.rs`）が同じ決まりで引くために 1 か所に置きます。
+pub(crate) fn file_field_is(field: &str, name: &str) -> bool {
+    field == name || field.strip_suffix("[]") == Some(name)
+}
+
 /// `a=1&b=2` を組に分ける。値は `%xx` と `+` を元に戻します。
 pub(crate) fn parse_query(query: &str) -> Vec<(String, String)> {
     let mut out = Vec::new();
@@ -1008,6 +1317,34 @@ mod tests {
         let req = Request::new("get", "/")
             .with_headers(vec![("content-type".into(), "application/json".into())]);
         assert_eq!(req.header("Content-Type"), Some("application/json"));
+    }
+
+    #[test]
+    fn multipartの文字の欄は本文の入力でファイルは別() {
+        let body = b"--b\r\n\
+            Content-Disposition: form-data; name=\"_token\"\r\n\r\n\
+            from-multipart\r\n\
+            --b\r\n\
+            Content-Disposition: form-data; name=\"avatar\"; filename=\"a.png\"\r\n\r\n\
+            data\r\n\
+            --b--";
+        let req = Request::new("POST", "/")
+            .with_query("_token=from-query&q=1")
+            .with_headers(vec![(
+                "content-type".into(),
+                "multipart/form-data; boundary=b".into(),
+            )])
+            .with_body(body.to_vec());
+        // CSRF は本文の `_token` を読む。
+        assert_eq!(req.body_input("_token").as_deref(), Some("from-multipart"));
+        assert_eq!(req.form("_token").as_deref(), Some("from-multipart"));
+        assert_eq!(req.input("avatar"), None);
+        assert_eq!(req.input("q").as_deref(), Some("1"));
+        assert_eq!(req.file("avatar").map(|f| f.get()), Some(&b"data"[..]));
+        assert!(req.has_file("avatar") && !req.has_file("other"));
+        assert_eq!(req.files("avatar").len(), 1);
+        // 本文そのものも読める。
+        assert_eq!(req.body(), &body[..]);
     }
 
     #[test]
@@ -1473,5 +1810,171 @@ mod tests {
         assert_eq!(req.query_all().len(), 2);
         assert_eq!(req.page(), 2);
         assert_eq!(req.query_pairs().as_ptr(), first, "解析し直していない");
+    }
+
+    const APP: &str = "http://localhost:8000";
+
+    #[test]
+    fn 戻り先は同じオリジンのパスとクエリだけ() {
+        assert_eq!(
+            back_location("http://localhost:8000/posts/create?a=1#top", APP, None).as_deref(),
+            Some("/posts/create?a=1")
+        );
+        // パスが無い・クエリだけのときも、`/` から始まる形にする。
+        assert_eq!(
+            back_location("http://localhost:8000", APP, None).as_deref(),
+            Some("/")
+        );
+        assert_eq!(
+            back_location("http://localhost:8000?q=1", APP, None).as_deref(),
+            Some("/?q=1")
+        );
+        // スキームとホストは大文字小文字を区別しない。既定のポートは書いても同じ。
+        assert_eq!(
+            back_location("HTTP://LocalHost:80/x", "http://localhost", None).as_deref(),
+            Some("/x")
+        );
+    }
+
+    #[test]
+    fn 戻り先はapp_urlかhostのどちらかと一致すればよい() {
+        // `APP_URL` だけ一致。
+        assert_eq!(
+            back_location("http://localhost:8000/a", APP, Some("evil.example")).as_deref(),
+            Some("/a")
+        );
+        // `Host` だけ一致（`APP_URL=localhost` のまま 127.0.0.1 から開いた）。
+        assert_eq!(
+            back_location("http://127.0.0.1:8000/a", APP, Some("127.0.0.1:8000")).as_deref(),
+            Some("/a")
+        );
+        // ポートの無い `Host` は、`Referer` のスキームの既定のポート。
+        assert_eq!(
+            back_location("https://example.com/a", APP, Some("example.com")).as_deref(),
+            Some("/a")
+        );
+        assert_eq!(
+            back_location("https://example.com:8443/a", APP, Some("example.com")),
+            None
+        );
+        // どちらとも違う。
+        assert_eq!(
+            back_location("http://evil.example/a", APP, Some("localhost:8000")),
+            None
+        );
+        // スキームが違えば別のオリジン。
+        assert_eq!(back_location("https://localhost:8000/a", APP, None), None);
+        // Referer が無い場合は呼び出し側で None になる。Host も無ければ決まらない。
+        assert_eq!(back_location("http://127.0.0.1:8000/a", APP, None), None);
+    }
+
+    #[test]
+    fn 外へ出られる形の戻り先は断る() {
+        for bad in [
+            // パスが `//` で始まる（プロトコル相対）。
+            "http://localhost:8000//evil.example/x",
+            // `\` はブラウザが `/` に直す。
+            "http://localhost:8000/\\evil.example",
+            "http://localhost:8000/a\\b",
+            // 制御文字・空白。
+            "http://localhost:8000/a\tb",
+            "http://localhost:8000/a\r\nSet-Cookie: x=1",
+            "http://localhost:8000/a b",
+            // ASCII でない文字。
+            "http://localhost:8000/記事",
+            // 利用者の情報でホストを紛らわせる。
+            "http://localhost:8000@evil.example/a",
+            // 絶対 URL でない・http でない。
+            "//localhost:8000/a",
+            "/a",
+            "javascript://localhost:8000/%0aalert(1)",
+            "",
+        ] {
+            assert_eq!(
+                back_location(bad, APP, Some("localhost:8000")),
+                None,
+                "{bad:?}"
+            );
+        }
+    }
+
+    /// 置き場所から読めたことにしたセッションと、`Referer` を持つ要求。
+    fn with_referer(method: &str, path: &str, referer: &str) -> Request {
+        let mut req = Request::new(method, path).with_headers(vec![
+            ("referer".to_string(), referer.to_string()),
+            ("host".to_string(), "localhost:8000".to_string()),
+        ]);
+        req.set_session(crate::session::Session::empty().mark_loaded());
+        req
+    }
+
+    #[test]
+    fn 戻す材料は条件がそろったときだけ作る() {
+        let req = with_referer("POST", "/posts", "http://localhost:8000/posts/create");
+        let back = req.validation_redirect(false).expect("作る");
+        assert_eq!(back.location, "/posts/create");
+        // 2 回目は覚えたものを返す（段ごとに作り直さない）。
+        assert!(Arc::ptr_eq(&back, &req.validation_redirect(false).unwrap()));
+
+        // JSON を求める相手には作らない。
+        assert!(req.validation_redirect(true).is_none());
+
+        // セッションが置き場所から読めていない（Cookie の無い相手）。
+        let mut req = Request::new("POST", "/posts").with_headers(vec![(
+            "referer".to_string(),
+            "http://localhost:8000/posts/create".to_string(),
+        )]);
+        req.set_session(crate::session::Session::empty());
+        assert!(req.validation_redirect(false).is_none());
+
+        // セッションが無い。
+        let req = Request::new("POST", "/posts").with_headers(vec![(
+            "referer".to_string(),
+            "http://localhost:8000/posts/create".to_string(),
+        )]);
+        assert!(req.validation_redirect(false).is_none());
+
+        // Referer が無い。
+        let mut req = Request::new("POST", "/posts");
+        req.set_session(crate::session::Session::empty().mark_loaded());
+        assert!(req.validation_redirect(false).is_none());
+    }
+
+    #[test]
+    fn getで今のurlと同じ戻り先には戻さない() {
+        let req =
+            with_referer("GET", "/search", "http://localhost:8000/search?q=1").with_query("q=1");
+        assert!(req.validation_redirect(false).is_none());
+        let req = with_referer("HEAD", "/search", "http://localhost:8000/search");
+        assert!(req.validation_redirect(false).is_none());
+        // クエリが違えば戻す。
+        let req =
+            with_referer("GET", "/search", "http://localhost:8000/search?q=1").with_query("q=2");
+        assert!(req.validation_redirect(false).is_some());
+        // POST は同じ URL でも戻す（GET で開き直すため）。
+        let req = with_referer("POST", "/posts", "http://localhost:8000/posts");
+        assert!(req.validation_redirect(false).is_some());
+    }
+
+    #[test]
+    fn 戻す材料の入力は秘密を落とす() {
+        let req = with_referer("POST", "/login", "http://localhost:8000/login")
+            .with_headers(vec![
+                (
+                    "referer".to_string(),
+                    "http://localhost:8000/login".to_string(),
+                ),
+                ("host".to_string(), "localhost:8000".to_string()),
+                (
+                    "content-type".to_string(),
+                    "application/x-www-form-urlencoded".to_string(),
+                ),
+            ])
+            .with_body(b"email=a%40example.com&password=secret".to_vec());
+        let back = req.validation_redirect(false).unwrap();
+        assert_eq!(
+            back.input.as_deref(),
+            Some(&[("email".to_string(), "a@example.com".to_string())][..])
+        );
     }
 }

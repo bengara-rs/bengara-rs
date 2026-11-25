@@ -3,12 +3,17 @@
 //! | 型 | 止める相手 | Laravel |
 //! |---|---|---|
 //! | `Authenticate` | ログインしていない人 | `auth` |
+//! | `Authenticate::token()` | API のトークンを持たない人 | `auth:sanctum` |
 //! | `RedirectIfAuthenticated` | ログイン中の人 | `guest` |
+//! | `CheckAbilities` | 能力を**すべて**は持たないトークン | `abilities:` |
+//! | `CheckForAnyAbility` | 能力を**1 つも**持たないトークン | `ability:` |
 //!
 //! ```ignore
 //! // bootstrap/app.rs
 //! .alias("auth", Authenticate::new())
 //! .alias("guest", RedirectIfAuthenticated::new())
+//! .alias("auth:sanctum", Authenticate::token())
+//! .alias("abilities:posts:write", CheckAbilities::new(["posts:write"]))
 //! ```
 //!
 //! ```ignore
@@ -16,6 +21,7 @@
 //! Route::post("/login", AuthController::login).middleware("guest");
 //! ```
 
+use super::PersonalAccessToken;
 use crate::error::Error;
 use crate::http::handler::BoxFuture;
 use crate::http::middleware::{Middleware, Next};
@@ -82,12 +88,17 @@ fn remembers_intended(method: &str) -> bool {
 /// ログイン後の転送は `GET` で飛ぶので、`POST` 専用のパスを覚えても 405 になります。
 pub struct Authenticate {
     redirect_to: Option<String>,
+    /// セッションではなく、API のトークンで確かめるか（[`token`](Self::token)）。
+    token: bool,
 }
 
 impl Authenticate {
     /// 401 を返す形で作る。
     pub fn new() -> Self {
-        Self { redirect_to: None }
+        Self {
+            redirect_to: None,
+            token: false,
+        }
     }
 
     /// 画面からの場合に転送する先を決める。
@@ -96,8 +107,62 @@ impl Authenticate {
     pub fn redirect_to(path: impl Into<String>) -> Self {
         Self {
             redirect_to: Some(path.into()),
+            token: false,
         }
     }
+
+    /// API のトークン（`Authorization: Bearer ..`）で確かめる形で作る。
+    /// Laravel の `auth:sanctum` に当たります。
+    ///
+    /// ```ignore
+    /// // bootstrap/app.rs
+    /// .alias("auth:sanctum", Authenticate::token())
+    /// ```
+    ///
+    /// | 状況 | 返すもの |
+    /// |---|---|
+    /// | ヘッダーが無い・形が違う | 401 |
+    /// | 表に無い・消した・値が違う | 401 |
+    /// | 期限切れ（`expires_at` が過ぎた） | 401 |
+    /// | 通った | そのまま通す |
+    ///
+    /// - **転送しません。** 画面からの要求にも 401 を返します。
+    /// - **セッションを使いません。** 読みも書きもしないので、Cookie の無い要求で
+    ///   セッションのファイルが増えることもありません。`StartSession` が無くても動きます。
+    /// - 通ったら、その要求の中だけ「トークンの持ち主で認証済み」になります。
+    ///   `req.auth()` の `check()`・`id()`・`user::<U>()` が持ち主を返します。
+    /// - `last_used_at` を書きます。前に書いてから 60 秒たっていなければ書きません。
+    ///   書けなかったときは警告をログに出し、要求は通します。
+    /// - セッションでログインしていても、トークンが無ければ 401 です
+    ///   （SPA の Cookie 認証は作っていません）。
+    pub fn token() -> Self {
+        Self {
+            redirect_to: None,
+            token: true,
+        }
+    }
+}
+
+/// トークンで確かめる（[`Authenticate::token`]）。
+fn authenticate_token(req: Request, next: Next) -> BoxFuture {
+    let options = next.render_options();
+    Box::pin(async move {
+        let found = match req.bearer_token() {
+            Some(token) => PersonalAccessToken::find_token(token).await?,
+            None => None,
+        };
+        let Some(token) = found.filter(|token| !token.is_expired()) else {
+            let error = Error::http(401, "ログインしてください");
+            tracing::debug!("{error}");
+            return Ok(crate::http::response::error_response(&error, options));
+        };
+        if let Err(e) = token.touch_last_used().await {
+            tracing::warn!("トークンの last_used_at を書けませんでした: {e}");
+        }
+        let mut req = req;
+        req.set_access_token(std::sync::Arc::new(token));
+        next.run(req).await
+    })
 }
 
 impl Default for Authenticate {
@@ -108,6 +173,9 @@ impl Default for Authenticate {
 
 impl Middleware for Authenticate {
     fn handle(&self, req: Request, next: Next) -> BoxFuture {
+        if self.token {
+            return authenticate_token(req, next);
+        }
         // セッションが無いと、ログインしていても理由なく 401 になる。登録し忘れを知らせる。
         if req.try_session().is_none() {
             return Box::pin(async {
@@ -162,6 +230,7 @@ impl Middleware for Authenticate {
 ///
 /// | 状況 | 返すもの |
 /// |---|---|
+/// | セッションが無い（`StartSession` の登録し忘れ） | 500（直し方を書いたエラー） |
 /// | ログインしていない | そのまま通す |
 /// | JSON を期待している | 403 |
 /// | 転送先を指定していない | 403 |
@@ -202,6 +271,16 @@ impl Default for RedirectIfAuthenticated {
 
 impl Middleware for RedirectIfAuthenticated {
     fn handle(&self, req: Request, next: Next) -> BoxFuture {
+        // セッションが無いと、ログイン中の人も「ログインしていない」に見えて黙って通る。
+        // `Authenticate` と同じく、登録し忘れを知らせる。
+        if req.try_session().is_none() {
+            return Box::pin(async {
+                Err(Error::msg(
+                    "ログイン中かの確認にはセッションが要ります。bootstrap/app.rs で \
+                     StartSession を RedirectIfAuthenticated（guest）より前に登録してください",
+                ))
+            });
+        }
         if req.auth().guest() {
             return next.run(req);
         }
@@ -220,6 +299,106 @@ impl Middleware for RedirectIfAuthenticated {
             }
         })
     }
+}
+
+/// トークンが能力を**すべて**持っていなければ止める。Laravel の `abilities:` に当たります。
+///
+/// ```ignore
+/// // bootstrap/app.rs
+/// .alias("abilities:posts:write", CheckAbilities::new(["posts:write"]))
+/// ```
+///
+/// ```ignore
+/// Route::post("/api/posts", PostController::store)
+///     .middleware("auth:sanctum")
+///     .middleware("abilities:posts:write");
+/// ```
+///
+/// | 状況 | 返すもの |
+/// |---|---|
+/// | トークンで認証していない | 401 |
+/// | 足りない能力がある | 403 |
+/// | すべて持っている（`"*"` を含む） | そのまま通す |
+///
+/// - `Authenticate::token()` より**後ろ**に置いてください。前に置くと、
+///   まだ認証していないので必ず 401 になります。
+/// - セッションでログインしているだけの要求も 401 です（Laravel も同じ）。
+/// - 能力を 1 つも書かなければ、トークンがあれば通します。
+pub struct CheckAbilities {
+    abilities: Vec<String>,
+}
+
+impl CheckAbilities {
+    /// 要る能力を決めて作る。
+    pub fn new<I, S>(abilities: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        Self {
+            abilities: abilities.into_iter().map(Into::into).collect(),
+        }
+    }
+}
+
+impl Middleware for CheckAbilities {
+    fn handle(&self, req: Request, next: Next) -> BoxFuture {
+        let allowed = req
+            .auth()
+            .current_access_token()
+            .map(|token| self.abilities.iter().all(|a| token.can(a)));
+        check_ability(allowed, req, next)
+    }
+}
+
+/// トークンが能力を**1 つも**持っていなければ止める。Laravel の `ability:` に当たります。
+///
+/// ```ignore
+/// // bootstrap/app.rs
+/// .alias("ability:posts:read,posts:write", CheckForAnyAbility::new(["posts:read", "posts:write"]))
+/// ```
+///
+/// 返すものは [`CheckAbilities`] と同じです（認証していない → 401、持っていない → 403）。
+/// 能力を 1 つも書かなければ、いつも 403 です（Laravel も同じ）。
+pub struct CheckForAnyAbility {
+    abilities: Vec<String>,
+}
+
+impl CheckForAnyAbility {
+    /// 候補の能力を決めて作る。
+    pub fn new<I, S>(abilities: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        Self {
+            abilities: abilities.into_iter().map(Into::into).collect(),
+        }
+    }
+}
+
+impl Middleware for CheckForAnyAbility {
+    fn handle(&self, req: Request, next: Next) -> BoxFuture {
+        let allowed = req
+            .auth()
+            .current_access_token()
+            .map(|token| self.abilities.iter().any(|a| token.can(a)));
+        check_ability(allowed, req, next)
+    }
+}
+
+/// 能力の判定の結果で通すか止める。`None` はトークンで認証していない。
+fn check_ability(allowed: Option<bool>, req: Request, next: Next) -> BoxFuture {
+    let error = match allowed {
+        Some(true) => return next.run(req),
+        Some(false) => Error::http(403, "このトークンには、この操作の権限がありません"),
+        None => Error::http(401, "ログインしてください"),
+    };
+    let options = next.render_options();
+    Box::pin(async move {
+        tracing::debug!("{error}");
+        Ok(crate::http::response::error_response(&error, options))
+    })
 }
 
 #[cfg(test)]
@@ -291,6 +470,26 @@ mod tests {
         }));
         let options = crate::http::response::RenderOptions::new(false, false);
         let error = Authenticate::new()
+            .handle(req, Next::new(stack, handler, options))
+            .await
+            .unwrap_err();
+        assert_eq!(error.status(), 500);
+        assert!(error.to_string().contains("StartSession"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn guestもセッションが無ければ登録し忘れを知らせる() {
+        use crate::http::handler::Erased;
+        use std::sync::Arc;
+
+        // StartSession を付け忘れると、ログイン中の人も黙って通っていた。
+        let req = Request::new("POST", "/login");
+        let stack: Arc<[Arc<dyn Middleware>]> = Arc::from(Vec::new());
+        let handler = Arc::new(Erased::<_, ()>::new(|| async {
+            Ok(crate::http::Response::text("ok"))
+        }));
+        let options = crate::http::response::RenderOptions::new(false, false);
+        let error = RedirectIfAuthenticated::new()
             .handle(req, Next::new(stack, handler, options))
             .await
             .unwrap_err();
@@ -383,5 +582,114 @@ mod tests {
         assert!(!is_internal_path("profile"));
 
         assert_eq!(INTENDED_KEY, "bengara_auth_intended");
+    }
+
+    /// 能力の確認に 1 本通し、状態を返す。`abilities` が `None` ならトークンを載せない。
+    async fn ability_status(mw: impl Middleware, abilities: Option<&[&str]>) -> u16 {
+        use crate::http::handler::Erased;
+        use std::sync::Arc;
+
+        let mut req = Request::new("GET", "/api/posts");
+        if let Some(abilities) = abilities {
+            req.set_access_token(Arc::new(PersonalAccessToken::fake(
+                "App\\Models\\User",
+                "7",
+                abilities,
+            )));
+        }
+        let stack: Arc<[Arc<dyn Middleware>]> = Arc::from(Vec::new());
+        let handler = Arc::new(Erased::<_, ()>::new(|| async {
+            Ok(crate::http::Response::text("ok"))
+        }));
+        let options = crate::http::response::RenderOptions::new(false, false);
+        mw.handle(req, Next::new(stack, handler, options))
+            .await
+            .expect("応答が返る")
+            .status()
+    }
+
+    #[tokio::test]
+    async fn checkabilitiesはすべて要る() {
+        let mw = || CheckAbilities::new(["posts:read", "posts:write"]);
+        assert_eq!(
+            ability_status(mw(), Some(&["posts:read", "posts:write"])).await,
+            200
+        );
+        assert_eq!(ability_status(mw(), Some(&["posts:read"])).await, 403);
+        assert_eq!(ability_status(mw(), Some(&["*"])).await, 200);
+        assert_eq!(ability_status(mw(), Some(&[])).await, 403);
+        assert_eq!(ability_status(mw(), None).await, 401, "トークンが無い");
+        // 何も書かなければ、トークンがあれば通す（Laravel と同じ）。
+        let empty = || CheckAbilities::new(Vec::<String>::new());
+        assert_eq!(ability_status(empty(), Some(&[])).await, 200);
+        assert_eq!(ability_status(empty(), None).await, 401);
+    }
+
+    #[tokio::test]
+    async fn checkforanyabilityはどれか1つ() {
+        let mw = || CheckForAnyAbility::new(["posts:read", "posts:write"]);
+        assert_eq!(ability_status(mw(), Some(&["posts:write"])).await, 200);
+        assert_eq!(ability_status(mw(), Some(&["posts:read"])).await, 200);
+        assert_eq!(ability_status(mw(), Some(&["*"])).await, 200);
+        assert_eq!(ability_status(mw(), Some(&["users:read"])).await, 403);
+        assert_eq!(ability_status(mw(), None).await, 401, "トークンが無い");
+        // 何も書かなければ、いつも 403（Laravel と同じ）。
+        let empty = || CheckForAnyAbility::new(Vec::<String>::new());
+        assert_eq!(ability_status(empty(), Some(&["*"])).await, 403);
+    }
+
+    #[tokio::test]
+    async fn トークンの確認はセッションが無くても401を返す() {
+        use crate::http::handler::Erased;
+        use std::sync::Arc;
+
+        // ヘッダーが無ければ DB に行かずに 401。転送もしない。
+        for (headers, wants_json) in [
+            (vec![], false),
+            (vec![], true),
+            (
+                vec![("authorization".to_string(), "Basic abc".to_string())],
+                false,
+            ),
+            (
+                vec![("authorization".to_string(), "Bearer ".to_string())],
+                false,
+            ),
+        ] {
+            let req = Request::new("GET", "/api/me").with_headers(headers);
+            assert!(req.try_session().is_none());
+            let stack: Arc<[Arc<dyn Middleware>]> = Arc::from(Vec::new());
+            let handler = Arc::new(Erased::<_, ()>::new(|| async {
+                Ok(crate::http::Response::text("ok"))
+            }));
+            let options = crate::http::response::RenderOptions::new(false, wants_json);
+            let status = Authenticate::token()
+                .handle(req, Next::new(stack, handler, options))
+                .await
+                .expect("500 にしない")
+                .status();
+            assert_eq!(status, 401, "wants_json={wants_json}");
+        }
+        assert!(Authenticate::token().token);
+        assert!(!Authenticate::new().token);
+        assert!(!Authenticate::redirect_to("/login").token);
+    }
+
+    #[test]
+    fn bearerの値を取り出す() {
+        let token = |value: &str| {
+            Request::new("GET", "/")
+                .with_headers(vec![("authorization".to_string(), value.to_string())])
+                .bearer_token()
+                .map(str::to_string)
+        };
+        assert_eq!(token("Bearer 1|abc").as_deref(), Some("1|abc"));
+        assert_eq!(token("bearer  1|abc ").as_deref(), Some("1|abc"));
+        assert_eq!(token("BEARER x").as_deref(), Some("x"));
+        assert_eq!(token("Basic abc"), None);
+        assert_eq!(token("Bearer"), None);
+        assert_eq!(token("Bearer   "), None);
+        assert_eq!(token("Bearerabc"), None);
+        assert_eq!(Request::new("GET", "/").bearer_token(), None);
     }
 }

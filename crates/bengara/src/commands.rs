@@ -317,6 +317,13 @@ impl Options {
             }
 
             if let Some(value) = arg.strip_prefix("--queue=") {
+                // 空の名前は断る。通すと名前が "" のキューを見張り、`default` に
+                // 積んだジョブを 1 件も拾わないまま黙って待ち続ける。
+                if value.trim().is_empty() {
+                    return Err(crate::Error::msg(
+                        "--queue の値がありません（例: --queue=mail）",
+                    ));
+                }
                 options.queue = value.to_string();
             } else if let Some(value) = arg.strip_prefix("--tries=") {
                 options.tries = parse_number(value, "--tries")?;
@@ -440,6 +447,16 @@ mod tests {
         assert!(Options::parse("queue:work", &args(&["--tries=x"])).is_err());
         assert!(Options::parse("queue:work", &args(&["--tries=0"])).is_err());
         assert!(Options::parse("queue:work", &args(&["--retry-after=0"])).is_err());
+    }
+
+    #[test]
+    fn 空のキューの名前は断る() {
+        // 以前は名前が "" のキューを見張り、ジョブを拾わないまま待ち続けた。
+        let error = Options::parse("queue:work", &args(&["--queue="]))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("--queue"), "{error}");
+        assert!(Options::parse("queue:work", &args(&["--queue=  "])).is_err());
     }
 
     #[test]

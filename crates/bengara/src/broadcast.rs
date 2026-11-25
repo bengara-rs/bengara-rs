@@ -179,8 +179,14 @@ fn driver() -> &'static Driver {
 static SERVER: AtomicBool = AtomicBool::new(false);
 
 /// 「このプロセスはサーバー」と覚える。`serve` が呼びます。
+///
+/// **機能フラグ `websocket` が無いときは何もしません。** 接続を受ける口が無いので、
+/// サーバーでも memory の配信はどこにも届きません。覚えずにおくと、
+/// memory で送ったときに警告が出ます（`warn_not_server`）。
 pub(crate) fn mark_server() {
-    SERVER.store(true, Ordering::Release);
+    if cfg!(feature = "websocket") {
+        SERVER.store(true, Ordering::Release);
+    }
 }
 
 fn is_server() -> bool {
@@ -280,10 +286,17 @@ async fn send(driver: &Driver, channel: &str, kind: Kind<'_>) -> Result<()> {
 fn warn_not_server() {
     static WARNED: AtomicBool = AtomicBool::new(false);
     if !WARNED.swap(true, Ordering::AcqRel) {
-        tracing::warn!(
-            "このプロセスはサーバーではないので、memory の配信はどの接続にも届きません。\
-             別のプロセスから送るときは BROADCAST_CONNECTION=database にしてください"
-        );
+        if cfg!(feature = "websocket") {
+            tracing::warn!(
+                "このプロセスはサーバーではないので、memory の配信はどの接続にも届きません。\
+                 別のプロセスから送るときは BROADCAST_CONNECTION=database にしてください"
+            );
+        } else {
+            tracing::warn!(
+                "機能フラグ websocket が無いので、memory の配信はどの接続にも届きません。\
+                 Cargo.toml の bengara の features に \"websocket\" を足してください"
+            );
+        }
     }
 }
 
@@ -381,6 +394,9 @@ impl Broadcast {
     ///
     /// 送れない番号（1004〜1006、1015、1016〜2999、5000 以上、1000 未満）は 1000 に直します。
     /// 理由は 123 バイトを超えたら文字の境目で切ります。
+    ///
+    /// **[`fake`](Self::fake) の間は何もしません。** 名前を確かめるだけで、記録もしません
+    /// （`published` には出ません）。
     pub async fn disconnect(channel: &str, code: u16, reason: &str) -> Result<()> {
         if FAKE.load(Ordering::Acquire) {
             return check_channel(channel);
@@ -427,6 +443,8 @@ impl Broadcast {
     }
 
     /// 以後の `publish` を記録だけして送らない（テスト用）。記録は空から始めます。
+    ///
+    /// `disconnect` は記録しません（名前を確かめるだけで、送りもしません）。
     ///
     /// **記録はプロセスで共有です。** 使うテストは `testing::exclusive()` の札を取ってください
     /// （`Mail::sent()` と同じ）。札を手放すと fake は終わり、記録も空になります。
@@ -711,6 +729,14 @@ mod tests {
         assert_eq!(Driver::parse("MEMORY"), Driver::Memory);
         assert_eq!(Driver::parse(" database "), Driver::Database);
         assert_eq!(Driver::parse("redis"), Driver::Unknown("redis".into()));
+    }
+
+    #[test]
+    fn サーバーの印は機能フラグがあるときだけ付く() {
+        // フラグ無しでは接続を受ける口が無い。印を付けると memory の警告が消え、
+        // 届かないことに気づけなかった。
+        mark_server();
+        assert_eq!(is_server(), cfg!(feature = "websocket"));
     }
 
     #[test]

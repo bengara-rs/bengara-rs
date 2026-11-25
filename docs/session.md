@@ -19,6 +19,9 @@ cargo artisan key:generate
 | 長さ       | **64 文字以上**。無い・短いとリクエストが 500 になる  |
 | 作り直すと | いまのセッションと署名付き URL が**全部使えなくなる** |
 
+- **Laravel の `APP_KEY=base64:...` はそのまま使えません。** 51 文字なので「短すぎる」として断られます。
+  bengara の鍵は `key:generate` で作る 64 文字以上の文字列です。Laravel から移すときは作り直してください。
+
 くわしくは [configuration.md](configuration.md) にあります。
 
 ### 2. ミドルウェアを登録する
@@ -130,6 +133,9 @@ req.auth().logout()?;        // 中身を捨てて、Cookie を消す
 | `StartSession::file()`              | ファイル。期限は 120 分        |
 | `StartSession::memory()`            | メモリ。期限は 120 分          |
 | `StartSession::new(置き場所, 設定)` | 自分で作った置き場所（下の節） |
+
+- **`file()` と `memory()` は `SESSION_LIFETIME` を読みません。** 期限は常に 120 分（7200 秒）です。
+  `.env` の期限を効かせるなら `from_env()` を使うか、`with_config` で `lifetime_secs` を渡します。
 
 ### 同じセッションのリクエストは 1 本ずつ
 

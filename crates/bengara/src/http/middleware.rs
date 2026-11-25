@@ -84,8 +84,15 @@ impl Next {
     /// **返るのはいつも `Ok` です。** 内側で起きたエラーは、ここでレスポンスに変えてから返します。
     /// そうしないと、レスポンスに手を入れるミドルウェアが、エラーのときだけ素通りされてしまいます。
     /// 戻り値が `Result` なのは、ミドルウェア自身が `?` と `abort()` を使えるようにするためです。
+    ///
+    /// 検査に落ちたとき（`Error::Validation`）に前の画面へ戻す材料は、要求を先へ渡す
+    /// **前**にここで受け取ります。エラーを応答に変える時点では、要求はもう手元に無いためです
+    /// （`Request::validation_redirect` を参照）。
     pub fn run(self, req: Request) -> BoxFuture {
-        let options = self.options.clone();
+        let options = self
+            .options
+            .clone()
+            .with_back(req.validation_redirect(self.options.wants_json));
         let inner = match self.stack.get(self.index).cloned() {
             Some(middleware) => {
                 let next = Self {

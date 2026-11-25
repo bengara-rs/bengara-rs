@@ -1,5 +1,6 @@
 //! セッションを読み書きするミドルウェアと、CSRF の確認。
 
+use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -169,6 +170,10 @@ impl StartSession {
     }
 
     /// `storage/framework/sessions/` に置く（既定）。
+    ///
+    /// **`SESSION_LIFETIME` は読みません。** 期限は常に 120 分（7200 秒）です。
+    /// `.env` の期限を効かせるなら [`from_env`](Self::from_env) を使うか、
+    /// [`with_config`](Self::with_config) で `lifetime_secs` を渡してください。
     pub fn file() -> Self {
         let config = SessionConfig::default();
         let store = Arc::new(super::FileStore::default_path(config.lifetime_secs));
@@ -176,6 +181,9 @@ impl StartSession {
     }
 
     /// プロセスのメモリに置く。**テスト専用です。**
+    ///
+    /// **`SESSION_LIFETIME` は読みません。** 期限は常に 120 分（7200 秒）です
+    /// （[`file`](Self::file) と同じ）。
     pub fn memory() -> Self {
         let config = SessionConfig::default();
         let store = Arc::new(super::MemoryStore::new(config.lifetime_secs));
@@ -264,7 +272,7 @@ impl Middleware for StartSession {
 
         Box::pin(async move {
             let key = signing_key()?;
-            serve(store, config, key, req, next).await
+            serve(store, config, &key, req, next).await
         })
     }
 }
@@ -801,13 +809,30 @@ const SIGNING_LABEL: &str = "bengara:session";
 /// **一度作ったら使い回します。** `APP_KEY` は起動後に変わらないので、
 /// リクエストごとに HMAC-SHA256 を計算し直す意味がありません。
 /// 鍵が設定されていないときの案内だけは、毎回その場で作ります（まれなので）。
-fn signing_key() -> Result<&'static [u8]> {
+#[cfg(not(test))]
+fn signing_key() -> Result<Cow<'static, [u8]>> {
     static KEY: OnceLock<Vec<u8>> = OnceLock::new();
     if let Some(found) = KEY.get() {
-        return Ok(found.as_slice());
+        return Ok(Cow::Borrowed(found.as_slice()));
     }
-    let derived = crate::config_registry::app_config().derived_key(SIGNING_LABEL)?;
-    Ok(KEY.get_or_init(|| derived).as_slice())
+    let derived = derive_signing_key()?;
+    Ok(Cow::Borrowed(KEY.get_or_init(|| derived).as_slice()))
+}
+
+/// 署名の鍵。**テストでは覚えません**（`auth/encryption.rs` の `cipher` と同じ）。
+///
+/// テストの二進は 1 プロセスです。鍵を覚えてしまうと、最初にセッションを通った
+/// テストのときの設定（まだ登録していなければ既定値）から導いた鍵が残り、
+/// あとから別の `APP_KEY` を入れた設定を登録しても効きません。
+/// テストが実行順で揺れるので、テストのときだけ毎回導出します。
+#[cfg(test)]
+fn signing_key() -> Result<Cow<'static, [u8]>> {
+    Ok(Cow::Owned(derive_signing_key()?))
+}
+
+/// いまの設定の `APP_KEY` から、署名用の鍵を導く。
+fn derive_signing_key() -> Result<Vec<u8>> {
+    crate::config_registry::app_config().derived_key(SIGNING_LABEL)
 }
 
 /// `値|署名` の形にする。
@@ -1410,10 +1435,19 @@ mod tests {
     }
 
     #[test]
-    fn 署名の鍵は使い回す() {
-        // 2 回目は HMAC を計算し直さず、同じ値を指す。
+    fn 署名の鍵はテストでは覚えない() {
+        // 覚えると、先に通ったテストの設定から導いた鍵が残り、実行順で結果が揺れる。
+        // 毎回いまの設定から導き直す（`Cow::Owned`）。
         match (signing_key(), signing_key()) {
-            (Ok(a), Ok(b)) => assert!(a.as_ptr() == b.as_ptr(), "同じ鍵を指す"),
+            (Ok(a), Ok(b)) => {
+                assert!(matches!(a, Cow::Owned(_)), "覚えた鍵を指さない");
+                assert_eq!(a, b, "同じ設定からは同じ鍵");
+                assert_eq!(
+                    a.as_ref(),
+                    derive_signing_key().unwrap().as_slice(),
+                    "いまの設定から導いた鍵"
+                );
+            }
             // APP_KEY が無い環境。案内は毎回その場で作るので、どちらもエラー。
             (Err(_), Err(_)) => {}
             _ => panic!("鍵の判定が揺れた"),
@@ -2438,5 +2472,273 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(store.counts().3, writes, "保存は増えない");
+    }
+
+    // ---- 検査に落ちたら前の画面に戻す ----
+
+    /// フォームの画面の `Referer`。
+    const FORM_PAGE: &str = "http://localhost:8000/posts/create?draft=1";
+
+    /// タイトルの検査をするハンドラ。
+    fn store_post() -> Arc<dyn ErasedHandler> {
+        handler(|req: Request| async move {
+            req.validate(&[("title", "required")])?;
+            Ok(Response::text("saved"))
+        })
+    }
+
+    /// 検査は通るが、手で `Error::Validation` を作るハンドラ（重複の確かめなど）。
+    fn store_post_by_hand() -> Arc<dyn ErasedHandler> {
+        handler(|_req: Request| async move {
+            let mut errors = crate::validation::ValidationErrors::default();
+            errors.add("title", "その題はもう使われています。");
+            Err(Error::Validation(Box::new(errors)))
+        })
+    }
+
+    /// 前のリクエストで覚えた理由と入力を本文で返すハンドラ。
+    fn show_form() -> Arc<dyn ErasedHandler> {
+        handler(|req: Request| async move {
+            let session = req.session();
+            let errors = session.errors();
+            Ok(Response::text(format!(
+                "{}|{}|{}",
+                errors.get("title").first().cloned().unwrap_or_default(),
+                session.old("title").unwrap_or_default(),
+                session.old("password").unwrap_or_default(),
+            )))
+        })
+    }
+
+    /// `POST /posts` を `StartSession` → ハンドラの並びに通す。
+    async fn post(
+        store: &Arc<Counting>,
+        cookie: Option<&str>,
+        referer: Option<&str>,
+        body: &str,
+        wants_json: bool,
+        handler: Arc<dyn ErasedHandler>,
+    ) -> Response {
+        through_session(
+            store, "POST", "/posts", cookie, referer, body, wants_json, handler,
+        )
+        .await
+    }
+
+    /// `StartSession` → ハンドラの並びを、本物の `Next` で回す。
+    #[allow(clippy::too_many_arguments)]
+    async fn through_session(
+        store: &Arc<Counting>,
+        method: &str,
+        path: &str,
+        cookie: Option<&str>,
+        referer: Option<&str>,
+        body: &str,
+        wants_json: bool,
+        handler: Arc<dyn ErasedHandler>,
+    ) -> Response {
+        let mut headers = vec![
+            ("host".to_string(), "localhost:8000".to_string()),
+            (
+                "content-type".to_string(),
+                "application/x-www-form-urlencoded".to_string(),
+            ),
+        ];
+        if let Some(cookie) = cookie {
+            headers.push((
+                "cookie".to_string(),
+                format!("bengara_session={}", sign(cookie, TEST_KEY)),
+            ));
+        }
+        if let Some(referer) = referer {
+            headers.push(("referer".to_string(), referer.to_string()));
+        }
+        let mut req = Request::new(method, path)
+            .with_headers(headers)
+            .with_body(body.as_bytes().to_vec());
+        req.mark_matched();
+        let options = crate::http::response::RenderOptions::new(false, wants_json);
+        let next = Next::new(Arc::from(Vec::new()), handler, options.clone());
+        // `serve` が返したエラー（ハンドラの外）は、アプリと同じく応答に変える。
+        let result = serve(store.clone(), SessionConfig::default(), TEST_KEY, req, next).await;
+        crate::http::response::render(result, options)
+    }
+
+    /// 次の画面を開く（GET）。
+    async fn open(
+        store: &Arc<Counting>,
+        cookie: &str,
+        handler: Arc<dyn ErasedHandler>,
+    ) -> Response {
+        through_session(
+            store,
+            "GET",
+            "/posts/create",
+            Some(cookie),
+            None,
+            "",
+            false,
+            handler,
+        )
+        .await
+    }
+
+    fn body_of(response: &Response) -> String {
+        String::from_utf8_lossy(response.body()).into_owned()
+    }
+
+    #[tokio::test]
+    async fn 検査に落ちたら前の画面に戻し理由と入力は次の画面で1回だけ読める() {
+        let store = Counting::new();
+        store.seed("back-form", &[("x", "1")]);
+
+        let res = post(
+            &store,
+            Some("back-form"),
+            Some(FORM_PAGE),
+            "title=&body=%E6%9C%AC%E6%96%87&password=secret",
+            false,
+            store_post(),
+        )
+        .await;
+        assert_eq!(res.status(), 302);
+        // `Location` は `Referer` のパスとクエリだけ。
+        assert_eq!(res.header("location"), Some("/posts/create?draft=1"));
+
+        // flash は `StartSession` の保存より前に書かれている（保存された中身に入っている）。
+        let saved = store.peek("back-form").expect("保存されている");
+        let errors = saved.get("__flash:__errors").expect("理由を保存している");
+        assert!(errors.contains("title"), "{errors}");
+        let old = saved
+            .get("__flash:__old_input")
+            .expect("入力を保存している");
+        assert!(old.contains("本文"), "{old}");
+        assert!(!old.contains("secret"), "パスワードは覚えない: {old}");
+
+        // 次の画面で理由と前の入力が読める。パスワードは出ない。
+        let res = open(&store, "back-form", show_form()).await;
+        let body = body_of(&res);
+        let parts: Vec<&str> = body.split('|').collect();
+        assert!(!parts[0].is_empty(), "理由がある: {body}");
+        assert_eq!(parts[1], "", "空で送った題はそのまま空: {body}");
+        assert_eq!(parts[2], "", "パスワードは出ない: {body}");
+
+        // その次の画面では消えている。
+        let res = open(&store, "back-form", show_form()).await;
+        assert_eq!(body_of(&res), "||");
+    }
+
+    #[tokio::test]
+    async fn 手で作った検査のエラーも同じく戻す() {
+        let store = Counting::new();
+        store.seed("back-hand", &[("x", "1")]);
+
+        let res = post(
+            &store,
+            Some("back-hand"),
+            Some(FORM_PAGE),
+            "title=%E9%87%8D%E8%A4%87&password=secret",
+            false,
+            store_post_by_hand(),
+        )
+        .await;
+        assert_eq!(res.status(), 302);
+        assert_eq!(res.header("location"), Some("/posts/create?draft=1"));
+
+        // 前の入力も覚える（`validate()` を通っていなくても）。
+        let res = open(&store, "back-hand", show_form()).await;
+        assert_eq!(body_of(&res), "その題はもう使われています。|重複|");
+    }
+
+    #[tokio::test]
+    async fn jsonを求める相手には今と同じ422のjson() {
+        let store = Counting::new();
+        store.seed("back-json", &[("x", "1")]);
+
+        let res = post(
+            &store,
+            Some("back-json"),
+            Some(FORM_PAGE),
+            "title=",
+            true,
+            store_post(),
+        )
+        .await;
+        assert_eq!(res.status(), 422);
+        let json: serde_json::Value = serde_json::from_slice(res.body()).unwrap();
+        assert!(json["errors"]["title"].is_array(), "{json}");
+        assert!(store
+            .peek("back-json")
+            .is_none_or(|saved| !saved.contains_key("__flash:__errors")));
+    }
+
+    #[tokio::test]
+    async fn cookieの無い相手には今と同じ422の画面でファイルを作らない() {
+        let store = Counting::new();
+
+        let res = post(&store, None, Some(FORM_PAGE), "title=", false, store_post()).await;
+        assert_eq!(res.status(), 422);
+        assert!(body_of(&res).contains("422"), "{}", body_of(&res));
+        assert_eq!(store.counts().3, 0, "セッションを保存しない");
+        assert!(res.header("set-cookie").is_none());
+    }
+
+    #[tokio::test]
+    async fn 別のオリジンやrefererの無い要求は422の画面() {
+        let store = Counting::new();
+        store.seed("back-cross", &[("x", "1")]);
+
+        for referer in [
+            Some("http://evil.example/posts/create"),
+            Some("http://localhost:8000//evil.example/"),
+            None,
+        ] {
+            let res = post(
+                &store,
+                Some("back-cross"),
+                referer,
+                "title=",
+                false,
+                store_post(),
+            )
+            .await;
+            assert_eq!(res.status(), 422, "{referer:?}");
+            assert!(res.header("location").is_none());
+        }
+    }
+
+    #[cfg(feature = "view")]
+    #[tokio::test]
+    async fn 戻った画面のテンプレートでerrorsとoldが読める() {
+        static FORM: &[(&str, &str)] = &[(
+            "form.html",
+            "{% if errors.any() %}[{{ errors.first('title') }}]{% endif %}{{ old('title') }}|{{ old('password') }}",
+        )];
+
+        let store = Counting::new();
+        store.seed("back-view", &[("x", "1")]);
+        post(
+            &store,
+            Some("back-view"),
+            Some(FORM_PAGE),
+            "title=%3Cb%3E&password=secret",
+            false,
+            store_post_by_hand(),
+        )
+        .await;
+
+        let draw = || {
+            handler(|req: Request| async move {
+                let html =
+                    crate::view::render_with_session_for_test(FORM, "form", req.try_session())?;
+                Ok(Response::text(html))
+            })
+        };
+        let res = open(&store, "back-view", draw()).await;
+        assert_eq!(body_of(&res), "[その題はもう使われています。]&lt;b&gt;|");
+
+        // その次の画面では消えている。
+        let res = open(&store, "back-view", draw()).await;
+        assert_eq!(body_of(&res), "|");
     }
 }

@@ -27,11 +27,17 @@ pub(crate) fn normalize(raw: &str) -> String {
         return trimmed.to_string();
     }
     let kept = tail.trim_end_matches('0');
-    if kept.is_empty() {
-        head.to_string()
-    } else {
-        format!("{head}.{kept}")
+    if !kept.is_empty() {
+        return format!("{head}.{kept}");
     }
+    // `-0.0` は `0` にする。`-0` と `0` が別の文字列になると、同じ値を比べて食い違う。
+    if head
+        .strip_prefix('-')
+        .is_some_and(|digits| !digits.is_empty() && digits.bytes().all(|b| b == b'0'))
+    {
+        return "0".to_string();
+    }
+    head.to_string()
 }
 
 #[cfg(test)]
@@ -50,7 +56,10 @@ mod tests {
     fn 小数点だけ残るときは小数点も落とす() {
         assert_eq!(normalize("1.000"), "1");
         assert_eq!(normalize("0.00"), "0");
-        assert_eq!(normalize("-0.0"), "-0");
+        // 以前は `-0` を返していた。
+        assert_eq!(normalize("-0.0"), "0");
+        assert_eq!(normalize("-0.000"), "0");
+        assert_eq!(normalize("-10.0"), "-10");
     }
 
     #[test]

@@ -523,8 +523,15 @@ mod tests {
         let tx = Transaction {
             shared: Arc::new(shared(Box::new(FakeTx))),
         };
-        let ddl = r#"alter table "t" add column "label" varchar(255) not null default 'どっち?'"#;
-        // 利用者が書く生 SQL の口は、文字列の中の `?` も値の置き場所として数える。
+        // 文字列の中の `?` は、利用者の口でも数えない。
+        let quoted =
+            r#"alter table "t" add column "label" varchar(255) not null default 'どっち?'"#;
+        tx.statement(quoted, &[])
+            .await
+            .expect("文字列の中は数えない");
+        // 引用の外の `?`（PostgreSQL の JSONB の演算子など）は、利用者が書く生 SQL の口では
+        // 値の置き場所として数える。
+        let ddl = r#"alter table "t" add constraint "c" check ("data" ? 'key')"#;
         let message = match tx.statement(ddl, &[]).await {
             Ok(_) => panic!("検査に引っかかるはず"),
             Err(error) => error.to_string(),

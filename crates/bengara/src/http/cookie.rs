@@ -175,7 +175,8 @@ fn ascii_domain(domain: &str) -> Option<&str> {
         return Some(domain);
     }
     tracing::warn!(
-        "Cookie の Domain に ASCII 以外の文字があったので、Domain を付けません         （日本語のドメインは xn-- の形で書いてください）"
+        "Cookie の Domain に ASCII 以外の文字があったので、Domain を付けません\
+         （日本語のドメインは xn-- の形で書いてください）"
     );
     None
 }

@@ -88,7 +88,9 @@ pub fn try_config<T: Any + Send + Sync>() -> Option<&'static T> {
 }
 
 /// `config/app.rs` が返す基本設定。Laravel の `config/app.php` に当たります。
-#[derive(Debug, Clone)]
+///
+/// `{:?}` で出しても `key` の中身は出ません（[`Debug`] の実装を参照）。
+#[derive(Clone)]
 pub struct AppConfig {
     /// アプリ名。
     pub name: String,
@@ -112,6 +114,27 @@ pub struct AppConfig {
 /// それより短い値は、手で書いたものと考えて断ります。
 /// `APP_KEY=x` のような 1 文字でも HMAC は動いてしまうので、入口で止めます。
 pub(crate) const MIN_KEY_CHARS: usize = 64;
+
+/// `key`（`APP_KEY`）は伏せて、有無と長さだけを出す。
+///
+/// 自動の `Debug` だと、`tracing::debug!("{config:?}")` やパニックの文で鍵がそのまま
+/// ログに残ります。鍵が漏れると、セッションも署名付き URL も偽造できます。
+impl std::fmt::Debug for AppConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let key = if self.key.is_empty() {
+            "(空)".to_string()
+        } else {
+            format!("(伏せ字、{} 文字)", self.key.chars().count())
+        };
+        f.debug_struct("AppConfig")
+            .field("name", &self.name)
+            .field("env", &self.env)
+            .field("debug", &self.debug)
+            .field("url", &self.url)
+            .field("key", &format_args!("{key}"))
+            .finish()
+    }
+}
 
 impl Default for AppConfig {
     /// `config/app.rs` が無いときに使われる値。環境変数から組み立てます。
@@ -160,6 +183,7 @@ impl AppConfig {
         if length < MIN_KEY_CHARS {
             return Err(crate::Error::msg(format!(
                 "APP_KEY が短すぎます（いま {length} 文字、{MIN_KEY_CHARS} 文字以上が必要です）。\
+                 Laravel の `base64:...` の鍵はそのまま使えません。\
                  `cargo artisan key:generate --force` で作り直して .env に入れてください"
             )));
         }
@@ -225,6 +249,16 @@ mod tests {
             url: "http://localhost".into(),
             key: key.to_string(),
         }
+    }
+
+    #[test]
+    fn debugで出しても鍵は出ない() {
+        let key = "s3cr3t".repeat(20);
+        let text = format!("{:?}", with_key(&key));
+        assert!(!text.contains("s3cr3t"), "{text}");
+        assert!(text.contains("120 文字"), "{text}");
+        assert!(text.contains("name: \"test\""), "{text}");
+        assert!(format!("{:?}", with_key("")).contains("(空)"));
     }
 
     #[test]

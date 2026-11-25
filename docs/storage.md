@@ -67,6 +67,8 @@ let real: PathBuf = disk.path("logo.png")?;         // 実際の場所
 | `path(パス)`                     | `Result<PathBuf>`         | –                              |
 | `append_bytes(パス, Vec<u8>)`    | `Result<()>`              | –（`append` は改行を挟む別物） |
 | `write_stream(パス, BodyStream)` | `Result<u64>`             | –                              |
+| `put_file(場所, file)`           | `Result<String>`          | `file.store(場所)`             |
+| `put_file_as(場所, file, 名前)`  | `Result<String>`          | `file.store_as(場所, 名前)`    |
 
 - **設定に無い名前を `Storage::disk` に渡すと、パニックします。** 書き間違いにすぐ気づけるようにするためです。
 - 既定のディスクは `Storage::default_disk()?` で取れます。`size` や `files` を使うときに呼びます。
@@ -97,6 +99,8 @@ pub fn config() -> StorageConfig {
 ### 一覧を取る
 
 `files` は下のディレクトリまで全部見て、ディスクからの相対パスを返します。
+**Laravel と違います。** Laravel の `files` はその階だけで、下まで見るのは `allFiles` です。
+bengara の `files` は Laravel の `allFiles` に当たります。その階だけの一覧はありません。
 
 ```rust
 Storage::default_disk()?.files("notes").await?;
@@ -125,6 +129,38 @@ Storage::disk("local").append_bytes("chunks/a.bin", bytes).await?;
 - **同時に `append` すると、改行の有無がずれることがあります。** 何本ものリクエストから足すときは、自分で `\n` を付けて
   `append_bytes` を使います。
 - 既定のディスクには `Storage::default_disk()?.append_bytes(..)` と書きます。
+
+## アップロードを保存する
+
+`req.file("avatar")` で受け取ったファイル（[requests-and-responses.md](requests-and-responses.md)）を保存します。
+保存したパスが返ります。
+
+```rust
+let avatar = req.file("avatar").unwrap();
+
+let path = avatar.store("avatars").await?;                          // 既定のディスク。名前は乱数
+let path = avatar.store_as("avatars", "me.jpg").await?;             // 名前を決める
+let path = Storage::disk("public").put_file("avatars", avatar).await?;          // ディスクを選ぶ
+let path = Storage::disk("public").put_file_as("avatars", avatar, "me.jpg").await?;
+// path は "avatars/3f2a…9c.png" の形。public なら "/storage/avatars/3f2a…9c.png" で配られる
+```
+
+| Laravel                                  | bengara                                             |
+|------------------------------------------|-----------------------------------------------------|
+| `$file->store('avatars')`                | `file.store("avatars")`                             |
+| `$file->storeAs('avatars', 'me.jpg')`    | `file.store_as("avatars", "me.jpg")`                |
+| `$file->store('avatars', 'public')`      | `Storage::disk("public").put_file("avatars", file)` |
+| `Storage::disk('public')->putFile(..)`   | `Storage::disk("public").put_file(..)`              |
+| `Storage::disk('public')->putFileAs(..)` | `Storage::disk("public").put_file_as(..)`           |
+
+- `store` と `put_file` の名前は、40 文字の乱数です。
+- **拡張子は中身から推したもの（`jpg` `png` `gif` `webp` `bmp`）だけを付けます。** 推せなければ付けません。
+  送られてきた名前の拡張子は使いません。`a.png` と名乗る HTML を `public` に `.html` で置かれると、
+  ブラウザがそのページとして開くためです。SVG も同じ理由で推しません。
+- `store_as` と `put_file_as` の名前は 1 つの名前だけです。`/` と `\` を含むとエラーです。
+  ほかは下の「断るパス」と同じ確かめを通します。同じ名前があれば上書きします。
+- **送られてきた名前（`client_original_name()`）を、そのまま `store_as` に渡さないでください。** 拡張子を相手が選べます。
+- 書くのは `write` と同じです。原子的ではありません。
 
 ## 本文を少しずつ書く
 
@@ -167,6 +203,8 @@ pub async fn upload(req: Request) -> Result<Response> {
 - **どの OS でもエラーにします。** 開発機で通ったコードが、本番で失敗しないようにするためです。
 - 装置の名前は `CON` `PRN` `AUX` `NUL` `COM0`〜`COM9` `LPT0`〜`LPT9` などです。大文字小文字は見ません。
 - リンクは実体の場所で確かめます。置き場所そのものがリンクなのは構いません。
+- **`path()` は文字列だけを確かめます。** リンクの実体は見ません。返ったパスが外を指すリンクを
+  通ることがあります。自分で開くときは気をつけてください（`read` などはディスクのメソッドを使えば確かめます）。
 - 外を指すリンクには、`has` や `size` もエラーを返します。`delete` はリンクそのものを消します。
 
 ```rust

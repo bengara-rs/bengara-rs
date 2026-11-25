@@ -104,6 +104,31 @@ fn クエリビルダにも型付きの列を渡せる() {
 }
 
 #[test]
+fn having_op_にも型付きの列を渡せる() {
+    // 以前は `&str` だけを受けていた。
+    let (sql, bindings) = Post::query()
+        .group_by(&["status"])
+        .having_op(Post::VIEWS, ">", 10)
+        .to_sql();
+    assert_eq!(
+        sql,
+        "select * from \"posts\" group by \"status\" having \"views\" > ?"
+    );
+    assert_eq!(bindings, vec![Value::Int(10)]);
+
+    // クエリビルダでも、文字列の列名でも書ける。
+    let (sql, _) = DB::table("posts")
+        .group_by(&["status"])
+        .having_op(Post::VIEWS, ">", 10)
+        .having_op("status", "!=", "draft")
+        .to_sql();
+    assert!(
+        sql.ends_with("having \"views\" > ? and \"status\" != ?"),
+        "{sql}"
+    );
+}
+
+#[test]
 fn 日時の列には_carbon_を渡せて文字列で束縛する() {
     let (sql, bindings) = Post::query()
         .where_op(Post::PUBLISHED_AT, "<", Carbon::now())

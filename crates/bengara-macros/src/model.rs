@@ -289,13 +289,22 @@ fn struct_options(input: &DeriveInput) -> syn::Result<StructOptions> {
             continue;
         }
         attr.parse_nested_meta(|meta| {
+            // 2 回書いたときは断る。以前は後のほうが黙って勝っていた。
             if meta.path.is_ident("table") {
+                if table.is_some() {
+                    return Err(meta.error(
+                        "`table = ..` を 2 回書いています。表の名前は 1 つだけ書いてください",
+                    ));
+                }
                 let value: LitStr = meta.value()?.parse()?;
                 check_name(&value, NameKind::Table)?;
                 table = Some(value.value());
                 return Ok(());
             }
             if meta.path.is_ident("columns") {
+                if columns {
+                    return Err(meta.error("`columns` を 2 回書いています。1 回だけ書いてください"));
+                }
                 columns = true;
                 return Ok(());
             }
@@ -342,6 +351,7 @@ fn collect_fields(input: &DeriveInput) -> syn::Result<Vec<Field>> {
             primary: false,
             skip: false,
         };
+        let mut renamed = false;
         for attr in &field.attrs {
             if !attr.path().is_ident("model") {
                 continue;
@@ -356,9 +366,16 @@ fn collect_fields(input: &DeriveInput) -> syn::Result<Vec<Field>> {
                     return Ok(());
                 }
                 if meta.path.is_ident("column") {
+                    // `table` と同じく、2 回書いたら断る（後のほうが黙って勝たない）。
+                    if renamed {
+                        return Err(meta.error(
+                            "`column = ..` を 2 回書いています。列の名前は 1 つだけ書いてください",
+                        ));
+                    }
                     let value: LitStr = meta.value()?.parse()?;
                     check_name(&value, NameKind::Column)?;
                     info.column = value.value();
+                    renamed = true;
                     return Ok(());
                 }
                 Err(meta.error(
@@ -780,6 +797,31 @@ mod tests {
                 .unwrap_err();
         assert!(
             error.contains("`table = \"表の名前\"` と `columns` だけです"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn 同じ指定を_2_回書くとビルドで止める() {
+        // 以前は後のほうが黙って勝っていた。
+        for source in [
+            "#[model(table = \"posts\", table = \"articles\")] struct Post { id: i64 }",
+            "#[model(table = \"posts\")] #[model(table = \"articles\")] struct Post { id: i64 }",
+        ] {
+            let error = run(source).unwrap_err();
+            assert!(
+                error.contains("`table = ..` を 2 回書いています"),
+                "{error}"
+            );
+        }
+        let error = run("#[model(table = \"posts\", columns, columns)] struct Post { id: i64 }")
+            .unwrap_err();
+        assert!(error.contains("`columns` を 2 回書いています"), "{error}");
+        let error = run("#[model(table = \"posts\")] struct Post { id: i64, \
+             #[model(column = \"a\", column = \"b\")] title: String }")
+        .unwrap_err();
+        assert!(
+            error.contains("`column = ..` を 2 回書いています"),
             "{error}"
         );
     }

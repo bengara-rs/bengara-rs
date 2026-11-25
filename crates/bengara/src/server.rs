@@ -607,8 +607,12 @@ fn shutdown_timeout() -> Option<std::time::Duration> {
 }
 
 /// 設定の文字を上限時間に直す。`None` は「設定が無い」の意味です。
+///
+/// **空（空白だけを含む）は「設定が無い」と同じです。** `env()` と同じ規則です。
+/// 以前は空も数として読もうとしていて、`.env` の `APP_SHUTDOWN_TIMEOUT=` で
+/// 「数値ではありません」と警告が出ていました（ほかの設定は `env()` で黙って既定になる）。
 fn parse_timeout(raw: Option<&str>) -> Option<std::time::Duration> {
-    let secs = match raw {
+    let secs = match raw.filter(|raw| !raw.trim().is_empty()) {
         Some(raw) => match raw.trim().parse::<u64>() {
             Ok(secs) => secs,
             Err(_) => {
@@ -819,8 +823,14 @@ mod tests {
     #[test]
     fn 数値でなければ既定に落ちる() {
         assert_eq!(parse_timeout(Some("すぐ")), Some(Duration::from_secs(30)));
-        assert_eq!(parse_timeout(Some("")), Some(Duration::from_secs(30)));
         assert_eq!(parse_timeout(Some("-1")), Some(Duration::from_secs(30)));
+    }
+
+    #[test]
+    fn 上限時間の空は設定が無いのと同じ() {
+        // `env()` と同じく、空は未設定。以前は「数値ではありません」と警告が出ていた。
+        assert_eq!(parse_timeout(Some("")), parse_timeout(None));
+        assert_eq!(parse_timeout(Some("  	")), Some(Duration::from_secs(30)));
     }
 
     #[test]

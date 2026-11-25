@@ -66,7 +66,7 @@ impl Carbon {
     pub fn parse(text: &str) -> Result<Self> {
         let error = || {
             Error::msg(format!(
-                "`{text}` は日時として読めません（YYYY-MM-DD か YYYY-MM-DD HH:MM:SS。UTC です）"
+                "`{text}` は日時として読めません（YYYY-MM-DD か YYYY-MM-DD HH:MM(:SS)。UTC です）"
             ))
         };
         let trimmed = text.trim();
@@ -389,7 +389,7 @@ mod tests {
         );
         let error = Carbon::parse("2026-02-30").unwrap_err().to_string();
         assert!(
-            error.contains("`2026-02-30` は日時として読めません（YYYY-MM-DD か YYYY-MM-DD HH:MM:SS。UTC です）"),
+            error.contains("`2026-02-30` は日時として読めません（YYYY-MM-DD か YYYY-MM-DD HH:MM(:SS)。UTC です）"),
             "{error}"
         );
     }

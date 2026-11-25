@@ -72,11 +72,61 @@ pub(crate) fn placeholder(driver: Driver, index: usize) -> String {
     }
 }
 
+/// 利用者が書いた SQL を 1 文字ずつ見て、引用の外にあるかを添えて返す。
+///
+/// `?` と `$` を見る 3 か所（[`count_placeholders`]・[`number_placeholders`]・
+/// [`has_dollar`]）が、すべてこれを通ります。数え方と振り直し方を食い違わせないためです。
+///
+/// 次の中は「外」としません。
+///
+/// - 文字列リテラル `'...'`。`''` の逃がしは、閉じてすぐ開き直すのと同じなので、そのまま扱えます。
+/// - 引用した名前 `"..."` と `` `...` ``。
+///
+/// 以前は SQL 全体の `?` と `$` を数えていました。`where_raw("label = '$100'")` が
+/// PostgreSQL で断られ、`'?'` の入った SQL は値の数が合わないと言われていました。
+///
+/// **バックスラッシュの逃がし（MySQL の `'it\'s'`）は見ません。** 標準の SQL と
+/// PostgreSQL・SQLite では `\` はただの文字です。ドライバで数え方を変えると、
+/// 組み立ての検査と終端の振り直しが食い違うので、どのドライバでも同じにしています。
+/// コメント（`--` / `/* */`）の中も「外」として数えます。
+fn outside_quotes(sql: &str) -> impl Iterator<Item = (char, bool)> + '_ {
+    let mut open: Option<char> = None;
+    sql.chars().map(move |c| match open {
+        Some(quote) => {
+            if c == quote {
+                open = None;
+            }
+            (c, false)
+        }
+        None => {
+            if matches!(c, '\'' | '"' | '`') {
+                open = Some(c);
+                (c, false)
+            } else {
+                (c, true)
+            }
+        }
+    })
+}
+
 /// 利用者が書いた SQL の `?` の数。
 ///
-/// **文字列の中の `?` も数えます。** `?` は値の置き場所としてしか使えません。
+/// 文字列リテラルと引用した名前の中の `?` は数えません（[`outside_quotes`]）。
+///
+/// **PostgreSQL の JSONB の演算子 `?` `?|` `?&` も置き場所として数えます。**
+/// 値の置き場所と区別できないためです。`jsonb_exists(列, 'キー')` のような関数で書いてください。
 pub(crate) fn count_placeholders(sql: &str) -> usize {
-    sql.matches('?').count()
+    outside_quotes(sql)
+        .filter(|&(c, outside)| outside && c == '?')
+        .count()
+}
+
+/// 利用者が書いた SQL の、引用の外に `$` があるか。
+///
+/// PostgreSQL の `$1` の直書きを見つけるために使います。`'$100'` のような
+/// 文字列リテラルの中の `$` は見ません（[`outside_quotes`]）。
+pub(crate) fn has_dollar(sql: &str) -> bool {
+    outside_quotes(sql).any(|(c, outside)| outside && c == '$')
 }
 
 /// 利用者が書いた SQL の `?` を、ドライバの書き方に直す。
@@ -89,8 +139,9 @@ pub(crate) fn number_placeholders(driver: Driver, sql: &str, already: usize) -> 
     }
     let mut out = String::with_capacity(sql.len() + 8);
     let mut index = already;
-    for c in sql.chars() {
-        if c == '?' {
+    // 振り直すのは `count_placeholders` が数える `?` だけ。文字列の中の `?` は残す。
+    for (c, outside) in outside_quotes(sql) {
+        if outside && c == '?' {
             index += 1;
             out.push_str(&placeholder(driver, index));
         } else {
@@ -576,6 +627,29 @@ mod tests {
         // ほかのドライバは触らない。
         assert_eq!(number_placeholders(Driver::MySql, "a = ?", 0), "a = ?");
         assert_eq!(number_placeholders(Driver::Sqlite, "a = ?", 5), "a = ?");
+    }
+
+    #[test]
+    fn 引用の中の_question_と_dollar_は数えない() {
+        // 以前は SQL 全体を数えていた。`'?'` の入った SQL は値の数が合わないと言われ、
+        // `'$100'` は PostgreSQL で `$1` の直書きとして断られていた。
+        assert_eq!(count_placeholders("label = '?' and id = ?"), 1);
+        assert_eq!(
+            count_placeholders(r#"select "a?b", `c?d` from t where x = ?"#),
+            1
+        );
+        // `''` の逃がしをはさんでも、文字列の中のまま。
+        assert_eq!(count_placeholders("note = 'it''s ?' and id = ?"), 1);
+        assert_eq!(
+            number_placeholders(Driver::Postgres, "note = 'it''s ?' and id = ?", 0),
+            "note = 'it''s ?' and id = $1"
+        );
+        assert!(!has_dollar("label = '$100'"));
+        assert!(!has_dollar(r#""price$" > 0"#));
+        assert!(has_dollar("views > $1"));
+        assert!(has_dollar("label = '$100' and views > $1"));
+        // JSONB の `?` は従来どおり置き場所として数える。
+        assert_eq!(count_placeholders("data ? 'key'"), 1);
     }
 
     #[test]

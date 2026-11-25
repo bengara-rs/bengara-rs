@@ -380,7 +380,13 @@ impl Event {
     /// 「ついでの処理」（通知など）で、本体を止めたくないときに使います。
     pub async fn try_dispatch<T: serde::Serialize>(event: &str, payload: &T) -> Result<()> {
         let text = serde_json::to_string(payload)?;
-        try_dispatch_in(&events(), event, &text).await
+        Self::try_dispatch_raw(event, &text).await
+    }
+
+    /// 文字列をそのまま渡して知らせる。**失敗しても次を呼びます**
+    /// （[`try_dispatch`](Self::try_dispatch) の文字列版。`dispatch_raw` と対です）。
+    pub async fn try_dispatch_raw(event: &str, payload: &str) -> Result<()> {
+        try_dispatch_in(&events(), event, payload).await
     }
 
     /// 聞いている処理があるか。
@@ -743,5 +749,30 @@ mod tests {
             .await
             .unwrap();
         Event::dispatch("登録していない出来事", &42).await.unwrap();
+        Event::try_dispatch_raw("登録していない出来事", "{}")
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn try_dispatch_rawは文字列のまま渡し失敗しても次を呼ぶ() {
+        // プロセス共通の表を書くので札を取る（`install` の説明を見てください）。
+        let _lock = crate::testing::exclusive().await;
+        const KEY: &str = "events.try_dispatch_raw";
+
+        let log = Log::new();
+        install(
+            Events::new()
+                .listen(KEY, fail)
+                .listen(KEY, log.recorder("next")),
+        );
+
+        // 1 件目が失敗しても 2 件目に届く。中身は JSON にせず、そのまま渡す。
+        Event::try_dispatch_raw(KEY, "生の文字").await.unwrap();
+        assert_eq!(log.taken(), vec!["next:生の文字".to_string()]);
+
+        // `dispatch_raw` は 1 件目で止まる。
+        assert!(Event::dispatch_raw(KEY, "生の文字").await.is_err());
+        assert!(log.taken().is_empty());
     }
 }

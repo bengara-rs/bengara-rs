@@ -53,7 +53,10 @@ pub struct MailConfig {
     /// SMTP サーバのポート。**0 のときは `encryption` から決めます**
     /// （`tls` は 465、`starttls` は 587、`none` は 25）。
     pub port: u16,
-    /// 暗号化の仕方（`tls` / `starttls` / `none`）。
+    /// 暗号化の仕方（`tls` / `ssl` / `smtps` / `starttls` / `none` / `null` / `false`）。
+    ///
+    /// `ssl` は `tls` の別名、`null` と `false` は `none` の別名です。大文字小文字と
+    /// 前後の空白は見ません。空は `starttls` で、知らない語は警告を出して `starttls` にします。
     ///
     /// `tls`（`ssl`）は、ポートが 465 か 0 のときだけ「つないだ直後から暗号化」
     /// します。ほかのポート（587 など）では `STARTTLS` を使います（Laravel と同じ）。
@@ -222,7 +225,24 @@ fn driver_set(mailer: Option<&str>, driver: Option<&str>) -> bool {
 }
 
 /// いまの送り先の名前（`about` の表示用）。
+///
+/// 送り先が決まっていれば、**実際に入っている送り先の名前**を返します。
+/// テスト（`#[bengara::test]`）では設定が `log` でも `array` が入るので、
+/// 設定の名前だけを見ると食い違いました。まだ決まっていなければ設定の名前です。
 pub(crate) fn driver_label() -> String {
+    label_of(MAILER.get())
+}
+
+/// [`driver_label`] の中身（`MAILER` は 1 回しか決まらないので、テストから確かめるため）。
+fn label_of(installed: Option<&Installed>) -> String {
+    match installed {
+        Some(installed) => installed.label.clone(),
+        None => config_label(),
+    }
+}
+
+/// 設定に書いた送り先の名前（大文字小文字と前後の空白をそろえたもの）。
+fn config_label() -> String {
     config().driver.trim().to_ascii_lowercase()
 }
 
@@ -327,6 +347,8 @@ impl Mailer for LogMailer {
             .create(true)
             .append(true)
             .open(&path)?;
+        // 1 通を 1 回の `write_all` で書く（錠は取りません）。追記で開いているので、
+        // 同時に送っても 1 通の途中に別の 1 通が割り込みにくくなります。
         file.write_all(message.to_log().as_bytes())?;
         tracing::info!("メールを {} に書き出しました", path.display());
         Ok(())
@@ -352,13 +374,31 @@ impl Mailer for ArrayMailer {
     }
 }
 
-static MAILER: OnceLock<Box<dyn Mailer>> = OnceLock::new();
+/// 入っている送り先と、その名前（`about` の表示用）。
+struct Installed {
+    mailer: Box<dyn Mailer>,
+    label: String,
+}
+
+static MAILER: OnceLock<Installed> = OnceLock::new();
+
+/// 自分で作った送り先の名前（`about` の表示用）。
+const CUSTOM_LABEL: &str = "custom（install_mailer）";
 
 /// 送り先を差し替える。`bootstrap/app.rs` かテストから呼びます。
 ///
 /// 1回目だけ効きます。2回目以降は何もせず、警告を出します。
 pub fn install_mailer(mailer: Box<dyn Mailer>) {
-    if MAILER.set(mailer).is_err() {
+    install_labeled(mailer, CUSTOM_LABEL);
+}
+
+/// 名前を付けて送り先を入れる。1回目だけ効きます。
+fn install_labeled(mailer: Box<dyn Mailer>, label: &str) {
+    let installed = Installed {
+        mailer,
+        label: label.to_string(),
+    };
+    if MAILER.set(installed).is_err() {
         tracing::warn!("メールの送り先は既に決まっています。この install_mailer は効きません");
     }
 }
@@ -372,7 +412,7 @@ pub(crate) fn install_test_mailer() {
     if driver_set_in_env() {
         return;
     }
-    install_mailer(Box::new(ArrayMailer));
+    install_labeled(Box::new(ArrayMailer), "array");
 }
 
 /// 送れない送り先。理由だけを持ちます。
@@ -457,7 +497,11 @@ fn make_smtp_mailer() -> Box<dyn Mailer> {
 
 fn mailer() -> &'static dyn Mailer {
     MAILER
-        .get_or_init(|| make_mailer(&config().driver))
+        .get_or_init(|| Installed {
+            mailer: make_mailer(&config().driver),
+            label: config_label(),
+        })
+        .mailer
         .as_ref()
 }
 
@@ -652,6 +696,20 @@ mod tests {
     use super::*;
 
     #[test]
+    fn aboutの名前は入っている送り先を見る() {
+        // テストでは設定が `log` のままでも `array` が入る。設定の名前だけを
+        // 見ていたころは、`about` が `log` と出ていた。
+        let array = Installed {
+            mailer: Box::new(ArrayMailer),
+            label: "array".to_string(),
+        };
+        assert_eq!(label_of(Some(&array)), "array");
+        // まだ決まっていなければ設定の名前。
+        assert_eq!(label_of(None), config_label());
+        assert!(CUSTOM_LABEL.contains("install_mailer"));
+    }
+
+    #[test]
     fn 既定の設定() {
         let config = MailConfig::default();
         assert_eq!(config.driver, "log");
@@ -742,10 +800,8 @@ mod tests {
         std::mem::take(&mut *SPY.lock().unwrap_or_else(|e| e.into_inner()))
     }
 
-    /// `SENT` を見るテストを直列にする錠。
-    ///
-    /// `Mail::clear_sent` を呼ぶテストが並行して走ると、互いの中身を消します。
-    static SENT_LOCK: Mutex<()> = Mutex::new(());
+    // `SENT` を見るテストは `testing::exclusive()` の札で直列にします。
+    // 札を手放すと `Mail::sent()` が空になるので、別の錠では守れません。
 
     #[tokio::test]
     async fn 宛先と本文が無ければ断る() {
@@ -931,9 +987,9 @@ mod tests {
         assert!(spied().is_empty(), "送り先まで届かない");
     }
 
-    #[test]
-    fn 送り先は名前で選ぶ() {
-        let _guard = SENT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    #[tokio::test]
+    async fn 送り先は名前で選ぶ() {
+        let _lock = crate::testing::exclusive().await;
         let message = Message {
             to: vec!["a@example.com".to_string()],
             subject: "件名".into(),
@@ -994,9 +1050,9 @@ mod tests {
         assert!(driver_set(None, Some("smtp")));
     }
 
-    #[test]
-    fn smtp_は_log_にも_array_にも落ちない() {
-        let _guard = SENT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    #[tokio::test]
+    async fn smtp_は_log_にも_array_にも落ちない() {
+        let _lock = crate::testing::exclusive().await;
         Mail::clear_sent();
         let mailer = make_mailer("smtp");
 
@@ -1031,7 +1087,7 @@ mod tests {
     #[tokio::test]
     async fn 溜める送り先は一覧に出る() {
         // install は1回しか効かないので、送り先を直接使う。
-        let _guard = SENT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _lock = crate::testing::exclusive().await;
         Mail::clear_sent();
         let mailer = ArrayMailer;
         let message = Mail::to("a@example.com")

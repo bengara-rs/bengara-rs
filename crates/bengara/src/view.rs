@@ -45,7 +45,8 @@ use crate::http::Response;
 /// ```
 ///
 /// `context` は構造体か `json!({ .. })` のオブジェクト、または `()`（空）です。
-/// CSRF のトークンや前の入力をテンプレートで使うときは [`Request::view`](crate::Request::view) を使います。
+/// CSRF のトークン・前の入力・検査に落ちた理由（`errors`）をテンプレートで使うときは
+/// [`Request::view`](crate::Request::view) を使います（ここでは `errors` はいつも空です）。
 ///
 /// # エラー
 ///
@@ -79,6 +80,17 @@ pub(crate) fn request_view(
     crate::html(imp::render(name, &context, Some(session))?)
 }
 
+/// 渡した一覧から `Request::view` と同じ文脈で描く（ほかのモジュールのテスト用）。
+#[cfg(all(test, feature = "view"))]
+pub(crate) fn render_with_session_for_test(
+    views: &'static [(&'static str, &'static str)],
+    name: &str,
+    session: Option<&crate::session::Session>,
+) -> Result<String> {
+    let env = imp::embedded_env(views).map_err(crate::Error::msg)?;
+    imp::render_in(&env, name, imp::to_context(&(), Some(session))?)
+}
+
 /// 埋め込んだ一覧を固定する。`bengara::app!()` が生成したものを渡します。
 ///
 /// 2 回目は黙って無視します（テストから複数回呼ばれても落ちないように）。
@@ -97,17 +109,89 @@ pub(crate) fn check_embedded() -> Result<()> {
 mod imp {
     use std::borrow::Cow;
     use std::path::{Path, PathBuf};
-    use std::sync::OnceLock;
+    use std::sync::{Arc, OnceLock};
 
-    use minijinja::value::{Rest, Serde, ValueKind};
-    use minijinja::{AutoEscape, Environment, ErrorKind, UndefinedBehavior, Value};
+    use minijinja::value::{from_args, Object, ObjectRepr, Rest, Serde, ValueKind};
+    use minijinja::{AutoEscape, Environment, ErrorKind, State, UndefinedBehavior, Value};
     use serde::Serialize;
 
     use crate::error::{Error, Result};
     use crate::session::Session;
+    use crate::validation::ValidationErrors;
 
-    /// リクエストの関数の名前。利用者の `context` には使えません。
-    const RESERVED: [&str; 3] = ["csrf_token", "csrf_field", "old"];
+    /// リクエストの関数の名前。
+    const FUNCTIONS: [&str; 3] = ["csrf_token", "csrf_field", "old"];
+
+    /// 検査に落ちた理由を入れる値の名前（Laravel の `$errors`）。
+    const ERRORS: &str = "errors";
+
+    /// 利用者の `context` に使えない名前（リクエストの関数と `errors`）。
+    const RESERVED: [&str; 4] = ["csrf_token", "csrf_field", "old", ERRORS];
+
+    /// テンプレートの `errors`。Laravel の `$errors`（MessageBag）と同じ名前のメソッドを持ちます。
+    ///
+    /// | 書き方 | 返すもの |
+    /// |---|---|
+    /// | `errors.any()` | 1 件でもあれば真 |
+    /// | `errors.has("title")` | その項目に理由があれば真 |
+    /// | `errors.first("title")` | その項目の最初の理由。無ければ空文字 |
+    /// | `errors.first()` | 全項目で最初の理由。無ければ空文字 |
+    /// | `errors.get("title")` | その項目の理由の一覧 |
+    /// | `errors.all()` | 全項目の理由を並べた一覧 |
+    ///
+    /// 理由の文はふつうの文字列なので、ほかの値と同じく自動で逃がされます。
+    /// `{% if errors %}` は `errors.any()` と同じです。
+    #[derive(Debug, Default)]
+    pub(super) struct ErrorBag(pub(super) ValidationErrors);
+
+    impl Object for ErrorBag {
+        fn repr(self: &Arc<Self>) -> ObjectRepr {
+            ObjectRepr::Plain
+        }
+
+        fn is_true(self: &Arc<Self>) -> bool {
+            !self.0.is_empty()
+        }
+
+        fn call_method(
+            self: &Arc<Self>,
+            _state: &mut State<'_, '_>,
+            method: &str,
+            args: &[Value],
+        ) -> std::result::Result<Value, minijinja::Error> {
+            let errors = &self.0;
+            match method {
+                "any" => {
+                    let () = from_args(args)?;
+                    Ok(Value::from(!errors.is_empty()))
+                }
+                "has" => {
+                    let (field,): (&str,) = from_args(args)?;
+                    Ok(Value::from(errors.has(field)))
+                }
+                "first" => {
+                    let (field,): (Option<&str>,) = from_args(args)?;
+                    let found = match field {
+                        Some(field) => errors.get(field).first().map(String::as_str),
+                        None => errors.first(),
+                    };
+                    Ok(Value::from(found.unwrap_or_default()))
+                }
+                "get" => {
+                    let (field,): (&str,) = from_args(args)?;
+                    Ok(Value::from(errors.get(field).to_vec()))
+                }
+                "all" => {
+                    let () = from_args(args)?;
+                    let all: Vec<String> = errors.all().values().flatten().cloned().collect();
+                    Ok(Value::from(all))
+                }
+                _ => Err(template_error(format!(
+                    "errors.{method}() はありません（any・has・first・get・all が使えます）"
+                ))),
+            }
+        }
+    }
 
     /// 埋め込んだ一覧。入っていなければ空（デバッグビルド）。
     static EMBEDDED: OnceLock<&'static [(&'static str, &'static str)]> = OnceLock::new();
@@ -260,8 +344,11 @@ mod imp {
                 }
             },
         );
+        // `errors` は、どこから描いても使えるよう空のものを置いておく。
+        // `req.view(..)` は描画の文脈で中身の入ったものに上書きする。
+        env.add_global(ERRORS, Value::from_object(ErrorBag::default()));
         // リクエストの関数。`req.view(..)` は描画の文脈で本物に上書きする。
-        for name in RESERVED {
+        for name in FUNCTIONS {
             env.add_function(
                 name,
                 move |_: Rest<Value>| -> std::result::Result<Value, minijinja::Error> {
@@ -415,6 +502,11 @@ mod imp {
             .map_err(|e| Error::msg(format!("テンプレートに渡す値を読めません: {e}")))?
             .collect();
         for key in &keys {
+            if key.as_str() == Some(ERRORS) {
+                return Err(Error::msg(
+                    "名前 `errors` は検査に落ちた理由に使っています。別の名前にしてください",
+                ));
+            }
             if let Some(key) = key.as_str().filter(|k| RESERVED.contains(k)) {
                 return Err(Error::msg(format!(
                     "名前 `{key}` はテンプレートの関数に使っています。別の名前にしてください"
@@ -432,6 +524,9 @@ mod imp {
             pairs.push((key, item));
         }
         let session = session.cloned();
+        // 理由は前のリクエストの flash から 1 回だけ読む。無ければ空。
+        let errors = session.as_ref().map(Session::errors).unwrap_or_default();
+        pairs.push((Value::from(ERRORS), Value::from_object(ErrorBag(errors))));
         let for_token = session.clone();
         pairs.push((
             Value::from("csrf_token"),
@@ -770,6 +865,91 @@ mod tests {
                 format!("名前 `{key}` はテンプレートの関数に使っています。別の名前にしてください")
             );
         }
+    }
+
+    /// 理由を持ち越したセッション（前のリクエストで検査に落ちた形）。
+    fn session_with_errors() -> Session {
+        let mut errors = crate::validation::ValidationErrors::default();
+        errors.add("title", "<b>題</b>は必ず入力してください。");
+        errors.add("title", "題は短くしてください。");
+        errors.add("body", "本文は必ず入力してください。");
+        let s = Session::empty();
+        s.flash_errors(&errors);
+        let (data, old_flash) = Session::split_flash(s.snapshot_for_save());
+        Session::new("next".into(), data, old_flash)
+    }
+
+    fn draw_errors(source: &'static str, session: Option<&Session>) -> crate::Result<String> {
+        let views: &'static [(&'static str, &'static str)] =
+            Box::leak(vec![("e.html", source)].into_boxed_slice());
+        let env = embedded_env(views).unwrap();
+        render_in(&env, "e", to_context(&json!({}), Some(session))?)
+    }
+
+    #[test]
+    fn errorsのメソッドはmessage_bagと同じ名前() {
+        let session = session_with_errors();
+        let out = draw_errors(
+            "{{ errors.any() }}|{{ errors.has('title') }}|{{ errors.has('none') }}|\
+             {{ errors.first('body') }}|[{{ errors.first('none') }}]|{{ errors.first() }}|\
+             {{ errors.get('title')|length }}|{{ errors.get('none')|length }}|\
+             {{ errors.all()|join(',') }}|{% if errors %}yes{% endif %}",
+            Some(&session),
+        )
+        .unwrap();
+        assert_eq!(
+            out,
+            "True|True|False|\
+             本文は必ず入力してください。|[]|本文は必ず入力してください。|\
+             2|0|\
+             本文は必ず入力してください。,&lt;b&gt;題&lt;&#x2f;b&gt;は必ず入力してください。,題は短くしてください。|yes"
+        );
+    }
+
+    #[test]
+    fn errorsの理由は逃がされる() {
+        let session = session_with_errors();
+        let out = draw_errors(
+            "{{ errors.first('title') }}|{% for m in errors.get('title') %}{{ m }};{% endfor %}",
+            Some(&session),
+        )
+        .unwrap();
+        assert_eq!(
+            out,
+            "&lt;b&gt;題&lt;&#x2f;b&gt;は必ず入力してください。|&lt;b&gt;題&lt;&#x2f;b&gt;は必ず入力してください。;題は短くしてください。;"
+        );
+    }
+
+    #[test]
+    fn errorsはセッションが無くても理由が無くても空で使える() {
+        let source = "{{ errors.any() }}|[{{ errors.first('title') }}]|{% if errors %}x{% endif %}";
+        assert_eq!(draw_errors(source, None).unwrap(), "False|[]|");
+        let empty = Session::empty();
+        assert_eq!(draw_errors(source, Some(&empty)).unwrap(), "False|[]|");
+        // `req.view` の外（`bengara::view`）でも使える。いつも空。
+        static PLAIN: &[(&str, &str)] = &[("p.html", "{{ errors.any() }}")];
+        assert_eq!(draw(PLAIN, "p", json!({})).unwrap(), "False");
+    }
+
+    #[test]
+    fn errorsの知らないメソッドと引数の誤りは描画のエラー() {
+        let session = session_with_errors();
+        let err = draw_errors("{{ errors.count() }}", Some(&session))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("errors.count() はありません"), "{err}");
+        assert!(draw_errors("{{ errors.has() }}", Some(&session)).is_err());
+    }
+
+    #[test]
+    fn 文脈にerrorsがあると500() {
+        let err = to_context(&json!({ "errors": [] }), None)
+            .unwrap_err()
+            .to_string();
+        assert_eq!(
+            err,
+            "名前 `errors` は検査に落ちた理由に使っています。別の名前にしてください"
+        );
     }
 
     #[test]

@@ -37,6 +37,9 @@ use crate::support::crypto;
 #[derive(Debug, Clone)]
 pub struct CacheConfig {
     /// 置き場所の名前（`file` / `memory`）。`array` は `memory` の別名です。
+    ///
+    /// 前後の空白を落とし、大文字小文字を区別せずに比べます
+    /// （`SESSION_DRIVER`・`HASH_DRIVER` と同じ）。
     pub driver: String,
 }
 
@@ -65,15 +68,22 @@ fn store() -> &'static Arc<dyn CacheStore> {
         let driver = crate::try_config::<CacheConfig>()
             .map(|config| config.driver.clone())
             .unwrap_or_else(|| CacheConfig::default().driver);
-        match driver.as_str() {
-            "memory" | "array" => Arc::new(MemoryCache::new()) as Arc<dyn CacheStore>,
-            "file" => Arc::new(FileCache::default_path()),
-            other => {
-                tracing::warn!("CACHE_DRIVER `{other}` は知りません。file を使います");
-                Arc::new(FileCache::default_path())
-            }
-        }
+        store_for(&driver)
     })
+}
+
+/// 置き場所の名前から作る。前後の空白を落とし、小文字にして比べる
+/// （`SESSION_DRIVER`・`HASH_DRIVER` と同じ）。
+fn store_for(driver: &str) -> Arc<dyn CacheStore> {
+    let driver = driver.trim();
+    match driver.to_ascii_lowercase().as_str() {
+        "memory" | "array" => Arc::new(MemoryCache::new()),
+        "file" => Arc::new(FileCache::default_path()),
+        _ => {
+            tracing::warn!("CACHE_DRIVER `{driver}` は知りません。file を使います");
+            Arc::new(FileCache::default_path())
+        }
+    }
 }
 
 /// 置き場所を呼ぶ。ブロックするものだけ裏のスレッドへ回します。
@@ -480,6 +490,17 @@ mod tests {
         assert_eq!(5_i64.saturating_neg(), -5);
         // 足す側も飽和するので、引きすぎても下限で止まります。
         assert_eq!(i64::MIN.saturating_add(i64::MIN), i64::MIN);
+    }
+
+    #[test]
+    fn 置き場所の名前は空白と大文字小文字を気にしない() {
+        // メモリの置き場所は場所を持たない（`location` が None）。
+        for name in ["memory", " Memory ", "ARRAY", "array\t"] {
+            assert!(store_for(name).location().is_none(), "{name:?}");
+        }
+        for name in ["file", " File", "FILE ", "redis"] {
+            assert!(store_for(name).location().is_some(), "{name:?}");
+        }
     }
 
     #[test]

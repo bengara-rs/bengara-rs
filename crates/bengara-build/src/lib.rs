@@ -2239,7 +2239,10 @@ mod tests {
     #[test]
     fn databaseは中を1つずつ見張る() {
         let root = temp_root("watch_database");
-        touch(&root.join("database/migrations/m0001_create_users.rs"), "");
+        touch(
+            &root.join("database/migrations/2026_01_01_000000_create_users.rs"),
+            "",
+        );
         touch(&root.join("database/seeders/DatabaseSeeder.rs"), "");
         touch(&root.join("database/helpers.rs"), "");
         touch(&root.join("database/database.sqlite"), "");
@@ -2247,6 +2250,8 @@ mod tests {
 
         let mut generator = Generator::default();
         generator.run(&root);
+        // 置いた名前はどれも正しい。見張り以外の理由で落ちないことを確かめる。
+        assert!(generator.errors.is_empty(), "{:?}", generator.errors);
 
         // SQLite に書くたびに作り直さないよう、database/ そのものは見張らない。
         assert!(!generator.watched.contains(&root.join("database")));

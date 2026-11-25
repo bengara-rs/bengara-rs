@@ -449,14 +449,40 @@ fn lookup_key<T: Model>(value: impl IntoValue, driver: Driver) -> Option<Value> 
 /// MySQL の `id()` は `bigint unsigned` なので、その値の行がありえます。
 /// SQLite と PostgreSQL の整数は `i64` までなので、当たる行がありません。
 fn never_matches_integer_key(value: &Value, driver: Driver) -> bool {
+    match integer_key_match(value) {
+        KeyMatch::Always => false,
+        KeyMatch::Never => true,
+        KeyMatch::OnlyMySql => driver != Driver::MySql,
+    }
+}
+
+/// 整数の主キーと比べて、当たる行がありうるか。ドライバを見ずに決められる所まで決める。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum KeyMatch {
+    /// どのドライバでもありうる。
+    Always,
+    /// どのドライバでも無い。
+    Never,
+    /// MySQL でだけありうる（`i64` を超える数字だけの文字列）。
+    OnlyMySql,
+}
+
+/// [`never_matches_integer_key`] のドライバを見ない部分。
+///
+/// `ModelQuery` の条件は、ドライバで変わる所を終端まで決めません
+/// （`QueryBuilder::where_by_driver`）。`using(&tx)` でドライバが替わるためです。
+fn integer_key_match(value: &Value) -> KeyMatch {
     let Value::Text(text) = value else {
-        return false;
+        return KeyMatch::Always;
     };
     let text = text.trim();
     if text.parse::<i64>().is_ok() {
-        return false;
+        KeyMatch::Always
+    } else if text.parse::<u64>().is_ok() {
+        KeyMatch::OnlyMySql
+    } else {
+        KeyMatch::Never
     }
-    !(driver == Driver::MySql && text.parse::<u64>().is_ok())
 }
 
 /// `Model::find` / `ModelQuery::find` / `fresh` の中身。
@@ -596,16 +622,17 @@ impl<T: Model> ModelQuery<T> {
     /// | 整数に読める文字列（`"12"`）   | 整数として比べる（`id = 12`）  |
     /// | 整数として読めない文字列       | 必ず 0 件（`1 = 0`）           |
     ///
+    /// `i64` を超える数字だけの文字列は、MySQL でだけ比べます（ほかでは `1 = 0`）。
+    /// どちらにするかは終端のドライバで決めます。`using(&tx)` で替えた先で決まります。
+    ///
     /// `req.model::<Post>("post")` や `req.auth().user::<User>()` は、外から来た
     /// 文字列をここへ渡します。文字列のまま比べると、PostgreSQL だけ
     /// `bigint = text` の SQL エラー（500）になるためです（[`Model::INTEGER_KEY`]）。
     /// 主キー以外の列は、渡した値のまま比べます。
     pub fn where_<C: ModelColumn<T>>(self, column: C, value: impl Bind<C::Accepts>) -> Self {
         let column = column.column_name();
-        match self.key_condition(column, value.bind()) {
-            Some(value) => self.map(|q| q.where_(column, value)),
-            None => self.nothing(column, false),
-        }
+        let (value, matched) = Self::key_condition(column, value.bind());
+        self.keyed(column, false, matched, false, |q| q.where_(column, value))
     }
 
     /// 列と値を演算子で比べる。
@@ -625,10 +652,8 @@ impl<T: Model> ModelQuery<T> {
     /// `or` でつないで、列が値と等しい。整数の主キーの扱いは [`where_`](Self::where_) と同じです。
     pub fn or_where<C: ModelColumn<T>>(self, column: C, value: impl Bind<C::Accepts>) -> Self {
         let column = column.column_name();
-        match self.key_condition(column, value.bind()) {
-            Some(value) => self.map(|q| q.or_where(column, value)),
-            None => self.nothing(column, true),
-        }
+        let (value, matched) = Self::key_condition(column, value.bind());
+        self.keyed(column, true, matched, false, |q| q.or_where(column, value))
     }
 
     /// `or` でつないで、列と値を演算子で比べる。整数の主キーの扱いは
@@ -653,10 +678,7 @@ impl<T: Model> ModelQuery<T> {
     ) -> Self {
         let column = column.column_name();
         let values: Vec<Value> = values.iter().cloned().map(Bind::bind).collect();
-        match self.key_list(column, &values) {
-            Some(values) => self.map(|q| q.where_in(column, &values)),
-            None => self.map(|q| q.where_in(column, &values)),
-        }
+        self.keyed_list(column, values, |q, values| q.where_in(column, values))
     }
 
     /// 列が一覧のどれとも等しくない。
@@ -670,10 +692,7 @@ impl<T: Model> ModelQuery<T> {
     ) -> Self {
         let column = column.column_name();
         let values: Vec<Value> = values.iter().cloned().map(Bind::bind).collect();
-        match self.key_list(column, &values) {
-            Some(values) => self.map(|q| q.where_not_in(column, &values)),
-            None => self.map(|q| q.where_not_in(column, &values)),
-        }
+        self.keyed_list(column, values, |q, values| q.where_not_in(column, values))
     }
 
     /// `or` でつないで、列が一覧のどれかと等しい。整数の主キーの扱いは
@@ -685,44 +704,86 @@ impl<T: Model> ModelQuery<T> {
     ) -> Self {
         let column = column.column_name();
         let values: Vec<Value> = values.iter().cloned().map(Bind::bind).collect();
-        match self.key_list(column, &values) {
-            Some(values) => self.map(|q| q.or_where_in(column, &values)),
-            None => self.map(|q| q.or_where_in(column, &values)),
-        }
+        self.keyed_list(column, values, |q, values| q.or_where_in(column, values))
     }
 
-    /// 主キーの列に渡す値を、主キーの型に合わせて直す。
-    /// **当たる行が無いと分かっている値のときは `None`。**
+    /// 主キーの列に渡す値を、主キーの型に合わせて直す。当たる行がありうるかも返す。
     ///
     /// 整数の主キーでない列と、`INTEGER_KEY` が偽のモデルは、そのまま返します。
     /// `NULL` もそのまま返します（`is null` への読み替えは `QueryBuilder` がします）。
     /// 直し方は `find` と同じです（`lookup_key`）。
-    fn key_condition(&self, column: &str, value: Value) -> Option<Value> {
+    ///
+    /// **ドライバはここでは見ません。** MySQL でだけ当たる値（`KeyMatch::OnlyMySql`）は
+    /// 終端で決めます（[`keyed`](Self::keyed)）。以前は組み立てのときのドライバで決めていたので、
+    /// `using(&tx)` で MySQL へ替えると、当たるはずの行が 0 件になっていました。
+    fn key_condition(column: &str, value: Value) -> (Value, KeyMatch) {
         if !(T::INTEGER_KEY && is_primary_key::<T>(column)) {
-            return Some(value);
+            return (value, KeyMatch::Always);
         }
         let value = T::key_value(value);
-        if never_matches_integer_key(&value, self.inner.driver()) {
-            return None;
-        }
-        Some(value)
+        let matched = integer_key_match(&value);
+        (value, matched)
     }
 
-    /// 一覧と比べるときの `key_condition`。
+    /// 主キーの判定に合わせて条件を置く。
     ///
-    /// 直す必要が無い列では `None`（渡された一覧をそのまま使う）。
-    /// 主キーの列では、直した値の一覧を返します。当たらない値は外します。
-    fn key_list(&self, column: &str, values: &[Value]) -> Option<Vec<Value>> {
-        if !(T::INTEGER_KEY && is_primary_key::<T>(column)) {
-            return None;
+    /// | 判定        | 置く条件                                                       |
+    /// |-------------|----------------------------------------------------------------|
+    /// | `Always`    | `apply` の条件                                                 |
+    /// | `Never`     | 必ず 0 件（`everything_if_never` なら必ず当たる条件）          |
+    /// | `OnlyMySql` | MySQL なら `apply`、ほかは `Never` と同じ。**終端で決めます** |
+    fn keyed(
+        self,
+        column: &str,
+        or: bool,
+        matched: KeyMatch,
+        everything_if_never: bool,
+        apply: impl FnOnce(QueryBuilder) -> QueryBuilder,
+    ) -> Self {
+        let never = move |q: QueryBuilder| {
+            if everything_if_never {
+                everything(q, column, or)
+            } else {
+                nothing(q, column, or)
+            }
+        };
+        match matched {
+            KeyMatch::Always => self.map(apply),
+            KeyMatch::Never => self.map(never),
+            KeyMatch::OnlyMySql => self.map(|q| q.where_by_driver(Driver::MySql, apply, never)),
         }
-        Some(
-            values
-                .iter()
-                .cloned()
-                .filter_map(|value| self.key_condition(column, value))
-                .collect(),
-        )
+    }
+
+    /// 一覧と比べる条件を置く。主キーの列では値を直し、当たらない値を外します。
+    ///
+    /// MySQL でだけ当たる値が混じるときは、MySQL では残し、ほかでは外す条件にします。
+    /// どちらにするかは終端で決めます。
+    fn keyed_list(
+        self,
+        column: &str,
+        values: Vec<Value>,
+        apply: impl Fn(QueryBuilder, &[Value]) -> QueryBuilder,
+    ) -> Self {
+        if !(T::INTEGER_KEY && is_primary_key::<T>(column)) {
+            return self.map(|q| apply(q, &values));
+        }
+        let mut mysql = Vec::with_capacity(values.len());
+        let mut others = Vec::with_capacity(values.len());
+        for value in values {
+            let (value, matched) = Self::key_condition(column, value);
+            match matched {
+                KeyMatch::Always => {
+                    mysql.push(value.clone());
+                    others.push(value);
+                }
+                KeyMatch::OnlyMySql => mysql.push(value),
+                KeyMatch::Never => {}
+            }
+        }
+        if mysql.len() == others.len() {
+            return self.map(|q| apply(q, &others));
+        }
+        self.map(|q| q.where_by_driver(Driver::MySql, |b| apply(b, &mysql), |b| apply(b, &others)))
     }
 
     /// `where_op` と `or_where_op` の中身。
@@ -733,47 +794,20 @@ impl<T: Model> ModelQuery<T> {
             operator_trimmed,
             "=" | "!=" | "<>" | "<" | "<=" | ">" | ">="
         );
-        let value = if comparable {
-            match self.key_condition(column, value) {
-                Some(value) => value,
-                // 整数として読めない文字列とは、どの行も等しくない。
-                None if matches!(operator_trimmed, "!=" | "<>") => {
-                    return self.everything(column, or);
-                }
-                None => return self.nothing(column, or),
-            }
+        let (value, matched) = if comparable {
+            Self::key_condition(column, value)
         } else {
-            value
+            (value, KeyMatch::Always)
         };
-        if or {
-            self.map(|q| q.or_where_op(column, operator, value))
-        } else {
-            self.map(|q| q.where_op(column, operator, value))
-        }
-    }
-
-    /// 必ず 0 件になる条件（`1 = 0`）を置く。
-    ///
-    /// 空の一覧との `where_in` がこの形になる。列名の検査もそのまま通る。
-    fn nothing(self, column: &str, or: bool) -> Self {
-        let nothing: [i64; 0] = [];
-        if or {
-            self.map(|q| q.or_where_in(column, &nothing))
-        } else {
-            self.map(|q| q.where_in(column, &nothing))
-        }
-    }
-
-    /// 必ず当たる条件（`1 = 1`）を置く。
-    fn everything(self, column: &str, or: bool) -> Self {
-        if or {
-            // 列は主キーと分かっているので、検査は要らない。
-            self.map(|q| q.or_where_raw("1 = 1", &[]))
-        } else {
-            // 空の一覧との `where_not_in` がこの形になる。
-            let nothing: [i64; 0] = [];
-            self.map(|q| q.where_not_in(column, &nothing))
-        }
+        // 整数として読めない文字列とは、どの行も等しくない。
+        let everything_if_never = matches!(operator_trimmed, "!=" | "<>");
+        self.keyed(column, or, matched, everything_if_never, |q| {
+            if or {
+                q.or_where_op(column, operator, value)
+            } else {
+                q.where_op(column, operator, value)
+            }
+        })
     }
 
     /// 列が `NULL`。
@@ -797,10 +831,10 @@ impl<T: Model> ModelQuery<T> {
         high: impl Bind<C::Accepts>,
     ) -> Self {
         let column = column.column_name();
-        match self.key_range(column, low.bind(), high.bind()) {
-            Some((low, high)) => self.map(|q| q.where_between(column, low, high)),
-            None => self.nothing(column, false),
-        }
+        let (low, high, matched) = Self::key_range(column, low.bind(), high.bind());
+        self.keyed(column, false, matched, false, |q| {
+            q.where_between(column, low, high)
+        })
     }
 
     /// 列が2つの値の間に無い。
@@ -814,18 +848,23 @@ impl<T: Model> ModelQuery<T> {
         high: impl Bind<C::Accepts>,
     ) -> Self {
         let column = column.column_name();
-        match self.key_range(column, low.bind(), high.bind()) {
-            Some((low, high)) => self.map(|q| q.where_not_between(column, low, high)),
-            None => self.everything(column, false),
-        }
+        let (low, high, matched) = Self::key_range(column, low.bind(), high.bind());
+        self.keyed(column, false, matched, true, |q| {
+            q.where_not_between(column, low, high)
+        })
     }
 
-    /// 範囲で比べるときの `key_condition`。どちらかが当たらない値なら `None`。
-    fn key_range(&self, column: &str, low: Value, high: Value) -> Option<(Value, Value)> {
-        Some((
-            self.key_condition(column, low)?,
-            self.key_condition(column, high)?,
-        ))
+    /// 範囲で比べるときの `key_condition`。どちらかが当たらない値なら `Never`、
+    /// どちらかが MySQL でだけ当たる値なら `OnlyMySql` です。
+    fn key_range(column: &str, low: Value, high: Value) -> (Value, Value, KeyMatch) {
+        let (low, low_match) = Self::key_condition(column, low);
+        let (high, high_match) = Self::key_condition(column, high);
+        let matched = match (low_match, high_match) {
+            (KeyMatch::Never, _) | (_, KeyMatch::Never) => KeyMatch::Never,
+            (KeyMatch::OnlyMySql, _) | (_, KeyMatch::OnlyMySql) => KeyMatch::OnlyMySql,
+            _ => KeyMatch::Always,
+        };
+        (low, high, matched)
     }
 
     /// 列が形に当てはまる（`like`）。
@@ -849,6 +888,11 @@ impl<T: Model> ModelQuery<T> {
         self.map(|q| q.where_raw(sql, bindings))
     }
 
+    /// `or` でつないで SQL を直接書く。
+    pub fn or_where_raw(self, sql: &str, bindings: &[Value]) -> Self {
+        self.map(|q| q.or_where_raw(sql, bindings))
+    }
+
     /// 括弧でくくった条件の塊を足す。
     pub fn where_group(self, build: impl FnOnce(QueryBuilder) -> QueryBuilder) -> Self {
         self.map(|q| q.where_group(build))
@@ -857,6 +901,21 @@ impl<T: Model> ModelQuery<T> {
     /// `or` でつないで、括弧でくくった条件の塊を足す。
     pub fn or_where_group(self, build: impl FnOnce(QueryBuilder) -> QueryBuilder) -> Self {
         self.map(|q| q.or_where_group(build))
+    }
+
+    // ---- 結合 ----
+
+    /// 内部結合。確かめる内容は [`QueryBuilder::join`] と同じです。
+    ///
+    /// **取る列は `select(&["posts.*"])` のように絞ってください。** `select *` のままだと
+    /// 結合した表の同じ名前の列（`id` など）が混じり、モデルに読み込む値が食い違います。
+    pub fn join(self, table: &str, first: &str, operator: &str, second: &str) -> Self {
+        self.map(|q| q.join(table, first, operator, second))
+    }
+
+    /// 左外部結合。注意は [`join`](Self::join) と同じです。
+    pub fn left_join(self, table: &str, first: &str, operator: &str, second: &str) -> Self {
+        self.map(|q| q.left_join(table, first, operator, second))
     }
 
     // ---- 束ね ----
@@ -871,8 +930,14 @@ impl<T: Model> ModelQuery<T> {
     /// **渡せるのは実在の列だけです。** `select` に書いた別名は渡せません
     /// （[`QueryBuilder::having_op`] を参照）。集計の結果で絞るときは
     /// `having_raw` を使ってください。
-    pub fn having_op(self, column: &str, operator: &str, value: impl IntoValue) -> Self {
-        self.map(|q| q.having_op(column, operator, value))
+    pub fn having_op<C: ModelColumn<T>>(
+        self,
+        column: C,
+        operator: &str,
+        value: impl Bind<C::Accepts>,
+    ) -> Self {
+        let value = value.bind();
+        self.map(|q| q.having_op(column.column_name(), operator, value))
     }
 
     /// 束ねた結果を SQL で絞る。
@@ -1043,6 +1108,35 @@ impl<T: Model> ModelQuery<T> {
         self.inner.update(&values).await
     }
 
+    /// 列の値を足す。返るのは変わった件数です。
+    ///
+    /// 中身は [`QueryBuilder::increment`] と同じです。ただし [`update`](Self::update) と同じく、
+    /// **モデルに `updated_at` があれば今の時刻も入れます**（Laravel と同じ）。
+    ///
+    /// ```ignore
+    /// Post::query().where_("id", id).increment("views", 1).await?;
+    /// ```
+    pub async fn increment<C: ModelColumn<T>>(&self, column: C, amount: i64) -> Result<u64> {
+        self.step("increment", column.column_name(), '+', amount)
+            .await
+    }
+
+    /// 列の値を引く。中身は [`increment`](Self::increment) と同じで、符号だけが違います。
+    pub async fn decrement<C: ModelColumn<T>>(&self, column: C, amount: i64) -> Result<u64> {
+        self.step("decrement", column.column_name(), '-', amount)
+            .await
+    }
+
+    /// `increment` と `decrement` の中身。
+    async fn step(&self, place: &str, column: &str, sign: char, amount: i64) -> Result<u64> {
+        // 増やす列そのものが `updated_at` なら、時刻で上書きしない。
+        if !T::COLUMNS.contains(&UPDATED_AT) || is_updated_at(column) {
+            return self.inner.step(place, column, sign, amount, &[]).await;
+        }
+        let extra = [(UPDATED_AT, Value::from(crate::Carbon::now()))];
+        self.inner.step(place, column, sign, amount, &extra).await
+    }
+
     /// 条件に当てはまる行を消す。
     pub async fn delete(&self) -> Result<u64> {
         self.inner.delete().await
@@ -1078,6 +1172,30 @@ fn is_primary_key<T: Model>(column: &str) -> bool {
         .strip_prefix(T::TABLE)
         .and_then(|rest| rest.strip_prefix('.'))
         .is_some_and(|rest| rest == T::PRIMARY_KEY)
+}
+
+/// 必ず 0 件になる条件（`1 = 0`）を置く。
+///
+/// 空の一覧との `where_in` がこの形になる。列名の検査もそのまま通る。
+fn nothing(query: QueryBuilder, column: &str, or: bool) -> QueryBuilder {
+    let nothing: [i64; 0] = [];
+    if or {
+        query.or_where_in(column, &nothing)
+    } else {
+        query.where_in(column, &nothing)
+    }
+}
+
+/// 必ず当たる条件（`1 = 1`）を置く。
+fn everything(query: QueryBuilder, column: &str, or: bool) -> QueryBuilder {
+    if or {
+        // 列は主キーと分かっているので、検査は要らない。
+        query.or_where_raw("1 = 1", &[])
+    } else {
+        // 空の一覧との `where_not_in` がこの形になる。
+        let nothing: [i64; 0] = [];
+        query.where_not_in(column, &nothing)
+    }
 }
 
 impl<T: Model> std::fmt::Debug for ModelQuery<T> {
@@ -1642,6 +1760,33 @@ mod tests {
         assert_eq!(sql, "select * from \"posts\" where 1 = 0");
     }
 
+    #[tokio::test]
+    async fn i64を超える主キーの判定はusingで替えた先のドライバで決まる() {
+        // 以前は組み立てのときのドライバで決めていた。既定の接続（MySQL 以外）で
+        // 組み立ててから MySQL のトランザクションへ替えると、当たるはずの行が 0 件になっていた。
+        let big = u64::MAX.to_string();
+        let query = Post::query()
+            .where_("id", big.as_str())
+            .or_where_in("id", &[big.as_str(), "7"])
+            .where_not_between("id", "1", big.as_str())
+            .where_op("id", "!=", big.as_str());
+        let (sql, _) = query.to_sql();
+        assert_eq!(
+            sql,
+            "select * from \"posts\" where 1 = 0 or \"id\" in (?) and 1 = 1 and 1 = 1"
+        );
+
+        let tx = fixed_on(Driver::MySql, affected()).await;
+        let (sql, bindings) = query.using(&tx).to_sql();
+        assert_eq!(
+            sql,
+            "select * from `posts` where `id` = ? or `id` in (?, ?) and `id` not between ? and ? \
+             and `id` != ?"
+        );
+        assert_eq!(bindings.len(), 6, "{bindings:?}");
+        assert_eq!(bindings[0], Value::Text(big.clone()));
+    }
+
     #[cfg(feature = "sqlite")]
     #[tokio::test]
     async fn 主キーの条件を文字列で渡しても実際に当たる() {
@@ -1876,6 +2021,61 @@ mod tests {
         let sent = joined(&found.tx);
         assert!(sent.contains("set \"title\" = ?"), "{sent}");
         assert!(!sent.contains("updated_at"), "{sent}");
+    }
+
+    #[tokio::test]
+    async fn モデルの増減はupdated_atを足す() {
+        // 以前は ModelQuery に increment / decrement が無く、query_builder() で降りると
+        // updated_at が入らなかった。Laravel の `Post::where(...)->increment(...)` は入れる。
+        let (found, tx) = spy().await;
+        Stamped::on(&tx)
+            .where_("id", 1)
+            .increment("views", 2)
+            .await
+            .expect("増やせる");
+        let sent = joined(&found.tx);
+        assert!(
+            sent.contains(
+                "update \"stamped\" set \"views\" = \"views\" + ?, \"updated_at\" = ? where"
+            ),
+            "{sent}"
+        );
+
+        let (found, tx) = spy().await;
+        Stamped::on(&tx)
+            .decrement("views", 1)
+            .await
+            .expect("減らせる");
+        let sent = joined(&found.tx);
+        assert!(
+            sent.contains("set \"views\" = \"views\" - ?, \"updated_at\" = ?"),
+            "{sent}"
+        );
+
+        // updated_at の列が無いモデルには足さない。
+        let (found, tx) = spy().await;
+        Post::on(&tx).increment("views", 1).await.expect("増やせる");
+        let sent = joined(&found.tx);
+        assert!(sent.contains("set \"views\" = \"views\" + ?"), "{sent}");
+        assert!(!sent.contains("updated_at"), "{sent}");
+    }
+
+    #[test]
+    fn モデルのクエリから結合とor_where_rawを書ける() {
+        let (sql, bindings) = Post::query()
+            .select(&["posts.*"])
+            .join("users", "users.id", "=", "posts.user_id")
+            .left_join("tags", "tags.post_id", "=", "posts.id")
+            .where_raw("length(title) > ?", &[Value::Int(3)])
+            .or_where_raw("views > ?", &[Value::Int(10)])
+            .to_sql();
+        assert_eq!(
+            sql,
+            "select \"posts\".* from \"posts\" inner join \"users\" on \"users\".\"id\" = \"posts\".\"user_id\" \
+             left join \"tags\" on \"tags\".\"post_id\" = \"posts\".\"id\" \
+             where length(title) > ? or views > ?"
+        );
+        assert_eq!(bindings, vec![Value::Int(3), Value::Int(10)]);
     }
 
     #[test]

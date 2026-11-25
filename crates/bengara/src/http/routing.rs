@@ -203,6 +203,7 @@ impl Registered {
     /// - ミドルウェアは**本文を読む前に**通ります。ログインしていない相手の大きな
     ///   送信を、受け取らずに断れます。
     /// - `req.body()`・`req.input()`・`req.validate()` から本文は見えません（クエリだけ）。
+    ///   multipart も解析しないので、`req.file()` も空です。
     ///   CSRF のトークンも本文の `_token` は読めないので、`X-CSRF-TOKEN` ヘッダーで送ってください。
     pub fn stream_body(self) -> Self {
         self.edit(|def| def.stream_body = true)
@@ -1250,6 +1251,7 @@ mod tests {
         assert_eq!(defs[0].path, "/posts");
         assert_eq!(defs[0].middleware, vec!["auth".to_string()]);
     }
+
     #[test]
     fn パス引数はパーセントデコードされる() {
         let defs = collect(|| {

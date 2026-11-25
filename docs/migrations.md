@@ -199,8 +199,8 @@ pub fn down(schema: &mut Schema) {
 `schema.table(..)` でできるのは、列・索引・外部キーを**足す**ことだけです。
 
 - **足す列には `.nullable()` か `.default(..)` を付けます。** 付けないと、SQLite では必ず、PostgreSQL では行があると失敗します。
-- 主キーは後から足せません。
-- SQLite では、外部キーを後から足せません。表を作り直します。
+- 主キーは後から足せません。書くとエラーです。
+- SQLite では、外部キーを後から足せません。書くとエラーです。表を作り直します。
 - 列の型を変えるときは、新しい表を作って移し替えます。
 
 ## そのほかの操作
@@ -255,18 +255,19 @@ pub fn down(schema: &mut Schema) {
 |-----------------------------------------------------------------------------|---------------------------------------|
 | `t.foreign(列)` に `.on(表名)` が無い                                       | エラー                                |
 | `schema.table(..)` の中で `t.id()` / `t.increments(..)` / 列の `.primary()` | エラー                                |
+| `schema.table(..)` の中の `t.primary(&[..])`                                | エラー                                |
+| SQLite で `schema.table(..)` の中の `t.foreign(..)`                         | エラー                                |
 | 主キーの指定を 2 つ重ねる（例: `t.id()` と `t.primary(&[..])`）             | エラー                                |
+| `default(f64::NAN)` など `NaN` や無限                                       | エラー                                |
+| `default(Vec<u8>)`（バイト列の既定値）                                      | エラー                                |
 | `t.primary(&[..])` を 2 回呼ぶ                                              | 警告。後の指定で置き換わる            |
-| `schema.table(..)` の中の `t.primary(&[..])`                                | 警告。何も足さない                    |
-| SQLite で `schema.table(..)` の中の `t.foreign(..)`                         | 警告。何も足さない                    |
 | `schema.table(..)` で NULL 不可かつ既定値なしの列                           | 警告。SQLite と PostgreSQL で失敗する |
 | `t.id()` に `nullable()` / `default()` / `unique()`                         | 警告。無視する                        |
 | `on_delete` / `on_update` に一覧外の値                                      | 警告。SQL にはそのまま出る            |
-| `default(f64::NAN)` など `NaN` や無限                                       | 警告。その文は流すときに失敗する      |
-| `default(Vec<u8>)`（バイト列の既定値）                                      | 警告。値は無視して `null` を書く      |
 
 - 主キーの指定は、`t.id()` / `t.increments(..)`、列の `.primary()`、表の `t.primary(&[..])` の 3 種類です。
 - 複合主キーは `t.primary(&[..])` だけで書きます。
+- 後から主キーを足すとき、SQLite で後から外部キーを足すときは、`schema.create(..)` で表を作り直します。
 
 ## 関連
 

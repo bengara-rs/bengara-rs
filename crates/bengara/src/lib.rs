@@ -67,12 +67,14 @@ pub use database::{
 pub use env_vars::{env, FromEnv};
 pub use error::{Error, Result};
 pub use events::{Event, Events, Listener, ListenerFuture};
+pub use http::UploadedFile;
 pub use http::{
     abort, abort_with, escape_html, has_valid_signature, html, json, redirect, route, route_url,
     route_url_with, route_with, signed_url, temporary_signed_url, text, url, BodyStream, BoxFuture,
     Cookie, Handler, Middleware, Middlewares, Next, Redirect, Registered, Request, Response, Route,
     RouteGroup, SameSite, Throttle,
 };
+pub use http::{CorsConfig, HandleCors};
 pub use lang::{__with, Lang, LangTable, __};
 pub use mail::{Mail, MailConfig, Mailer, Message};
 pub use paths::{app_path, base_path, public_path, storage_path};

@@ -61,6 +61,12 @@ encryption = ["dep:chacha20poly1305"]
 # 暗号なので実績のあるクレートに任せます（判断 30 と同じ考え方）。
 argon2 = ["dep:argon2"]
 
+# Laravel（PHP の `password_hash`）で作った bcrypt（`$2y$`）の値を照合する。既定では入りません。
+# **照合だけです。作りません。** ログインのついでに HASH_DRIVER の方式で作り直します。
+# フラグが無いときは偽になり、ログで「features に "bcrypt" を足すと照合できます」と案内します。
+# 暗号（Blowfish）は実績のあるクレートに任せ、値の読み取りと手順は自前です（判断 30 と同じ考え方）。
+bcrypt = ["dep:blowfish"]
+
 # SMTP でメールを送る。既定では入りません。
 # フラグが無いときも mail モジュールはコンパイルされ、MAIL_MAILER=smtp に
 # したときだけ「features に "mail" を足してください」というエラーになります。
@@ -107,6 +113,9 @@ chacha20poly1305 = { version = "0.10", default-features = false, features = [
 # パスワードの Argon2id。既定の機能（alloc・getrandom・password-hash）をそのまま使います。
 # getrandom は bengara が使っているものと同じ 0.4 系です。
 argon2 = { version = "0.6", optional = true }
+# bcrypt の照合。Blowfish の鍵の準備（bcrypt 用の口）だけを使います。
+# 値の読み取り・72 バイトの切り詰め・回す回数は auth/hashing.rs で書きます。
+blowfish = { version = "0.10", features = ["bcrypt"], optional = true }
 # メール。待つ形（同期）の送り口だけを使います。
 # bengara は `Mailer::send` を `spawn_blocking` の中で呼ぶので、
 # tokio 向けの送り口（tokio1-rustls-tls）は要りません。依存も少なくなります。
@@ -151,6 +160,6 @@ tokio-tungstenite = { version = "0.30", default-features = false, features = [
     "connect",
 ] }
 
-# docs.rs では、つなげるドライバとメールと WebSocket と Argon2id とテンプレートを入れた状態で説明を出す。
+# docs.rs では、つなげるドライバとメールと WebSocket と Argon2id と bcrypt とテンプレートを入れた状態で説明を出す。
 [package.metadata.docs.rs]
-features = ["sqlite", "mysql", "postgres", "encryption", "argon2", "mail", "websocket", "view"]
+features = ["sqlite", "mysql", "postgres", "encryption", "argon2", "bcrypt", "mail", "websocket", "view"]

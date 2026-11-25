@@ -50,15 +50,22 @@ pub(crate) fn now_millis() -> i64 {
 /// 以前は数として読めれば何桁でも通していました（`+5` も `parse` が読みます）。
 /// 入力の検査（`date` の規則）がこれを使うので、崩れた値を日付として通さないためです。
 ///
-/// # 時刻の後ろに付いたものは落とします
+/// # 時差は UTC に直します
 ///
-/// 秒より細かい桁（`.123`）と、タイムゾーンの指定（`Z`・`+09:00`・`-05:00`）は
-/// 見ません。**時刻部分の先頭の `HH:MM:SS` だけを読みます。**
-/// `-` を区切りの一覧に並べる形だと負の時差を読み落とし、`None`（＝期限切れ扱い）
-/// になっていました。
+/// 時刻の後ろの時差（`Z`・`+09:00`・`+0900`・`+09`・`-05:00`）は、足し引きして
+/// **UTC の秒に直します。** `2026-10-09 10:00:00+09:00` は `2026-10-09 01:00:00` です。
 ///
-/// タイムゾーンを**足し引きはしません。** 自分で書く値は UTC だけで、
-/// 外から入った値の時差まで扱い出すと、どこで直すかが分からなくなるためです。
+/// 以前は時差を読み捨てていたので、`+09:00` の値が 9 時間ずれて読めていました
+/// （パスワード再設定の期限が 9 時間延びる）。断る形にしなかったのは、
+/// 読めない値を期限切れとして扱う所（`PasswordReset::expired`）で、
+/// 時差付きの値が入ると再設定が常に断られるためです。
+///
+/// - 秒より細かい桁（`.123`）は捨てます。
+/// - 時差の形が崩れているもの（`+9`・`+25:00`）は読めない扱い（`None`）です。
+/// - それ以外の後ろに付いたもの（` UTC` など）は、今までどおり見ません。
+///
+/// bengara が自分で書く値と DB から読む値は、どれも時差の無い UTC です
+/// （PostgreSQL の `timestamptz` も読むときに UTC に直します。`database/temporal.rs`）。
 pub(crate) fn parse_timestamp(text: &str) -> Option<i64> {
     let text = text.trim();
     let (date, time) = match text.split_once(['T', ' ']) {
@@ -108,8 +115,39 @@ pub(crate) fn parse_timestamp(text: &str) -> Option<i64> {
         return None;
     }
 
+    let offset = parse_offset(&time[end..])?;
+
     let days = days_from_civil(year, month, day);
-    Some(days * 86_400 + hour * 3_600 + minute * 60 + second)
+    Some(days * 86_400 + hour * 3_600 + minute * 60 + second - offset)
+}
+
+/// 時刻の後ろに付いた時差を秒で返す（東が正）。時差が無ければ 0。
+///
+/// 先に小数の秒（`.123`）を飛ばします。`+`・`-` で始まるのに形が崩れていれば `None`。
+/// 時差でないもの（` UTC` など）は 0 として見ません（`parse_timestamp` を参照）。
+fn parse_offset(rest: &str) -> Option<i64> {
+    let rest = match rest.strip_prefix('.') {
+        Some(fraction) => fraction.trim_start_matches(|c: char| c.is_ascii_digit()),
+        None => rest,
+    };
+    let rest = rest.trim_start();
+    let (sign, digits) = match rest.as_bytes().first() {
+        Some(b'+') => (1, &rest[1..]),
+        Some(b'-') => (-1, &rest[1..]),
+        // `Z` も、時差でないものも 0。
+        _ => return Some(0),
+    };
+    let (hours, minutes) = match digits.split_once(':') {
+        Some((hours, minutes)) => (hours, minutes),
+        None if digits.len() == 4 => digits.split_at(2),
+        None => (digits, "00"),
+    };
+    let hours: i64 = fixed_digits(hours, 2)?.parse().ok()?;
+    let minutes: i64 = fixed_digits(minutes, 2)?.parse().ok()?;
+    if hours > 23 || minutes > 59 {
+        return None;
+    }
+    Some(sign * (hours * 3_600 + minutes * 60))
 }
 
 /// ちょうど `len` 桁の数字だけでできていれば、そのまま返す。
@@ -313,22 +351,51 @@ mod tests {
     }
 
     #[test]
-    fn タイムゾーンつきの時刻も読める() {
-        // 時差は足し引きせず、先頭の HH:MM:SS だけを読む。
+    fn タイムゾーンつきの時刻はutcに直して読む() {
         let base = parse_timestamp("2026-10-09 10:00:00").unwrap();
+        // 時差が 0 のもの。
         for text in [
             "2026-10-09 10:00:00Z",
             "2026-10-09T10:00:00Z",
-            "2026-10-09 10:00:00+09:00",
-            // `-` が区切りの一覧に無かったころ、ここだけ None になっていた。
-            // `PasswordReset::expired` は None を期限切れにするので、
-            // こうした値が入るとトークンが常に拒否された。
-            "2026-10-09 10:00:00-05:00",
-            "2026-10-09 10:00:00-0500",
-            "2026-10-09T10:00:00.123456-05:00",
+            "2026-10-09 10:00:00+00:00",
+            "2026-10-09 10:00:00+00",
             "2026-10-09 10:00:00.5",
+            "2026-10-09 10:00:00.5Z",
+            // 時差でないものは今までどおり見ない。
+            "2026-10-09 10:00:00 UTC",
         ] {
             assert_eq!(parse_timestamp(text), Some(base), "{text}");
+        }
+        // 以前は時差を読み捨て、`+09:00` が 9 時間ずれて読めていた。
+        let hour = 3_600;
+        for (text, expected) in [
+            ("2026-10-09 10:00:00+09:00", base - 9 * hour),
+            ("2026-10-09T10:00:00+0900", base - 9 * hour),
+            ("2026-10-09 10:00:00+09", base - 9 * hour),
+            ("2026-10-09 10:00:00+05:30", base - 5 * hour - 30 * 60),
+            // `-` が区切りの一覧に無かったころ、ここは None になっていた。
+            // `PasswordReset::expired` は None を期限切れにするので、
+            // こうした値が入るとトークンが常に拒否された。
+            ("2026-10-09 10:00:00-05:00", base + 5 * hour),
+            ("2026-10-09 10:00:00-0500", base + 5 * hour),
+            ("2026-10-09T10:00:00.123456-05:00", base + 5 * hour),
+        ] {
+            assert_eq!(parse_timestamp(text), Some(expected), "{text}");
+        }
+        // 日付をまたいでも合う。
+        assert_eq!(
+            parse_timestamp("2026-10-09 01:00:00+09:00"),
+            parse_timestamp("2026-10-08 16:00:00")
+        );
+        // 崩れた時差は読めない。
+        for broken in [
+            "2026-10-09 10:00:00+9",
+            "2026-10-09 10:00:00+25:00",
+            "2026-10-09 10:00:00+09:60",
+            "2026-10-09 10:00:00+",
+            "2026-10-09 10:00:00+09:0",
+        ] {
+            assert_eq!(parse_timestamp(broken), None, "{broken}");
         }
     }
 

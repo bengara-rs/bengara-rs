@@ -36,6 +36,8 @@ pub struct Post {
 
 - 使える型は、整数・`f32`・`f64`・`bool`・`String`・`Vec<u8>`・`Carbon`（日時）です。ふだんは `i64` と `String` を使います。
 - **NULL を許す列は `Option<...>` にします。** そうしないと、読むときにエラーです。
+- **`decimal` の列は `f64` のフィールドにします。** PostgreSQL では `String` にすると、読めても `save` で断られます（`numeric` の列に文字列は書けません）。桁を落とせないときは、`DB::statement` で `?::numeric` と書いて保存します。
+- 構造体の指定（`table`・`columns`）とフィールドの `column` を 2 回書くと、コンパイルエラーです。
 - **主キーは自動採番の整数です。** `Option` にはできません。
 - `r#type` のようなフィールドは、`type` が列名になります。
 - 列名の一覧は `Post::COLUMNS` で取れます。
@@ -387,8 +389,8 @@ post.published_at = Some(Carbon::now().add_days(3));
 | `is_past()` / `is_future()`                                     | いまより前 / 後                               |
 | `to_date_string()` / `to_time_string()` / `to_iso8601_string()` | `YYYY-MM-DD` / `HH:MM:SS` / `…T…Z`            |
 
-- `parse` が読むのは `YYYY-MM-DD` と `YYYY-MM-DD HH:MM:SS` です。区切りの `T`、末尾の `Z`、小数の秒も読みます。
-- 桁はちょうどにそろえます。`2026-1-5` や `09:30:00:00` は読めません。
+- `parse` が読むのは `YYYY-MM-DD` と `YYYY-MM-DD HH:MM(:SS)` です。秒は省けます（`2026-11-20 09:30` は 09:30:00）。区切りの `T`、末尾の `Z`、小数の秒も読みます。
+- 年は 4 桁、ほかは 2 桁ちょうどにそろえます。`2026-1-5` や `9:30`、`09:30:00:00` は読めません。
 - **タイムゾーンは UTC だけです。** `+09:00` のような時差付きは読みません。
 - 入力から取り出すときは `validated.get_as::<Carbon>("published_at")?` と書けます。
 

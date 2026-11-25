@@ -2,18 +2,22 @@
 
 pub(crate) mod body;
 pub(crate) mod cookie;
+pub(crate) mod cors;
 pub(crate) mod handler;
 pub(crate) mod middleware;
+pub(crate) mod multipart;
 pub(crate) mod percent;
 pub(crate) mod request;
 pub(crate) mod response;
 pub(crate) mod routing;
 pub(crate) mod statics;
 pub(crate) mod throttle;
+pub(crate) mod upload;
 pub(crate) mod url;
 
 pub use body::BodyStream;
 pub use cookie::{Cookie, SameSite};
+pub use cors::{CorsConfig, HandleCors};
 pub use handler::{BoxFuture, Handler};
 pub use middleware::{Middleware, Middlewares, Next};
 pub use request::Request;
@@ -22,6 +26,7 @@ pub use response::{
 };
 pub use routing::{route, route_with, Registered, Route, RouteGroup};
 pub use throttle::Throttle;
+pub use upload::UploadedFile;
 pub use url::{
     has_valid_signature, route_url, route_url_with, signed_url, temporary_signed_url, url,
 };

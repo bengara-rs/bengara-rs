@@ -53,9 +53,13 @@ bengara = { version = "0.1", features = ["sqlite", "view"] }
 use bengara::prelude::*;
 use bengara::serde_json::json;
 
-pub async fn index(req: Request) -> Result<Response> {
-    let posts = Post::query().latest().get().await?;
-    req.view("posts.index", json!({ "posts": posts }))
+pub struct PostController;
+
+impl PostController {
+    pub async fn index(req: Request) -> Result<Response> {
+        let posts = Post::query().latest().get().await?;
+        req.view("posts.index", json!({ "posts": posts }))
+    }
 }
 ```
 
@@ -90,17 +94,19 @@ let body = bengara::view::render("emails.welcome", json!({ "name": user.name }))
 
 ## Blade との対応
 
-| Blade                                             | bengara（minijinja）                              |
-|---------------------------------------------------|---------------------------------------------------|
-| `{{ $title }}`                                    | `{{ title }}`（逃がされる）                       |
-| `{!! $html !!}`                                   | `{{ html\|safe }}`                                |
-| `@if` / `@foreach` / `@forelse`                   | `{% if %}` / `{% for %}` / `{% for %}…{% else %}` |
-| `@extends('layouts.app')` / `@section` / `@yield` | `{% extends "layouts.app" %}` / `{% block %}`     |
-| `@include('partials.nav')`                        | `{% include "partials.nav" %}`                    |
-| `@csrf`                                           | `{{ csrf_field() }}`                              |
-| `route('posts.show', $post)`                      | `{{ route('posts.show', {'post': post.id}) }}`    |
-| `__('posts.empty')`                               | `{{ __('posts.empty') }}`                         |
-| `old('title')`                                    | `{{ old('title') }}`                              |
+| Blade                                             | bengara（minijinja）                                                 |
+|---------------------------------------------------|----------------------------------------------------------------------|
+| `{{ $title }}`                                    | `{{ title }}`（逃がされる）                                          |
+| `{!! $html !!}`                                   | `{{ html\|safe }}`                                                   |
+| `@if` / `@foreach` / `@forelse`                   | `{% if %}` / `{% for %}` / `{% for %}…{% else %}`                    |
+| `@extends('layouts.app')` / `@section` / `@yield` | `{% extends "layouts.app" %}` / `{% block %}`                        |
+| `@include('partials.nav')`                        | `{% include "partials.nav" %}`                                       |
+| `@csrf`                                           | `{{ csrf_field() }}`                                                 |
+| `route('posts.show', $post)`                      | `{{ route('posts.show', {'post': post.id}) }}`                       |
+| `__('posts.empty')`                               | `{{ __('posts.empty') }}`                                            |
+| `old('title')`                                    | `{{ old('title') }}`                                                 |
+| `@error('title') {{ $message }} @enderror`        | `{% if errors.has('title') %}{{ errors.first('title') }}{% endif %}` |
+| `$errors->any()` / `$errors->all()`               | `errors.any()` / `errors.all()`                                      |
 
 - 変数に `$` は付けません。
 - **使っていない名前（未定義の変数）はエラーです。** 打ち間違いが空の画面にならないようにしています。
@@ -138,7 +144,38 @@ let body = bengara::view::render("emails.welcome", json!({ "name": user.name }))
 - `bengara::view(..)` と `render(..)` の中で呼ぶと、描画のエラーになります。
 - セッションが無い（`StartSession` を通っていない）と、`csrf_field()` と `csrf_token()` はエラーです。
   `old()` は `default` を返します。
-- `context` に `csrf_token`・`csrf_field`・`old` の鍵があると 500 です。別の名前にしてください。
+- `context` に `csrf_token`・`csrf_field`・`old`・`errors` の鍵があると 500 です。別の名前にしてください。
+
+## 検査に落ちた理由（`errors`）
+
+検査に落ちて前の画面に戻ったとき、理由を `errors` で読めます。Laravel の `$errors` に当たります。
+
+| 書き方                  | 返すもの                             |
+|-------------------------|--------------------------------------|
+| `errors.any()`          | 1 件でもあれば真                     |
+| `errors.has("title")`   | その項目に理由があれば真             |
+| `errors.first("title")` | その項目の最初の理由。無ければ空文字 |
+| `errors.first()`        | 全項目で最初の理由。無ければ空文字   |
+| `errors.get("title")`   | その項目の理由の一覧                 |
+| `errors.all()`          | 全項目の理由を並べた一覧             |
+
+```html
+{% if errors.any() %}
+  <ul>{% for message in errors.all() %}<li>{{ message }}</li>{% endfor %}</ul>
+{% endif %}
+
+<input name="title" value="{{ old('title') }}">
+{% if errors.has('title') %}<p class="error">{{ errors.first('title') }}</p>{% endif %}
+```
+
+- `errors` は関数ではなく値です。`errors()` とは書きません。
+- `{% if errors %}` は `errors.any()` と同じです。
+- 理由は次のリクエストで 1 回だけ読めます（`old()` と同じ）。
+- 理由の文は、ほかの値と同じく自動で逃がされます。
+- 理由が無いとき・セッションが無いときは空です。エラーにはなりません。
+- `bengara::view(..)` と `render(..)` でも使えますが、いつも空です。
+- 並びは項目の名前の順です。1 つの項目の中では、足した順です。
+- いつ前の画面に戻るかは [validation.md](validation.md) の「落ちたとき」を見てください。
 
 ## デバッグとリリースの違い
 
@@ -162,6 +199,7 @@ let body = bengara::view::render("emails.welcome", json!({ "name": user.name }))
 
 ## Laravel と違うところ
 
-- `$errors` はありません。検査に落ちると、前の画面に戻さず 422 を返します（[validation.md](validation.md)）。
+- `$errors` は `errors` です。袋の名前分け（`$errors->login`）はありません。1 つの袋だけです。
+- 利用者の `context` に `errors` という名前は使えません（Laravel は渡した値で上書きできます）。
 - `@method('PUT')` はありません。フォームからは POST のルートで受けます。
 - メールの本文は、`render(..)` で描いた文字列を `Mail::to(..)` の `.html(..)` に渡します。

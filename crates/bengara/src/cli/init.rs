@@ -635,7 +635,7 @@ fn update_main(root: &Path, current: Option<&str>, report: &mut Report) -> Resul
         // 「手で書いたコード」として案内する。
         let legacy = std::fs::read_to_string(root.join("src/main.rs"));
         let hand_written = match &legacy {
-            Ok(text) => !text.is_empty() && !is_replaceable_main(text),
+            Ok(text) => !is_disposable_src_main(text),
             Err(error) => error.kind() != ErrorKind::NotFound,
         };
         if hand_written {
@@ -691,8 +691,11 @@ fn clean_src(root: &Path, in_use: bool, report: &mut Report) -> Result<()> {
         return Ok(());
     }
     if main.is_file() {
-        let text = std::fs::read_to_string(&main).unwrap_or_default();
-        if !is_replaceable_main(&text) && !text.contains("bengara::app!") {
+        // 読めないものは消さない（`update_main` も「手で書いたコード」と見る）。
+        let disposable = std::fs::read_to_string(&main)
+            .map(|text| is_disposable_src_main(&text))
+            .unwrap_or(false);
+        if !disposable {
             println!("src/main.rs は使われません。中身を確かめてから消してください。\n");
             return Ok(());
         }
@@ -706,6 +709,21 @@ fn clean_src(root: &Path, in_use: bool, report: &mut Report) -> Result<()> {
         report.removed.push("src/".to_string());
     }
     Ok(())
+}
+
+/// `src/main.rs` を「手で書いたコードではない」と見てよいか。
+///
+/// `update_main`（案内を出すか）と `clean_src`（消すか）が**同じ判定**を使います。
+/// 以前は別々に書いていて、空の `src/main.rs` を `update_main` は「手で書いたもの
+/// ではない」と見て案内を出さず、`clean_src` は「確かめてから消してください」と
+/// 残していました。逆に `bengara::app!` の `src/main.rs` は、`clean_src` が消すのに
+/// `update_main` は「手で書いたコード」と案内していました。
+///
+/// 空（空白と BOM だけを含む）・置き換えてよい雛形・`bengara::app!` の 3 つです。
+fn is_disposable_src_main(text: &str) -> bool {
+    text.trim_start_matches('\u{feff}').trim().is_empty()
+        || is_replaceable_main(text)
+        || text.contains("bengara::app!")
 }
 
 /// 置き換えてよい入口のファイルか。
@@ -872,6 +890,33 @@ mod tests {
                 );
             }
 
+            let _ = std::fs::remove_dir_all(&root);
+        }
+    }
+
+    #[test]
+    fn src_main_rsの判定は案内と片付けでそろえる() {
+        // 以前は空の src/main.rs を、案内は「手で書いたものではない」と見るのに、
+        // 片付けは「確かめてから消してください」と残していた。
+        for (text, disposable) in [
+            ("", true),
+            ("\u{feff}  \n", true),
+            ("fn main() {\n    println!(\"Hello, world!\");\n}\n", true),
+            ("bengara::app!();\n", true),
+            ("fn main() { do_something(); }\n", false),
+        ] {
+            assert_eq!(is_disposable_src_main(text), disposable, "{text:?}");
+
+            let root = temp_project("src-main");
+            std::fs::create_dir_all(root.join("src")).unwrap();
+            std::fs::write(root.join("src/main.rs"), text).unwrap();
+            let mut report = Report::default();
+            clean_src(&root, false, &mut report).unwrap();
+            assert_eq!(
+                !root.join("src/main.rs").exists(),
+                disposable,
+                "{text:?} の片付けが判定と違う"
+            );
             let _ = std::fs::remove_dir_all(&root);
         }
     }
