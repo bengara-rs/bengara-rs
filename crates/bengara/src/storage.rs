@@ -4,6 +4,7 @@
 //! Storage::put("notes/a.txt", "本文").await?;
 //! let body = Storage::get("notes/a.txt").await?;
 //! Storage::disk("public").write("avatars/1.png", bytes).await?;
+//! let path = Storage::disk("public").put_file("avatars", avatar).await?; // アップロード
 //! ```
 //!
 //! | 名前 | 実際の場所 |
@@ -263,6 +264,53 @@ impl Storage {
             std::fs::write(&full, contents).map_err(Error::Io)
         })
         .await?
+    }
+
+    /// アップロードされたファイルを、`path` の下に乱数の名前で保存する。保存したパスを返します。
+    ///
+    /// ```ignore
+    /// let path = Storage::disk("public").put_file("avatars", avatar).await?;
+    /// // "avatars/3f2a…9c.png"。配るときは "/storage/avatars/3f2a…9c.png"
+    /// ```
+    ///
+    /// Laravel の `putFile` と、`$file->store('avatars', 'public')` に当たります。
+    /// 名前は 40 文字の乱数で、拡張子は中身から推したもの（JPEG・PNG・GIF・WebP・BMP）
+    /// だけを付けます。推せなければ付けません。**送られてきた名前と種類は使いません。**
+    pub async fn put_file(&self, path: &str, file: &crate::http::UploadedFile) -> Result<String> {
+        let name = file.hash_name();
+        self.put_file_as(path, file, &name).await
+    }
+
+    /// アップロードされたファイルを、`path` の下に `name` の名前で保存する。保存したパスを返します。
+    ///
+    /// Laravel の `putFileAs` と、`$file->storeAs('avatars', 'a.jpg', 'public')` に当たります。
+    ///
+    /// `name` は 1 つの名前だけです。`/` と `\` を含むと断ります（`path` に書いてください）。
+    /// ほかは [`write`](Self::write) と同じパスの確かめを通します
+    /// （`..`・絶対パス・装置の名前・制御文字・Windows で使えない記号を断ります）。
+    /// 同じ名前があれば上書きします。
+    ///
+    /// **送られてきた名前（`client_original_name()`）をそのまま渡さないでください。**
+    /// 拡張子を選べるので、`public` に `.html` を置かれると、ブラウザがそのページとして開きます。
+    pub async fn put_file_as(
+        &self,
+        path: &str,
+        file: &crate::http::UploadedFile,
+        name: &str,
+    ) -> Result<String> {
+        if matches!(name, "" | "." | "..") || name.contains(['/', '\\']) {
+            return Err(Error::msg(format!(
+                "保存の名前 `{name}` は使えません（空・`.`・`..` か、`/` か `\\` を含んでいます）"
+            )));
+        }
+        let dir = path.trim_end_matches(['/', '\\']);
+        let full = if dir.is_empty() {
+            name.to_string()
+        } else {
+            format!("{dir}/{name}")
+        };
+        self.write(&full, file.get().to_vec()).await?;
+        Ok(full)
     }
 
     /// `Storage::append` の中身。ファイルがあれば改行を挟んで書き足す。
@@ -1482,5 +1530,74 @@ mod tests {
         }
         let _ = std::fs::remove_dir_all(&disk.root);
         let _ = std::fs::remove_dir_all(&outside);
+    }
+
+    fn uploaded(content: &[u8]) -> crate::http::UploadedFile {
+        crate::http::UploadedFile::new(
+            "a.html".into(),
+            "text/html".into(),
+            Arc::new(content.to_vec()),
+            0..content.len(),
+        )
+    }
+
+    #[tokio::test]
+    async fn アップロードを乱数の名前で保存する() {
+        let disk = disk("put-file");
+        let _ = std::fs::remove_dir_all(&disk.root);
+
+        let png = uploaded(b"\x89PNG\r\n\x1a\nbody");
+        let path = disk.put_file("avatars/", &png).await.unwrap();
+        assert!(
+            path.starts_with("avatars/") && path.ends_with(".png"),
+            "{path}"
+        );
+        assert_eq!(path.len(), "avatars/".len() + 44);
+        assert_eq!(
+            disk.read_bytes(&path).await.unwrap().as_deref(),
+            Some(&b"\x89PNG\r\n\x1a\nbody"[..])
+        );
+
+        // 中身が HTML なら拡張子を付けない。送られてきた `a.html` も使わない。
+        let html = disk
+            .put_file("", &uploaded(b"<html></html>"))
+            .await
+            .unwrap();
+        assert_eq!(html.len(), 40, "{html}");
+        assert!(!html.contains('.'));
+
+        let _ = std::fs::remove_dir_all(&disk.root);
+    }
+
+    #[tokio::test]
+    async fn 名前を決めて保存する_使えない名前は断る() {
+        let disk = disk("put-file-as");
+        let _ = std::fs::remove_dir_all(&disk.root);
+
+        let file = uploaded(b"abc");
+        let path = disk.put_file_as("avatars", &file, "1.jpg").await.unwrap();
+        assert_eq!(path, "avatars/1.jpg");
+        assert_eq!(
+            disk.read("avatars/1.jpg").await.unwrap().as_deref(),
+            Some("abc")
+        );
+
+        for bad in [
+            "", ".", "..", "../x", "a/b", "a\\b", "nul", "con.txt", "a?b", "a\u{1}b", "a.txt ",
+        ] {
+            assert!(
+                disk.put_file_as("avatars", &file, bad).await.is_err(),
+                "{bad:?} が通った"
+            );
+        }
+        // 置き場所の外を指す `path` も断る。
+        for bad in ["../up", "/abs", "C:/x"] {
+            assert!(
+                disk.put_file_as(bad, &file, "a.txt").await.is_err(),
+                "{bad}"
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(&disk.root);
     }
 }

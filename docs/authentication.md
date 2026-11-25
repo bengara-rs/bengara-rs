@@ -122,16 +122,17 @@ pub async fn login(req: Request) -> Result<Response> {
 
 `attempt` の 1 つ目の引数は、照合に使う列です。メールアドレス以外でもログインさせられます。
 
-| メソッド                                    | すること                                          |
-|---------------------------------------------|---------------------------------------------------|
-| `attempt::<U>(列, 値, パスワード)`          | 1 件引いて照合し、合えばログイン。返るのは `bool` |
-| `login(&user)`                              | 照合せずにログイン（登録の直後など）              |
-| `login_using_id(値)`                        | 主キーの値だけでログイン                          |
-| `check()` / `guest()`                       | ログインしているか / していないか                 |
-| `id()`                                      | ログイン中の主キーの値（`Option<String>`）        |
-| `user::<U>()`                               | ログイン中の利用者を DB から読む                  |
-| `user_or_fail::<U>()`                       | 同じ。いなければ 401                              |
-| `validate_password::<U>(&user, パスワード)` | ログインせずに照合だけする                        |
+| メソッド                                    | すること                                                     |
+|---------------------------------------------|--------------------------------------------------------------|
+| `attempt::<U>(列, 値, パスワード)`          | 1 件引いて照合し、合えばログイン。返るのは `bool`            |
+| `login(&user)`                              | 照合せずにログイン（登録の直後など）                         |
+| `login_using_id(値)`                        | 主キーの値だけでログイン                                     |
+| `check()` / `guest()`                       | ログインしているか / していないか                            |
+| `id()`                                      | ログイン中の主キーの値（`Option<String>`）                   |
+| `user::<U>()`                               | ログイン中の利用者を DB から読む                             |
+| `user_or_fail::<U>()`                       | 同じ。いなければ 401                                         |
+| `validate::<U>(列, 値, パスワード)`         | 1 件引いて照合だけする。合えば利用者を返す（ログインしない） |
+| `validate_password::<U>(&user, パスワード)` | ログインせずに照合だけする                                   |
 
 - **ログインすると、セッション ID と CSRF トークンが変わります。**
   ログイン後の画面で取り直します（[session.md](session.md)）。
@@ -292,6 +293,210 @@ req.auth().logout_user_async(user.key()).await?;
 - **知らないアドレスを頼まれたときも、同じ応答を返します。** 応答が違うと、登録の有無が分かります。
 - リンクは `GET` で開かれます。同じパスに `GET` のルートも用意します。
 
+## API のトークン
+
+モバイルアプリや外から呼ぶ API を、セッションを使わずに守ります。
+Laravel Sanctum の「個人用アクセストークン」に当たります。
+表も値の形も Sanctum と同じなので、**Laravel で発行したトークンをそのまま照合できます。**
+
+| Sanctum                              | bengara                                                       |
+|--------------------------------------|---------------------------------------------------------------|
+| `$user->createToken('名前', ['a'])`  | `user.create_token("名前", &["a"], None).await?`              |
+| `->plainTextToken`                   | `.plain_text_token`                                           |
+| `$user->tokens()->delete()`          | `user.tokens().delete().await?`                               |
+| `$user->tokenCan('a')`               | `req.auth().token_can("a")`                                   |
+| `$user->currentAccessToken()`        | `req.auth().current_access_token()`                           |
+| `PersonalAccessToken::findToken($t)` | `PersonalAccessToken::find_token(t).await?`                   |
+| `auth:sanctum`                       | `Authenticate::token()`                                       |
+| `abilities:a,b` / `ability:a,b`      | `CheckAbilities::new([..])` / `CheckForAnyAbility::new([..])` |
+
+- `prelude` には入っていません。`bengara::auth` から `use` します。
+- SPA の Cookie 認証（Sanctum の stateful）はありません。
+
+### 表を作る
+
+```rust
+// database/migrations/..._create_personal_access_tokens_table.rs
+use bengara::auth::PersonalAccessToken;
+
+pub fn up(schema: &mut Schema) {
+    PersonalAccessToken::define(schema);
+}
+
+pub fn down(schema: &mut Schema) {
+    schema.drop_if_exists(PersonalAccessToken::TABLE);
+}
+```
+
+表の名前は `personal_access_tokens`、列は Sanctum 4 と同じです。
+
+| 列                         | 中身                                   |
+|----------------------------|----------------------------------------|
+| `id`                       | 主キー                                 |
+| `tokenable_type`           | 持ち主の種類（`App\Models\User` など） |
+| `tokenable_id`             | 持ち主の主キー（整数）                 |
+| `name`                     | トークンの名前                         |
+| `token`                    | 平文の SHA-256（16 進 64 文字）。一意  |
+| `abilities`                | 能力の JSON の配列。`"*"` はすべて     |
+| `last_used_at`             | 最後に使った日時                       |
+| `expires_at`               | 期限。NULL なら無期限                  |
+| `created_at`・`updated_at` | 作った・直した日時                     |
+
+Laravel の表がすでにあるなら、作り直さずにそのまま使えます。
+
+### トークンを作る
+
+```rust
+use bengara::auth::HasApiTokens;
+
+let token = user.create_token("iPhone", &["posts:read", "posts:write"], None).await?;
+Response::json(&json!({ "token": token.plain_text_token }))
+
+// 期限をつける
+let token = user
+    .create_token("一時的", &["*"], Some(Carbon::now().add_days(30)))
+    .await?;
+```
+
+- `Authenticatable` を実装したモデルなら、何も書かずに使えます。`HasApiTokens` を `use` するだけです。
+- 渡す値は `{id}|{平文}` の形です。平文は乱数 40 文字と crc32b（8 文字）で、Sanctum 4 と同じです。
+- **平文が見えるのは作ったときだけです。** 表には SHA-256 しか残りません。
+- 何でもできるトークンは `&["*"]` です（Laravel の既定の `['*']` に当たります）。
+- 保存していない利用者（主キーが空）ではエラーです。
+
+メールアドレスとパスワードを受けてトークンを返す口は、`validate` で照合します。
+`attempt` はセッションでログインして Cookie を返すので、この口には使いません。
+
+```rust
+let Some(user) = req.auth().validate::<User>("email", &email, input.get("password")).await? else {
+    return abort_with(422, "メールアドレスかパスワードが違います");
+};
+let token = user.create_token(input.get("device_name"), &["posts:read"], None).await?;
+```
+
+- 利用者がいないときも、照合と同じだけ時間をかけます（登録の有無が漏れません）。
+
+### 持ち主の種類（`tokenable_type`）
+
+表の `tokenable_type` には `Authenticatable::morph_class()` を入れます。
+既定は `App\Models\` に型の名前をつないだものです（`User` なら `App\Models\User`）。
+
+- Laravel で発行したトークンを読むためです。Laravel のモデルと同じ名前の型なら、何も書かずに読めます。
+- 名前が違うとき（`morphMap` を使っていたときなど）は、`morph_class()` を書き換えます。
+
+```rust
+impl Authenticatable for Member {
+    fn password_hash(&self) -> &str {
+        &self.password
+    }
+    fn morph_class() -> String {
+        "App\\Models\\User".to_string()
+    }
+}
+```
+
+### トークンで守る
+
+```rust
+// bootstrap/app.rs
+use bengara::auth::{CheckAbilities, CheckForAnyAbility};
+
+.with_middleware(|m| {
+    m.append(StartSession::from_env())
+        // トークンで呼ぶ書き込みのルートだけを、名前で 1 本ずつ外す。
+        .append(VerifyCsrfToken::new().except_route("api.posts.store"))
+        .alias("auth:sanctum", Authenticate::token())
+        .alias("abilities:posts:write", CheckAbilities::new(["posts:write"]))
+        .alias("ability:posts:read,posts:write", CheckForAnyAbility::new(["posts:read", "posts:write"]))
+})
+
+// routes/web.rs
+Route::prefix("api").name("api.").middleware("auth:sanctum").group(|| {
+    Route::get("/me", ApiController::me).name("me");
+    Route::post("/posts", PostController::store)
+        .name("posts.store")
+        .middleware("abilities:posts:write");
+});
+```
+
+相手は `Authorization: Bearer <トークン>` を付けて呼びます。
+
+| 状況                               | `Authenticate::token()` が返すもの |
+|------------------------------------|------------------------------------|
+| ヘッダーが無い・`Bearer` でない    | 401                                |
+| 表に無い・値が違う・消したトークン | 401                                |
+| 期限切れ（`expires_at` が過ぎた）  | 401                                |
+| 通った                             | そのまま通す                       |
+
+- **転送しません。** 画面からの要求にも 401 を返します。JSON を求める相手には JSON で返します。
+- **セッションを使いません。** 読みも書きもしないので、Cookie の無い要求でセッションのファイルは増えません。
+- **CSRF の確認から外します。** トークンの要求は Cookie を持たないので、書き込みのルートを
+  `except_route` で外します（上の例）。
+  **`except_route("api.*")` のようにまとめないでください。** `api.` の下にセッションで認証する口を
+  後から足したとき、その口まで黙って外れます。名前で 1 本ずつ書きます。
+- `last_used_at` を書きます。前に書いてから 60 秒たっていなければ書きません。
+- 名前の `auth:sanctum` は好きに決めてかまいません。`alias` に渡した名前で呼びます。
+
+### ハンドラで読む
+
+通った要求では、`req.auth()` がトークンの持ち主を返します。
+
+```rust
+pub async fn me(req: Request) -> Result<Response> {
+    let user = req.auth().user_or_fail::<User>().await?;
+    if req.auth().token_cant("posts:write") {
+        return abort(403);
+    }
+    Response::json(&user)
+}
+```
+
+| メソッド                 | 返すもの                                                   |
+|--------------------------|------------------------------------------------------------|
+| `check()` / `id()`       | トークンがあれば真 / 持ち主の主キー（`tokenable_id`）      |
+| `user::<U>()`            | 持ち主。`tokenable_type` が `U` と違えば `None`            |
+| `current_access_token()` | この要求のトークン（`PersonalAccessToken`）                |
+| `token_can(能力)`        | この要求のトークンがその能力を持つか。トークンが無ければ偽 |
+
+- **トークンを先に見ます。** トークンで通った要求では、セッションのログインは見ません。
+- `login` や `logout` は、いつもセッションに対する操作です。トークンは消しません。
+- `check()` と `id()` は利用者の行を引きません。利用者を消したら、その人のトークンも消します。
+
+### 能力を確かめる
+
+| ミドルウェア         | 通す条件                          | 認証していない | 足りない |
+|----------------------|-----------------------------------|----------------|----------|
+| `CheckAbilities`     | 書いた能力を**すべて**持つ        | 401            | 403      |
+| `CheckForAnyAbility` | 書いた能力の**どれか 1 つ**を持つ | 401            | 403      |
+
+- `"*"` を持つトークンは、どの能力も持つ扱いです。
+- 能力の名前は完全に一致したときだけ当たります。`posts:*` のような書き方は読みません。
+- `Authenticate::token()` より**後ろ**に掛けます。セッションでログインしているだけの要求は 401 です。
+
+### トークンを消す
+
+```rust
+use bengara::prelude::*;   // Model（delete）を使うため
+
+// この端末だけログアウト（いま使っているトークンを消す）
+if let Some(token) = req.auth().current_access_token() {
+    token.delete().await?;
+}
+
+// 全部の端末からログアウト
+user.tokens().delete().await?;
+```
+
+- `tokens()` はその利用者のトークンを引くクエリです。`get()` で一覧、`count()` で数も取れます。
+- 期限切れのトークンは、自動では消えません。
+
+### 秘密の扱い
+
+- 平文のトークンは表に残しません。照合は SHA-256 を定数時間で比べます。
+- `Authorization` ヘッダーは、`{req:?}` のログでは `***` に伏せます。
+- `NewAccessToken` と `PersonalAccessToken` の `Debug` は、平文も SHA-256 も出しません。
+- `req.bearer_token()` で値を取り出せますが、**ログには出さないでください。**
+
 ## 暗号化
 
 値を他人に読めない形にします。機能フラグ `encryption` が要ります。
@@ -320,8 +525,36 @@ let plain = decrypt(&hidden)?;       // 改ざんされていればエラー
 - Argon2id は、計算に大量のメモリを使わせる方式です。GPU での総当たりに PBKDF2 より強いです。
 - `check` は、どちらの方式の値でも照合します。方式を替えても、古い値でログインできます。
 - Laravel（PHP の `password_hash`）で作った `$argon2id$` の値は、そのまま照合できます。
-- **bcrypt（`$2y$`、Laravel の既定）と `$argon2i$` は照合できません。** 偽になります。
+- bcrypt（`$2y$`、Laravel の既定）の値は、機能フラグ `bcrypt` で照合できます（下の節）。
+- **`$argon2i$` は照合できません。** 偽になります。
 - `cargo artisan about` の「パスワード」の行で、いまの方式と強さが分かります。
+
+### Laravel の bcrypt の値を持ち込む
+
+Laravel の users 表を持ち込んだとき、全員にパスワードを設定し直してもらわずに済みます。
+
+```toml
+bengara = { version = "0.1", features = ["sqlite", "bcrypt"] }
+```
+
+- **照合だけです。bcrypt で作ることはできません。**
+- 合ったら、`attempt` がログインのついでに `HASH_DRIVER` の方式（PBKDF2 か Argon2id）で作り直します。
+  bcrypt の値では、`Hash::needs_rehash` がいつも真です。
+- `HASH_DRIVER=bcrypt` にしても、ログに出して PBKDF2 で作ります。
+- フラグが無いときは偽になります。ログに「features に `"bcrypt"` を足すと照合できます」と出ます。
+
+| 値・入力                           | 扱い                                              |
+|------------------------------------|---------------------------------------------------|
+| `$2y$`・`$2b$`・`$2a$`             | 照合する                                          |
+| `$2x$`（古い不具合のある形）       | 偽                                                |
+| 長さが 60 でない・文字が正しくない | 偽                                                |
+| cost が 4〜16 の外                 | 計算せずに偽（Laravel の既定は 12）               |
+| 72 バイトを超えるパスワード        | 先頭 72 バイトだけを使う（PHP と同じ）            |
+| NUL（`\0`）を含むパスワード        | **偽**。PHP は NUL で切って照合するが、真似しない |
+
+- PHP は NUL を含むパスワードから bcrypt を作れません。なので NUL を偽にしても、正しい値は落ちません。
+- bcrypt の値の利用者でも、いない利用者と同じだけ時間をかけます。照合した値の cost の最大にそろえます。
+- ログインしない人の値は、bcrypt のまま残ります。
 
 ### PBKDF2 の回数
 
@@ -394,10 +627,10 @@ opt-level = 3
 
 - 作り直すのは、`Hash::needs_rehash` が真のときです。
 
-| いまの方式 | `needs_rehash` が真になる値                                     |
-|------------|-----------------------------------------------------------------|
-| `pbkdf2`   | 回数が設定より少ない値。形の読めない値                          |
-| `argon2id` | PBKDF2 の値。`m`・`t`・`p` が設定と違う値（設定より強くても真） |
+| いまの方式 | `needs_rehash` が真になる値                                                  |
+|------------|------------------------------------------------------------------------------|
+| `pbkdf2`   | 回数が設定より少ない値。形の読めない値。bcrypt の値                          |
+| `argon2id` | PBKDF2 の値。`m`・`t`・`p` が設定と違う値（設定より強くても真）。bcrypt の値 |
 
 - 書く列は `Authenticatable::auth_password_name()` です。既定は `password` です。
 - 作り直しに失敗しても、ログインは成功します。ログに警告が出ます。
@@ -422,7 +655,7 @@ if ok && Hash::needs_rehash(&user.password) {
 Argon2id は 1 件で既定 64 MiB を使うので、ログインが押し寄せてもメモリを使いすぎないためです。
 
 - 既定は CPU の数です。上限を超えた分は、空くまで待ちます。
-- 上限が効くのは `make_async`・`check_async`・`attempt`・`validate_password` です。
+- 上限が効くのは `make_async`・`check_async`・`attempt`・`validate`・`validate_password` です。
 - **同期版の `Hash::make` / `Hash::check` には効きません。**
 
 ## 関連

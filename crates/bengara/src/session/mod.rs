@@ -311,7 +311,7 @@ impl Session {
     /// 中身の組を全部返す（持ち越し中の値も含む）。
     ///
     /// **`__` で始まる鍵は入りません。** フレームワークが中で使う値
-    /// （CSRF のトークン `__csrf_token`、検査に落ちた入力 `__old_input`）です。
+    /// （CSRF のトークン `__csrf_token`、検査に落ちた入力 `__old_input` と理由 `__errors`）です。
     /// 画面やログにそのまま出すと、トークンや入力し直し用の値が漏れます。
     /// 要るときは `req.csrf_token()` と [`old`](Self::old) で取り出してください。
     pub fn all(&self) -> BTreeMap<String, String> {
@@ -346,6 +346,46 @@ impl Session {
         let json = serde_json::to_string(&pairs.iter().cloned().collect::<BTreeMap<_, _>>())
             .unwrap_or_else(|_| "{}".to_string());
         self.flash_internal(OLD_INPUT_KEY, json);
+    }
+
+    /// 検査に落ちた理由を覚えておく（前の画面に戻したときに出すため）。
+    ///
+    /// 中身は項目ごとの理由の一覧を JSON にしたものです。並びは
+    /// [`ValidationErrors`](crate::validation::ValidationErrors) と同じ（項目の名前の順）です。
+    ///
+    /// JSON が [`MAX_OLD_INPUT_BYTES`] を超えるときは覚えずに偽を返します。
+    /// 呼ぶ側は戻さずに 422 の画面にします（理由の無い画面に戻さないため）。
+    pub(crate) fn flash_errors(&self, errors: &crate::validation::ValidationErrors) -> bool {
+        let json = serde_json::to_string(errors.all()).unwrap_or_else(|_| "{}".to_string());
+        if json.len() > MAX_OLD_INPUT_BYTES {
+            tracing::warn!(
+                "検査に落ちた理由が {} バイトあり、上限（{MAX_OLD_INPUT_BYTES} バイト）を\
+                 超えているので覚えません",
+                json.len()
+            );
+            return false;
+        }
+        self.flash_internal(ERRORS_KEY, json);
+        true
+    }
+
+    /// 前のリクエストで検査に落ちた理由を読む。無い・読めないときは空です。
+    ///
+    /// テンプレートの `errors` が使います。
+    #[cfg_attr(not(feature = "view"), allow(dead_code))]
+    pub(crate) fn errors(&self) -> crate::validation::ValidationErrors {
+        let mut errors = crate::validation::ValidationErrors::default();
+        let raw = self.lock().lookup(ERRORS_KEY).cloned();
+        let Some(raw) = raw else {
+            return errors;
+        };
+        let parsed: BTreeMap<String, Vec<String>> = serde_json::from_str(&raw).unwrap_or_default();
+        for (field, messages) in parsed {
+            for message in messages {
+                errors.add(&field, message);
+            }
+        }
+        errors
     }
 
     /// ログイン前に見ようとしていたパスを取り出す。**読むと消えます。**
@@ -498,8 +538,11 @@ const FLASH_PREFIX: &str = "__flash:";
 /// 前の入力を入れておく場所。
 const OLD_INPUT_KEY: &str = "__old_input";
 
-/// 検査に落ちた入力として覚える合計の上限（バイト）。
-const MAX_OLD_INPUT_BYTES: usize = 64 * 1024;
+/// 検査に落ちた理由を入れておく場所。
+const ERRORS_KEY: &str = "__errors";
+
+/// 検査に落ちた入力として覚える合計の上限（バイト）。理由（[`ERRORS_KEY`]）にも使います。
+pub(crate) const MAX_OLD_INPUT_BYTES: usize = 64 * 1024;
 
 /// 推測できない ID を作る。
 fn new_id() -> String {
@@ -896,5 +939,29 @@ mod tests {
 
         s.flash_input(&[("title".to_string(), "小さい".to_string())]);
         assert_eq!(s.old("title").as_deref(), Some("小さい"));
+    }
+
+    #[test]
+    fn 理由は順序を保って持ち越し大きすぎれば覚えない() {
+        let mut errors = crate::validation::ValidationErrors::default();
+        errors.add("title", "1 つ目");
+        errors.add("title", "2 つ目");
+        errors.add("body", "本文");
+
+        let s = Session::empty();
+        assert!(s.errors().is_empty(), "無いときは空");
+        assert!(s.flash_errors(&errors));
+        // 次のリクエストへ持ち越す形にしてから読む。
+        let (data, old_flash) = Session::split_flash(s.snapshot_for_save());
+        let next = Session::new("next".into(), data, old_flash);
+        assert_eq!(next.errors(), errors);
+        assert_eq!(next.errors().get("title"), ["1 つ目", "2 つ目"]);
+        assert!(!next.all().contains_key(ERRORS_KEY), "all() には出さない");
+
+        let mut big = crate::validation::ValidationErrors::default();
+        big.add("title", "x".repeat(MAX_OLD_INPUT_BYTES));
+        let s = Session::empty();
+        assert!(!s.flash_errors(&big), "上限を超える理由は覚えない");
+        assert!(!s.is_dirty());
     }
 }

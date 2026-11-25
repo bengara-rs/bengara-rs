@@ -9,7 +9,8 @@
 //! let title = input.get("title");
 //! ```
 //!
-//! 失敗すると `Error::Validation` になり、422 と、どの項目がなぜ駄目かの JSON を返します。
+//! 失敗すると `Error::Validation` になります。JSON を求める相手には 422 と、どの項目がなぜ駄目かの JSON を、
+//! 画面の相手には前の画面へ戻す 302（戻り先が決まらなければ 422 の画面）を返します（`Request::validate`）。
 //!
 //! 規則を [`rules!`](crate::rules) で書くと、書き間違いをコンパイルのときに止めます。
 //! 規則と読み先の型をまとめるときは [`FormRequest`] と `req.validate_as()` を使います。
@@ -206,7 +207,7 @@ macro_rules! rule_names {
     () => {
         "required, nullable, integer (int), numeric, boolean (bool), email, url, alpha, \
          alpha_num, alpha_dash, min, max, size, between, in, confirmed, same, different, \
-         starts_with, ends_with, date"
+         starts_with, ends_with, date, file, image, mimes"
     };
 }
 
@@ -236,6 +237,12 @@ enum Rule {
     StartsWith(String),
     EndsWith(String),
     Date,
+    /// ファイルが送られた。
+    File,
+    /// 中身が画像（JPEG・PNG・GIF・WebP・BMP）。SVG は入れない。
+    Image,
+    /// 中身から推した種類が、並べたどれか（`mimes:jpg,png`）。
+    Mimes(Vec<String>),
 }
 
 /// 使える規則の名前。知らない規則を断るときの案内に出します。
@@ -338,6 +345,33 @@ impl Rule {
             "starts_with" => Rule::StartsWith(text("starts_with")?),
             "ends_with" => Rule::EndsWith(text("ends_with")?),
             "date" => Rule::Date,
+            "file" => Rule::File,
+            "image" => Rule::Image,
+            // 中身から推せる種類（`http/upload.rs` の `MIMES_NAMES`）だけを書けます。
+            // 推せない種類（`pdf` など）を書くと、どのファイルも通らなくなるので 500 にします。
+            "mimes" => {
+                let allowed: Vec<String> = arg
+                    .unwrap_or("")
+                    .split(',')
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect();
+                if allowed.is_empty() {
+                    return Err(Error::msg(
+                        "規則 `mimes` には 1 つ以上の種類が要ります（例: mimes:jpg,png）",
+                    ));
+                }
+                if let Some(unknown) = allowed
+                    .iter()
+                    .find(|name| !crate::http::upload::MIMES_NAMES.contains(&name.as_str()))
+                {
+                    return Err(Error::msg(format!(
+                        "規則 `mimes` の `{unknown}` は中身から推せません。書けるのは {} です",
+                        crate::http::upload::MIMES_NAMES.join(", ")
+                    )));
+                }
+                Rule::Mimes(allowed)
+            }
             // 知らない規則は**書き間違い**です。利用者に見せる 422 にはしません。
             // `min`（引数忘れ）と同じ扱いで、作った人へ 500 で知らせます。
             // 422 にすると、内部の規則名がそのまま画面に出ます。
@@ -374,6 +408,7 @@ impl Rule {
 /// | `between` の形が違う | `between:5`・`between:a,10` |
 /// | `in` に値が 1 つも無い | `in:`・`in:,,` |
 /// | `same` などに値が無い | `same:` |
+/// | `mimes` に種類が無い・中身から推せない種類 | `mimes:`・`mimes:pdf`・`mimes:svg` |
 ///
 /// 次のものは**実行時に任せます**（500 になります）。`between:10,1`（下限が上限より大きい）、
 /// `max:1e400`（桁あふれ）、`size:1e30`（大きすぎる）。
@@ -471,6 +506,10 @@ pub trait FormRequest: serde::de::DeserializeOwned {
 /// let _ = bengara::rules! { "a" => "same:" };
 /// ```
 ///
+/// ```compile_fail,E0080
+/// let _ = bengara::rules! { "avatar" => "file|mimes:svg" };
+/// ```
+///
 /// `FormRequest::RULES` を `rules!` で書くと、`validate_as` を呼ばなくても止まります。
 ///
 /// ```compile_fail,E0080
@@ -510,8 +549,9 @@ pub trait FormRequest: serde::de::DeserializeOwned {
 ///     "title" => "required|max:255",
 ///     "age"   => "nullable|integer|between:0,150",
 ///     "at"    => "date",
+///     "photo" => "nullable|image|mimes:jpg,png|max:2048",
 /// };
-/// assert_eq!(rules.len(), 3);
+/// assert_eq!(rules.len(), 4);
 /// let none: &[(&str, &str)] = bengara::rules! {};
 /// assert!(none.is_empty());
 /// ```
@@ -567,7 +607,39 @@ const fn check_rule(spec: &[u8], start: usize, end: usize) {
         || is!("alpha_dash")
         || is!("confirmed")
         || is!("date")
+        || is!("file")
+        || is!("image")
     {
+        return;
+    }
+    if is!("mimes") {
+        // `,` で分けて空白を落とす。空でない値が 1 つ以上あり、どれも推せる種類であること。
+        let mut found = false;
+        let mut s = a;
+        while s <= b {
+            let e = find_byte(spec, s, b, b',');
+            let (vs, ve) = trim_range(spec, s, e);
+            if vs < ve {
+                let mut known = false;
+                let mut k = 0;
+                while k < crate::http::upload::MIMES_NAMES.len() {
+                    if bytes_eq(spec, vs, ve, crate::http::upload::MIMES_NAMES[k]) {
+                        known = true;
+                    }
+                    k += 1;
+                }
+                if !known {
+                    panic!(
+                        "検査の規則: `mimes` に書けるのは jpg, jpeg, png, gif, webp, bmp です（中身から推せる種類だけ）"
+                    );
+                }
+                found = true;
+            }
+            s = e + 1;
+        }
+        if !found {
+            panic!("検査の規則: `mimes` には 1 つ以上の種類が要ります（例: mimes:jpg,png）");
+        }
         return;
     }
     if is!("min") {
@@ -831,6 +903,8 @@ const fn has_fraction(bytes: &[u8], start: usize, end: usize) -> bool {
 /// 入力をひとまとめにしたもの（クエリ・フォーム・JSON のどれか）。
 pub(crate) struct Input {
     values: BTreeMap<String, String>,
+    /// アップロードされたファイル（名前は送られてきたまま。`photos[]` も）。
+    files: Vec<(String, crate::http::UploadedFile)>,
 }
 
 /// 前後の空白を**落とさない**項目の名前。
@@ -869,11 +943,29 @@ impl Input {
                 .entry(k)
                 .or_insert_with(|| if trim { v.trim().to_string() } else { v });
         }
-        Self { values }
+        Self {
+            values,
+            files: Vec::new(),
+        }
+    }
+
+    /// アップロードされたファイルを足す（`req.validate` が使います）。
+    pub(crate) fn with_files(mut self, files: Vec<(String, crate::http::UploadedFile)>) -> Self {
+        self.files = files;
+        self
     }
 
     fn get(&self, field: &str) -> Option<&str> {
         self.values.get(field).map(String::as_str)
+    }
+
+    /// その名前のファイル。`photos` は `photos[]` の欄も含みます（`req.files` と同じ）。
+    fn files_of(&self, field: &str) -> Vec<&crate::http::UploadedFile> {
+        self.files
+            .iter()
+            .filter(|(name, _)| crate::http::request::file_field_is(name, field))
+            .map(|(_, file)| file)
+            .collect()
     }
 }
 
@@ -888,6 +980,17 @@ pub(crate) fn validate(input: &Input, rules: &[(&str, &str)]) -> Result<Validate
             .filter(|s| !s.trim().is_empty())
             .map(Rule::parse)
             .collect::<Result<_>>()?;
+
+        // ファイルが送られた項目は、ファイルとして検査する（`required` も通る）。
+        // 通ったファイルは `Validated` に入れません。文字の表なので、入れられるのは
+        // 送られてきた名前くらいで、それを保存に使われると困るためです。`req.file()` で読みます。
+        let files = input.files_of(field);
+        if !files.is_empty() {
+            for rule in &parsed {
+                check_files(rule, field, &files, input, &parsed, &mut errors);
+            }
+            continue;
+        }
 
         let raw = input.get(field);
         // 値は `Input::new` で前後の空白を落としてある。
@@ -1126,7 +1229,101 @@ fn check(
                 );
             }
         }
+        // ここに来るのは、ファイルが送られず、文字が来た項目です（Laravel も落とします）。
+        // ファイルが送られた項目は `check_files` が見ます。
+        Rule::File => errors.add(field, file_message(field)),
+        Rule::Image => errors.add(field, image_message(field)),
+        Rule::Mimes(allowed) => errors.add(field, mimes_message(field, allowed)),
     }
+}
+
+/// ファイルが送られた項目に、規則を 1 つ当てる。
+///
+/// 同じ名前のファイルが何個か来たとき（`photos[]`）は、全部に当てます。
+/// 1 つでも落ちれば、その規則の理由を 1 件だけ足します。
+///
+/// | 規則 | 見るもの |
+/// |---|---|
+/// | `required`・`nullable`・`file` | 何もしない（送られている） |
+/// | `image` | 中身が JPEG・PNG・GIF・WebP・BMP か。SVG は通さない |
+/// | `mimes` | 中身から推した種類が並べたどれか。送られてきた名前と MIME は見ない |
+/// | `min`・`max`・`between`・`size` | 大きさを **KB**（1024 バイト）で比べる。Laravel と同じ |
+/// | それ以外 | 値を空文字として当てる（`integer` などは落ちる） |
+fn check_files(
+    rule: &Rule,
+    field: &str,
+    files: &[&crate::http::UploadedFile],
+    input: &Input,
+    rules: &[Rule],
+    errors: &mut ValidationErrors,
+) {
+    let kilobytes = |file: &&crate::http::UploadedFile| file.size() as f64 / 1024.0;
+    let any = |failed: &dyn Fn(&&crate::http::UploadedFile) -> bool| files.iter().any(failed);
+    match rule {
+        Rule::Required | Rule::Nullable | Rule::File => {}
+        Rule::Image => {
+            if any(&|file| file.kind().is_none()) {
+                errors.add(field, image_message(field));
+            }
+        }
+        Rule::Mimes(allowed) => {
+            let fits = |file: &&crate::http::UploadedFile| {
+                file.kind()
+                    .is_some_and(|kind| allowed.iter().any(|name| kind.matches(name)))
+            };
+            if any(&|file| !fits(file)) {
+                errors.add(field, mimes_message(field, allowed));
+            }
+        }
+        Rule::Min(min) => {
+            if any(&|file| kilobytes(file) < min.num) {
+                errors.add(
+                    field,
+                    format!("{field} は {min} KB 以上のファイルにしてください。"),
+                );
+            }
+        }
+        Rule::Max(max) => {
+            if any(&|file| kilobytes(file) > max.num) {
+                errors.add(
+                    field,
+                    format!("{field} は {max} KB 以下のファイルにしてください。"),
+                );
+            }
+        }
+        Rule::Between(lo, hi) => {
+            if any(&|file| kilobytes(file) < lo.num || kilobytes(file) > hi.num) {
+                errors.add(
+                    field,
+                    format!("{field} は {lo} KB から {hi} KB のファイルにしてください。"),
+                );
+            }
+        }
+        Rule::Size(size) => {
+            if any(&|file| kilobytes(file) != *size as f64) {
+                errors.add(
+                    field,
+                    format!("{field} は {size} KB のファイルにしてください。"),
+                );
+            }
+        }
+        other => check(other, field, "", input, rules, errors),
+    }
+}
+
+fn file_message(field: &str) -> String {
+    format!("{field} はファイルを送ってください。")
+}
+
+fn image_message(field: &str) -> String {
+    format!("{field} は画像（JPEG・PNG・GIF・WebP・BMP）を送ってください。")
+}
+
+fn mimes_message(field: &str, allowed: &[String]) -> String {
+    format!(
+        "{field} は {} の形式のファイルを送ってください。",
+        allowed.join(" / ")
+    )
 }
 
 /// `min` / `max` / `between` が何と比べるか。
@@ -2220,6 +2417,7 @@ mod tests {
             "min" | "max" | "size" => format!("{name}:3"),
             "between" => format!("{name}:1,3"),
             "in" | "same" | "different" | "starts_with" | "ends_with" => format!("{name}:a"),
+            "mimes" => format!("{name}:jpg"),
             _ => name.to_string(),
         }
     }
@@ -2240,7 +2438,7 @@ mod tests {
     #[test]
     fn 一覧のすべての規則名が実行時もコンパイル時も通る() {
         let names = listed_names();
-        assert_eq!(names.len(), 23, "{names:?}");
+        assert_eq!(names.len(), 26, "{names:?}");
         assert!(names.contains(&"int") && names.contains(&"date"));
         for name in names {
             let spec = with_example(name);
@@ -2277,6 +2475,9 @@ mod tests {
             Rule::StartsWith(_) => "starts_with",
             Rule::EndsWith(_) => "ends_with",
             Rule::Date => "date",
+            Rule::File => "file",
+            Rule::Image => "image",
+            Rule::Mimes(_) => "mimes",
         }
     }
 
@@ -2362,6 +2563,23 @@ mod tests {
             "starts_with:",
             "ends_with",
             "required|\u{3000}maxx:10",
+            // ファイルの規則
+            "file",
+            "image",
+            "image:allow_svg",
+            "file|image|mimes:jpg,png|max:2048",
+            "mimes: jpeg , webp ",
+            "mimes:,gif,",
+            "mimes:bmp",
+            "mimes",
+            "mimes:",
+            "mimes:,",
+            "mimes:pdf",
+            "mimes:svg",
+            "mimes:html",
+            "mimes:jpg,svg",
+            "mimes:JPG",
+            "Image",
         ] {
             assert_eq!(
                 compile_accepts(spec),
@@ -2428,6 +2646,153 @@ mod tests {
         assert!(message("min").contains("`min` には数値が要ります"));
         assert!(message("size:1.5").contains("`size` には 0 以上の整数が要ります"));
         assert!(message("in:,").contains("`in` には 1 つ以上の値が要ります"));
+        assert!(message("mimes:").contains("`mimes` には 1 つ以上の種類が要ります"));
+        // 止める文に書いた一覧は、実際に推せる種類（`MIMES_NAMES`）と同じ。
+        let names = crate::http::upload::MIMES_NAMES.join(", ");
+        assert!(message("mimes:pdf").contains(&names), "{names}");
+    }
+
+    mod files {
+        use super::*;
+        use crate::http::UploadedFile;
+        use std::sync::Arc;
+
+        const PNG: &[u8] = b"\x89PNG\r\n\x1a\n";
+
+        fn upload(content: &[u8]) -> UploadedFile {
+            UploadedFile::new(
+                "a.png".into(),
+                "image/png".into(),
+                Arc::new(content.to_vec()),
+                0..content.len(),
+            )
+        }
+
+        fn with_files(pairs: &[(&str, &str)], files: &[(&str, &[u8])]) -> Input {
+            input(pairs).with_files(
+                files
+                    .iter()
+                    .map(|(name, content)| (name.to_string(), upload(content)))
+                    .collect(),
+            )
+        }
+
+        /// `len` バイトの PNG（先頭だけ PNG で、後ろは 0）。
+        fn png_of(len: usize) -> Vec<u8> {
+            let mut bytes = PNG.to_vec();
+            bytes.resize(len, 0);
+            bytes
+        }
+
+        #[test]
+        fn ファイルが送られればrequiredとfileが通る() {
+            let i = with_files(&[], &[("avatar", PNG)]);
+            let ok = validate(&i, &[("avatar", "required|file|image")]).unwrap();
+            // ファイルは `Validated` に入れない（`req.file()` で読む）。
+            assert!(!ok.has("avatar"));
+
+            let e = errors_of(&input(&[]), &[("avatar", "required|file")]);
+            assert_eq!(e.get("avatar"), ["avatar は必ず入力してください。"]);
+            // 送られていなければ飛ばす（`required` が無いとき）。
+            assert!(errors_of(&input(&[]), &[("avatar", "file|image")]).is_empty());
+        }
+
+        #[test]
+        fn 文字が来たらファイルの規則で落ちる() {
+            let e = errors_of(
+                &input(&[("avatar", "a.png")]),
+                &[("avatar", "file|image|mimes:png")],
+            );
+            assert_eq!(
+                e.get("avatar"),
+                [
+                    "avatar はファイルを送ってください。",
+                    "avatar は画像（JPEG・PNG・GIF・WebP・BMP）を送ってください。",
+                    "avatar は png の形式のファイルを送ってください。",
+                ]
+            );
+        }
+
+        #[test]
+        fn imageは中身で見てsvgとhtmlを通さない() {
+            for content in [
+                &b"<svg xmlns=\"http://www.w3.org/2000/svg\"/>"[..],
+                b"<html><script>alert(1)</script></html>",
+                b"plain text",
+            ] {
+                let e = errors_of(&with_files(&[], &[("f", content)]), &[("f", "image")]);
+                assert!(e.has("f"), "{:?}", String::from_utf8_lossy(content));
+            }
+            for content in [
+                &b"\xFF\xD8\xFF\xE0"[..],
+                PNG,
+                b"GIF89a",
+                b"RIFF\x00\x00\x00\x00WEBP",
+            ] {
+                let i = with_files(&[], &[("f", content)]);
+                assert!(errors_of(&i, &[("f", "image")]).is_empty());
+            }
+        }
+
+        #[test]
+        fn mimesは中身から推した種類で見る() {
+            let jpeg = with_files(&[], &[("f", b"\xFF\xD8\xFF\xE0")]);
+            assert!(errors_of(&jpeg, &[("f", "mimes:jpg")]).is_empty());
+            assert!(errors_of(&jpeg, &[("f", "mimes:jpeg")]).is_empty());
+            assert_eq!(
+                errors_of(&jpeg, &[("f", "mimes:png,gif")]).get("f"),
+                ["f は png / gif の形式のファイルを送ってください。"]
+            );
+            // 名前と MIME を `a.png` / `image/png` と偽った HTML は通さない。
+            let fake = with_files(&[], &[("f", b"<html></html>")]);
+            assert!(errors_of(&fake, &[("f", "mimes:png")]).has("f"));
+        }
+
+        #[test]
+        fn ファイルの大きさはkbで比べる() {
+            let rules = &[("f", "max:2")];
+            let at = with_files(&[], &[("f", &png_of(2048))]);
+            assert!(errors_of(&at, rules).is_empty(), "2 KB ちょうどは通る");
+            let over = with_files(&[], &[("f", &png_of(2049))]);
+            assert_eq!(
+                errors_of(&over, rules).get("f"),
+                ["f は 2 KB 以下のファイルにしてください。"]
+            );
+
+            let small = with_files(&[], &[("f", &png_of(1023))]);
+            assert_eq!(
+                errors_of(&small, &[("f", "min:1")]).get("f"),
+                ["f は 1 KB 以上のファイルにしてください。"]
+            );
+            assert!(errors_of(&small, &[("f", "between:0.5,1")]).is_empty());
+            assert!(errors_of(&small, &[("f", "between:1,2")]).has("f"));
+            let one = with_files(&[], &[("f", &png_of(1024))]);
+            assert!(errors_of(&one, &[("f", "size:1")]).is_empty());
+            assert!(errors_of(&small, &[("f", "size:1")]).has("f"));
+        }
+
+        #[test]
+        fn 同じ名前のファイルは全部に当て_理由は1件() {
+            let i = with_files(
+                &[],
+                &[
+                    ("photos[]", PNG),
+                    ("photos[]", b"text"),
+                    ("photos[]", b"text"),
+                ],
+            );
+            let e = errors_of(&i, &[("photos", "image")]);
+            assert_eq!(e.total(), 1, "{e:?}");
+            let ok = with_files(&[], &[("photos[]", PNG), ("photos[]", PNG)]);
+            assert!(errors_of(&ok, &[("photos", "required|image")]).is_empty());
+        }
+
+        #[test]
+        fn ファイルに文字の規則を当てると落ちる() {
+            let i = with_files(&[], &[("f", PNG)]);
+            assert!(errors_of(&i, &[("f", "integer")]).has("f"));
+            assert!(errors_of(&i, &[("f", "email")]).has("f"));
+        }
     }
 
     mod typed_values {

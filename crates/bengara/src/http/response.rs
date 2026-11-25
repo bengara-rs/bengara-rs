@@ -386,7 +386,7 @@ pub fn abort_with<T>(status: u16, message: impl Into<String>) -> Result<T> {
 
 /// エラーをどう見せるかの指定。起動時とリクエストごとに決まり、以後は変わりません。
 ///
-/// `Arc` を1つ持つだけなので、クローンは安いです。
+/// `Arc` を2つ持つだけなので、クローンは安いです。
 #[derive(Clone)]
 pub(crate) struct RenderOptions {
     /// 詳しい内容を出すか（`APP_DEBUG`）。
@@ -395,6 +395,10 @@ pub(crate) struct RenderOptions {
     pub(crate) wants_json: bool,
     /// 利用者が差し替えたエラーの見せ方。
     pub(crate) exceptions: Option<std::sync::Arc<crate::application::Exceptions>>,
+    /// 検査に落ちたときに前の画面へ戻す材料。`Next::run` が要求ごとに入れます。
+    ///
+    /// 戻さない要求（セッションや `Referer` が無いなど）では `None` で、確保もしません。
+    pub(crate) back: Option<std::sync::Arc<crate::http::request::ValidationRedirect>>,
 }
 
 impl RenderOptions {
@@ -403,7 +407,16 @@ impl RenderOptions {
             debug,
             wants_json,
             exceptions: None,
+            back: None,
         }
+    }
+
+    pub(crate) fn with_back(
+        mut self,
+        back: Option<std::sync::Arc<crate::http::request::ValidationRedirect>>,
+    ) -> Self {
+        self.back = back;
+        self
     }
 
     pub(crate) fn with_exceptions(
@@ -448,6 +461,13 @@ fn build_error_response(error: &Error, options: RenderOptions) -> Response {
 
     // 入力の検査だけは、どの項目が駄目かを機械が読める形で返す。
     if let Error::Validation(errors) = error {
+        // 画面の相手で、戻り先が決まっていれば前の画面へ戻す（Laravel と同じ）。
+        // 材料は JSON を求める相手には作らないが、念のためここでも見る。
+        if !options.wants_json {
+            if let Some(response) = options.back.as_ref().and_then(|back| back.respond(errors)) {
+                return response;
+            }
+        }
         if options.wants_json {
             return Response::json(&errors.to_json())
                 .unwrap_or_else(|_| Response::text("入力に誤りがあります。"))

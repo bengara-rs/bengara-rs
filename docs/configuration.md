@@ -83,16 +83,55 @@ let shop = config::<crate::config::shop::ShopConfig>();
 | `ArgonConfig`     | Argon2id の強さ            | [authentication.md](authentication.md) | 作らない        |
 | `BroadcastConfig` | 配信の送り方               | [websocket.md](websocket.md)           | 作らない        |
 | `QueueConfig`     | ジョブごとの打ち切りの時間 | [queue.md](queue.md)                   | 作らない        |
+| `CorsConfig`      | 別のオリジンからの呼び出し | [下の節](#cors-の設定)                 | 作らない        |
 
-- 次の 3 つは `prelude` に入っていません。`use` で取り込みます。
+- 次の 4 つは `prelude` に入っていません。`use` で取り込みます。
 
   | 型                | 取り込む場所                          |
   |-------------------|---------------------------------------|
   | `ArgonConfig`     | `bengara::ArgonConfig`                |
   | `QueueConfig`     | `bengara::queue::QueueConfig`         |
   | `BroadcastConfig` | `bengara::broadcast::BroadcastConfig` |
+  | `CorsConfig`      | `bengara::CorsConfig`                 |
 
-- `QueueConfig` は環境変数から読みません。置かなければ、どのジョブも `queue:work --timeout` で打ち切ります。
+- `QueueConfig` と `CorsConfig` は環境変数から読みません。置かなければ、`QueueConfig` はどのジョブも
+  `queue:work --timeout` で打ち切り、`CorsConfig` は下の表の既定になります。
+
+### CORS の設定
+
+`config/cors.rs` に置きます。Laravel の `config/cors.php` と同じ欄です。
+使うのは `HandleCors::from_config()` です（[middleware.md](middleware.md#別のオリジンから呼ぶhandlecors)）。
+置いても、`HandleCors` を登録しなければ何も起きません。
+
+```rust
+// config/cors.rs
+use bengara::CorsConfig;
+
+pub fn config() -> CorsConfig {
+    CorsConfig {
+        allowed_origins: vec!["https://app.example.com".into()],
+        supports_credentials: true,
+        ..Default::default()
+    }
+}
+```
+
+| 欄                     | 既定        | 意味                                                                            |
+|------------------------|-------------|---------------------------------------------------------------------------------|
+| `paths`                | `["api/*"]` | 対象のパス。先頭の `/` は書かない。`*` は `/` も含めて何にでも当たる            |
+| `allowed_methods`      | `["*"]`     | 許すメソッド                                                                    |
+| `allowed_origins`      | `["*"]`     | 許すオリジン。`https://*.example.com` のように、ホストの先頭にだけ `*` を書ける |
+| `allowed_headers`      | `["*"]`     | 許すヘッダー                                                                    |
+| `exposed_headers`      | `[]`        | ブラウザの JavaScript に見せるヘッダー                                          |
+| `max_age`              | `0`         | 事前確認の答えを覚えてよい秒数。0 は「覚えない」                                |
+| `supports_credentials` | `false`     | Cookie 付きの呼び出しを許すか                                                   |
+
+- `paths` は Laravel と同じく前後の `/` を落として比べます。`api/*` は `/api/posts` に当たり、`/api` には当たりません。
+- `https://*.example.com` の `*` は 1 文字以上です。`https://example.com` には当たりません。ポートは書いたとおりのときだけ当たります。
+- オリジンのスキームとホストは、大文字小文字を区別せずに比べます。
+- Laravel の `allowed_origins_patterns`（正規表現）はありません。
+- Laravel の既定の `paths` にある `sanctum/csrf-cookie` は入っていません（その口がありません）。
+- 矛盾する組み合わせ（`supports_credentials` と `*` など）は、起動時に止まります（[middleware.md](middleware.md#起動時に止まる設定)）。
 
 ### いまの環境を調べる
 
@@ -249,6 +288,7 @@ MAIL_FROM_NAME="${APP_NAME}"
 - `SESSION_LIFETIME` は 1 分より短くなりません。最大 60 秒早く切れることがあります（[session.md](session.md)）。
 - `HASH_DRIVER=argon2id` には機能フラグ `argon2` が要ります。
   フラグが無いときと知らない名前のときは、ログに出して `pbkdf2` にします。
+- `HASH_DRIVER=bcrypt` も、ログに出して `pbkdf2` にします。bcrypt は照合だけです（フラグ `bcrypt`）。
 - パスワードの項目は [authentication.md](authentication.md) にくわしくあります。
 
 ### データベース
@@ -367,6 +407,7 @@ bengara = { version = "0.1", features = ["sqlite", "mail"] }
 | `websocket`  | 入っていない   | WebSocket の受け口（[websocket.md](websocket.md)）              |
 | `encryption` | 入っていない   | `encrypt` / `decrypt`（[authentication.md](authentication.md)） |
 | `argon2`     | 入っていない   | パスワードの Argon2id（`HASH_DRIVER=argon2id`）                 |
+| `bcrypt`     | 入っていない   | Laravel の bcrypt（`$2y$`）の照合だけ（作れない）               |
 | `view`       | 入っていない   | テンプレート（[views.md](views.md)）                            |
 | `log-filter` | **入っている** | `RUST_LOG=myapp=debug` のような絞り込み                         |
 

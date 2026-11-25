@@ -14,13 +14,15 @@
 mod hashing;
 mod middleware;
 mod reset;
+mod token;
 
 #[cfg(feature = "encryption")]
 mod encryption;
 
 pub use hashing::{ArgonConfig, Hash, HashConfig};
-pub use middleware::{Authenticate, RedirectIfAuthenticated};
+pub use middleware::{Authenticate, CheckAbilities, CheckForAnyAbility, RedirectIfAuthenticated};
 pub use reset::PasswordReset;
+pub use token::{HasApiTokens, NewAccessToken, PersonalAccessToken};
 
 pub(crate) use hashing::{driver_label as hash_driver_label, install_test_iterations};
 pub(crate) use middleware::{is_internal_path, INTENDED_KEY};
@@ -76,18 +78,89 @@ pub trait Authenticatable: Model {
     fn auth_password_name() -> &'static str {
         "password"
     }
+
+    /// API のトークンの表（`personal_access_tokens`）の `tokenable_type` に入れる名前。
+    /// Laravel の `getMorphClass` に当たります。
+    ///
+    /// 既定は `App\Models\` に型の名前をつないだものです（`User` なら `App\Models\User`）。
+    /// Laravel で発行したトークンを、そのまま読めるようにするためです。
+    /// Laravel のモデルと名前が違うとき（`morphMap` を使っていたときなど）だけ書き換えてください。
+    ///
+    /// ```ignore
+    /// impl Authenticatable for Member {
+    ///     fn password_hash(&self) -> &str {
+    ///         &self.password
+    ///     }
+    ///     fn morph_class() -> String {
+    ///         "App\\Models\\User".to_string()
+    ///     }
+    /// }
+    /// ```
+    ///
+    /// 型ごとに違う名前になるので、`User` のトークンで `Admin` として通ることはありません。
+    fn morph_class() -> String {
+        let full = std::any::type_name::<Self>();
+        let base = full.split('<').next().unwrap_or(full);
+        let name = base.rsplit("::").next().unwrap_or(base);
+        format!("App\\Models\\{name}")
+    }
 }
 
 /// ログインの状態を扱う。`req.auth()` が返します。
 ///
-/// 中身はセッションへの参照だけなので、作るのは安いです。
+/// 中身はセッションとトークンへの参照だけなので、作るのは安いです。
+///
+/// # セッションとトークン
+///
+/// `Authenticate::token()` を通った要求では、**トークンを先に見ます。**
+/// `check()`・`id()`・`user::<U>()` はトークンの持ち主を返し、セッションのログインは見ません。
+/// トークンが無い要求では、これまでどおりセッションを見ます。
+///
+/// ログイン・ログアウト（`login`・`logout` など）は、いつもセッションに対する操作です。
+/// トークンを無効にするときは `current_access_token()` の行を消してください。
 pub struct Auth<'a> {
     session: Option<&'a Session>,
+    token: Option<&'a PersonalAccessToken>,
 }
 
 impl<'a> Auth<'a> {
     pub(crate) fn new(session: Option<&'a Session>) -> Self {
-        Self { session }
+        Self {
+            session,
+            token: None,
+        }
+    }
+
+    /// トークンで認証した要求なら、そのトークンを持たせる（`Request::auth` が呼ぶ）。
+    pub(crate) fn with_access_token(mut self, token: Option<&'a PersonalAccessToken>) -> Self {
+        self.token = token;
+        self
+    }
+
+    /// この要求を認証したトークン。Laravel の `currentAccessToken()` に当たります。
+    ///
+    /// `Authenticate::token()` を通っていなければ `None` です。
+    ///
+    /// ```ignore
+    /// // いま使っているトークンだけを消す（その端末だけログアウト）
+    /// if let Some(token) = req.auth().current_access_token() {
+    ///     token.delete().await?;
+    /// }
+    /// ```
+    pub fn current_access_token(&self) -> Option<&'a PersonalAccessToken> {
+        self.token
+    }
+
+    /// この要求のトークンがその能力を持っているか。Laravel の `tokenCan` に当たります。
+    ///
+    /// トークンで認証していなければ偽です。`"*"` を持つトークンは、どの能力も真です。
+    pub fn token_can(&self, ability: &str) -> bool {
+        self.token.is_some_and(|token| token.can(ability))
+    }
+
+    /// この要求のトークンがその能力を持っていないか。
+    pub fn token_cant(&self, ability: &str) -> bool {
+        !self.token_can(ability)
     }
 
     /// セッションを取り出す。無ければ、登録し忘れとして知らせる。
@@ -106,6 +179,8 @@ impl<'a> Auth<'a> {
     /// その人のセッションが残っているあいだは真のままです（`Authenticate` も
     /// 同じ判定です）。利用者を消したときは [`logout_user`](Self::logout_user) で
     /// セッションも切ってください。
+    ///
+    /// トークンで認証した要求では、トークンがあれば真です（利用者の行は引きません）。
     pub fn check(&self) -> bool {
         self.id().is_some()
     }
@@ -116,7 +191,14 @@ impl<'a> Auth<'a> {
     }
 
     /// ログイン中の主キーの値。
+    ///
+    /// トークンで認証した要求では、トークンの持ち主（`tokenable_id`）です。
+    /// 持ち主の種類（`tokenable_type`）は見ません。持ち主のモデルが何種類もあるときは
+    /// [`user`](Self::user) を使うか、`current_access_token()` の `tokenable_type` を見てください。
     pub fn id(&self) -> Option<String> {
+        if let Some(token) = self.token {
+            return Some(token.tokenable_id.clone()).filter(|v| !v.is_empty());
+        }
         self.session?.get(AUTH_ID_KEY).filter(|v| !v.is_empty())
     }
 
@@ -298,7 +380,17 @@ impl<'a> Auth<'a> {
     /// ログイン中の利用者を DB から読む。
     ///
     /// **呼ぶたびに DB を引きます。** 何度も使うときは変数に入れてください。
+    ///
+    /// トークンで認証した要求では、トークンの持ち主です。持ち主の種類
+    /// （`tokenable_type`）が `U` の [`Authenticatable::morph_class`] と違えば、
+    /// 問い合わせずに `None` です。
     pub async fn user<U: Authenticatable>(&self) -> Result<Option<U>> {
+        if self
+            .token
+            .is_some_and(|token| token.tokenable_type != U::morph_class())
+        {
+            return Ok(None);
+        }
         let Some(id) = self.id() else {
             return Ok(None);
         };
@@ -338,6 +430,35 @@ impl<'a> Auth<'a> {
         value: &str,
         password: &str,
     ) -> Result<bool> {
+        match self.validate::<U>(column, value, password).await? {
+            Some(user) => {
+                self.login(&user)?;
+                Ok(true)
+            }
+            None => Ok(false),
+        }
+    }
+
+    /// 列の値とパスワードで照合する。**ログインはしません。** 合えばその利用者を返します。
+    ///
+    /// ```ignore
+    /// let Some(user) = req.auth().validate::<User>("email", &email, &password).await? else {
+    ///     return abort_with(422, "メールアドレスかパスワードが違います");
+    /// };
+    /// let token = user.create_token("mobile", &["*"], None).await?;
+    /// ```
+    ///
+    /// Laravel の `Auth::validate` に当たります。Laravel は真偽を返しますが、ここでは
+    /// 照合した利用者を返します。API のトークンを発行する口のように、セッションでログイン
+    /// させずに利用者を確かめたいときに使います。
+    ///
+    /// 時間合わせ・同時数の上限・ログインのついでの作り直しは、[`attempt`](Self::attempt) と同じです。
+    pub async fn validate<U: Authenticatable>(
+        &self,
+        column: &str,
+        value: &str,
+        password: &str,
+    ) -> Result<Option<U>> {
         let found = U::query().where_(column, value).first().await?;
         let plain = password;
         let password = password.to_string();
@@ -351,20 +472,20 @@ impl<'a> Auth<'a> {
                 false
             })
             .await?;
-            return Ok(false);
+            return Ok(None);
         };
 
         let stored = user.password_hash().to_string();
         let ok = run_hashing(move || Hash::check(&password, &stored)).await?;
-        if ok {
-            if Hash::needs_rehash(user.password_hash()) {
-                if let Err(e) = rehash_password(&user, plain).await {
-                    tracing::warn!("ログインのついでにパスワードを作り直せませんでした: {e}");
-                }
-            }
-            self.login(&user)?;
+        if !ok {
+            return Ok(None);
         }
-        Ok(ok)
+        if Hash::needs_rehash(user.password_hash()) {
+            if let Err(e) = rehash_password(&user, plain).await {
+                tracing::warn!("ログインのついでにパスワードを作り直せませんでした: {e}");
+            }
+        }
+        Ok(Some(user))
     }
 
     /// パスワードだけを確かめる。ログインはしません。
@@ -585,6 +706,49 @@ mod tests {
     }
 
     #[test]
+    fn 持ち主の種類は既定で型の名前() {
+        assert_eq!(Member::morph_class(), "App\\Models\\Member");
+    }
+
+    #[tokio::test]
+    async fn トークンがあればセッションより先に見る() {
+        let session = Session::empty();
+        Auth::new(Some(&session)).login_using_id(5).unwrap();
+        let token = PersonalAccessToken::fake("App\\Models\\Member", "7", &["posts:read"]);
+
+        // トークンが無ければ、これまでどおりセッション。
+        let auth = Auth::new(Some(&session));
+        assert_eq!(auth.id().as_deref(), Some("5"));
+        assert!(auth.current_access_token().is_none());
+        assert!(!auth.token_can("posts:read"), "トークンが無ければ偽");
+
+        // トークンがあれば、トークンの持ち主。
+        let auth = Auth::new(Some(&session)).with_access_token(Some(&token));
+        assert!(auth.check());
+        assert_eq!(auth.id().as_deref(), Some("7"));
+        assert_eq!(auth.current_access_token().map(|t| t.id), Some(1));
+        assert!(auth.token_can("posts:read"));
+        assert!(auth.token_cant("posts:write"));
+
+        // セッションが無くても使える。
+        let auth = Auth::new(None).with_access_token(Some(&token));
+        assert!(auth.check());
+        assert_eq!(auth.id().as_deref(), Some("7"));
+
+        // 種類が違えば、問い合わせずに `None`（既定の接続には流れない）。
+        let other = PersonalAccessToken::fake("App\\Models\\Admin", "7", &["*"]);
+        let auth = Auth::new(None).with_access_token(Some(&other));
+        assert!(auth.user::<Member>().await.unwrap().is_none());
+        assert_eq!(
+            auth.user_or_fail::<Member>()
+                .await
+                .err()
+                .map(|e| e.status()),
+            Some(401)
+        );
+    }
+
+    #[test]
     fn 保存していないモデルではログインできない() {
         let session = Session::empty();
         let auth = Auth::new(Some(&session));
@@ -753,6 +917,64 @@ mod tests {
                 .await
                 .unwrap());
             assert_eq!(stored_secret().await, new, "要らなければ書かない");
+        }
+
+        /// Laravel の users 表から持ち込んだ bcrypt の値でログインでき、そのついでに
+        /// 設定の方式（PBKDF2 か Argon2id）へ移る。値は PHP 8.3 の `password_hash` で作ったもの。
+        #[cfg(feature = "bcrypt")]
+        #[tokio::test]
+        async fn bcryptの値はログインのついでに設定の方式へ移す() {
+            install_test_iterations();
+            let php = "$2y$04$U.buQHSdNt8UnmLL9HpRyOp6l/Om0N6Akx4oSX7s9lRucYTx.gkOm";
+            let _db = setup(php).await;
+
+            // 合わないときは書かない。
+            let session = Session::empty();
+            let auth = Auth::new(Some(&session));
+            assert!(!auth
+                .attempt::<Login>("email", "a@example.com", "ちがう")
+                .await
+                .unwrap());
+            assert_eq!(stored_secret().await, php, "外れたら書かない");
+
+            // 合えばログインし、設定の方式で作り直す。bcrypt では作らない。
+            assert!(auth
+                .attempt::<Login>("email", "a@example.com", "ひみつのパスワード")
+                .await
+                .unwrap());
+            assert!(auth.check());
+            let new = stored_secret().await;
+            assert!(!new.starts_with("$2"), "bcrypt のままではない: {new}");
+            assert!(!Hash::needs_rehash(&new), "いまの設定の方式になった");
+            assert!(Hash::check("ひみつのパスワード", &new));
+        }
+
+        #[tokio::test]
+        async fn validateは照合した利用者を返しログインはしない() {
+            install_test_iterations();
+            let old = Hash::make_with("ひみつ", 1);
+            let _db = setup(&old).await;
+            let session = Session::empty();
+            let auth = Auth::new(Some(&session));
+
+            let user = auth
+                .validate::<Login>("email", "a@example.com", "ひみつ")
+                .await
+                .unwrap()
+                .expect("合えば利用者が返る");
+            assert_eq!(user.id, 1);
+            assert!(!auth.check(), "ログインはしない");
+            assert_ne!(
+                stored_secret().await,
+                old,
+                "作り直しは attempt と同じく行う"
+            );
+
+            let wrong = auth.validate::<Login>("email", "a@example.com", "ちがう");
+            assert!(wrong.await.unwrap().is_none(), "合わなければ None");
+            let nobody = auth.validate::<Login>("email", "b@example.com", "ひみつ");
+            assert!(nobody.await.unwrap().is_none(), "いなければ None");
+            assert!(!auth.check());
         }
 
         #[tokio::test]

@@ -27,6 +27,7 @@ impl PostController {
 | ヘッダー   | `header(name)` `headers()`                                        |
 | Cookie     | `cookie(name)` `cookies()`                                        |
 | 入力       | `input(key)` `input_all()` `form(key)` `form_all()`               |
+| ファイル   | `file(name)` `files(name)` `has_file(name)`                       |
 | 本文       | `body()` `body_text()` `json::<T>()` `body_stream()`              |
 | 検査       | `validate(rules)` `validate_as::<T>()`                            |
 | セッション | `session()` `try_session()` `csrf_token()`                        |
@@ -99,6 +100,81 @@ Route::post("/imports", ImportController::store).max_body(16 * 1024 * 1024);
 - 何 MB もある本文は、次の「本文を少しずつ読む」を使います。
 - 接続の待ち時間と同時接続数の上限は、前段のプロキシで掛けます（[deployment.md](deployment.md)）。
 
+### ファイルを受け取る
+
+`<form enctype="multipart/form-data">` で送られたファイルを受け取ります。
+
+```rust
+pub async fn update(req: Request) -> Result<Response> {
+    req.validate(&[("avatar", "required|image|max:2048")])?;
+    if let Some(avatar) = req.file("avatar") {
+        let path = avatar.store("avatars").await?; // "avatars/3f2a…9c.png"
+    }
+    // ...
+}
+```
+
+| Laravel                       | bengara                                        |
+|-------------------------------|------------------------------------------------|
+| `$request->file('avatar')`    | `req.file("avatar")` → `Option<&UploadedFile>` |
+| `$request->hasFile('avatar')` | `req.has_file("avatar")`                       |
+| `$request->file('photos')`    | `req.files("photos")` → `Vec<&UploadedFile>`   |
+
+- 型は `bengara::UploadedFile` です（`prelude` には入っていません）。
+- `photos` と `photos[]` は同じに扱います。`file("photos")` は最初の 1 つを返します。
+- ファイルを選ばずに送った欄は、無かったものとして扱います（`has_file` は偽）。
+- 文字の欄は、今までの入力と同じく `input()`・`validate()` で読みます。並びは送られてきた順です。
+- CSRF のトークンは、フォームの中の `_token` で通ります。
+- ファイルの欄は入力に入りません。検査に落ちたときに覚える前の入力（`old`）にも入りません。
+- `body()` は今までどおり、本文そのものを返します。
+
+`UploadedFile` から読めるものです。
+
+| Laravel                        | bengara                        | 返すもの                           |
+|--------------------------------|--------------------------------|------------------------------------|
+| `getClientOriginalName()`      | `client_original_name()`       | 送られてきた名前（パスは落とす）   |
+| `getClientOriginalExtension()` | `client_original_extension()`  | 送られてきた名前の拡張子           |
+| `getClientMimeType()`          | `client_mime_type()`           | 送られてきた種類（無ければ下の注） |
+| `getSize()`                    | `size()`                       | 大きさ（バイト、`u64`）            |
+| `extension()`                  | `extension()`                  | 中身から推した拡張子（`Option`）   |
+| `getMimeType()`                | `mime_type()`                  | 中身から推した種類（`Option`）     |
+| `get()`                        | `get()`                        | 中身（`&[u8]`）                    |
+| `store('avatars')`             | `store("avatars")`             | 保存したパス（`.await` が要る）    |
+| `storeAs('avatars', 'a.jpg')`  | `store_as("avatars", "a.jpg")` | 保存したパス（`.await` が要る）    |
+
+- **送られてきた名前と種類は信じないでください。** 相手が自由に決められます。
+- 種類が送られてこなかったときは `application/octet-stream` です。
+- 中身から推すのは JPEG・PNG・GIF・WebP・BMP だけです。HTML と SVG には推しません（`None`）。
+- 保存のしかたは [storage.md](storage.md) の「アップロードを保存する」にあります。
+  置き場所を選ぶときは `Storage::disk("public").put_file("avatars", avatar)` です。
+
+決まりと上限です。
+
+| 項目                      | 決まり                                                        |
+|---------------------------|---------------------------------------------------------------|
+| 読む本文                  | 全部受けてから読む。本文の上限（既定 2 MiB）が掛かる          |
+| `.stream_body()` のルート | 読まない。`file()` は `None`、`input()` に本文の欄は入らない  |
+| ファイルの数              | 20 個まで（PHP の `max_file_uploads` の既定と同じ）           |
+| 欄の数                    | 1000 個まで。文字とファイルの合計（PHP の `max_input_vars`）  |
+| 欄 1 つの見出しの長さ     | 8 KiB まで                                                    |
+| ファイル名                | UTF-8 のまま送られた名前と、`filename*=UTF-8''…` の両方を読む |
+
+| 状況                                             | 返すもの |
+|--------------------------------------------------|----------|
+| 本文・ファイルの数・欄の数・見出しが上限を超えた | 413      |
+| 形が壊れている（境界が無い・途中で切れた など）  | 400      |
+
+- この 2 つは本文の上限と同じく、ミドルウェアも `with_exceptions` も通りません。
+- PHP は上限を超えた分を黙って捨てます。bengara は断ります。欄が抜けたまま処理が進むのを防ぐためです。
+- 大きなファイルを受けるルートは、`.max_body(バイト)` で上限を上げます。
+
+```rust
+Route::post("/profile/avatar", ProfileController::avatar).max_body(10 * 1024 * 1024);
+```
+
+- 本文は全部メモリに載せます。何百 MB もあるファイルは `.stream_body()` と `write_stream` を使ってください。
+  その場合、`multipart` の形は自分で読むことになります。
+
 ### 本文を少しずつ読む
 
 大きな本文を、全部メモリに載せずに扱えます。
@@ -156,6 +232,7 @@ pub async fn store(req: Request) -> Result<Response> {
 | 読み方                                            | 動き                                                      |
 |---------------------------------------------------|-----------------------------------------------------------|
 | `body()` `input()` `form()` `json()` `validate()` | 本文は見えない（空）。クエリは見える                      |
+| `file()` `files()` `has_file()`                   | `multipart` を読まないので、いつも空                      |
 | CSRF の検査                                       | 本文の `_token` は読めない。`X-CSRF-TOKEN` ヘッダーで送る |
 | ミドルウェア                                      | 本文を読む前に通る                                        |
 

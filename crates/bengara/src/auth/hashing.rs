@@ -7,6 +7,10 @@
 //! 照合は保存されている値の先頭（`$pbkdf2-sha256$` か `$argon2id$`）で振り分けるので、
 //! 方式を替えても古い値で照合できます。ログインのついでに新しい方式で作り直します。
 //!
+//! 機能フラグ `bcrypt` を入れると、Laravel（PHP の `password_hash`）で作った
+//! **bcrypt**（`$2y$`・`$2b$`・`$2a$`）の値も照合できます。**照合だけで、作りません。**
+//! ログインのついでに `HASH_DRIVER` の方式で作り直します。
+//!
 //! ```ignore
 //! let stored = Hash::make("ひみつ");
 //! assert!(Hash::check("ひみつ", &stored));
@@ -46,6 +50,20 @@ const PBKDF2_PREFIX: &str = "$pbkdf2-sha256$";
 
 /// Argon2id の保存値の先頭。
 const ARGON2ID_PREFIX: &str = "$argon2id$";
+
+/// bcrypt の値の cost の下限。PHP の `password_verify`（crypt_blowfish）と同じです。
+#[cfg_attr(not(feature = "bcrypt"), allow(dead_code))]
+const MIN_BCRYPT_COST: u32 = 4;
+
+/// 保存されている bcrypt の値の cost に許す上限。
+///
+/// cost は 1 増えるごとに計算が倍になります。形の上では 31 まで書けますが、
+/// 31 の照合は Laravel の既定（12）の 50 万倍かかり、終わりません。
+/// PBKDF2 の [`MAX_ITERATIONS`] と同じで、細工した値で 1 回の照合をいくらでも
+/// 引き延ばさせないための上限です。16 は既定（12）の 16 倍で、リリースビルドで
+/// 8 秒ほど（cost 12 が 0.5 秒ほどの機械で）。PBKDF2 の上限とほぼ同じ時間です。
+/// Laravel で使われる値（10〜14 ほど）は収まります。超える値は計算せずに偽とします。
+const MAX_BCRYPT_COST: u32 = 16;
 
 /// 保存されている値の `i=` に許す上限。
 ///
@@ -308,6 +326,14 @@ fn resolve_driver(raw: &str) -> DriverChoice {
                 ..pbkdf2
             }
         }
+        // bcrypt は照合だけで、作れない。知らない値と同じく pbkdf2 に落とす。
+        None if raw.trim().eq_ignore_ascii_case("bcrypt") => {
+            tracing::warn!(
+                "HASH_DRIVER=bcrypt では作れません。bcrypt は照合だけです。\
+                 作るのは pbkdf2 か argon2id です。pbkdf2 を使います"
+            );
+            pbkdf2
+        }
         None => {
             tracing::warn!(
                 "HASH_DRIVER `{}` は知りません。pbkdf2 を使います",
@@ -368,10 +394,14 @@ const SEEN_PBKDF2: u8 = 1;
 /// 「Argon2id の値を照合した」印。
 const SEEN_ARGON2ID: u8 = 2;
 
+/// 「bcrypt の値を照合した」印。
+const SEEN_BCRYPT: u8 = 4;
+
 /// 照合した方式の印。プロセスの中で一度立ったら下ろしません（[`MAX_SEEN_ITERATIONS`] と同じ）。
 ///
 /// 両方の方式の値が混ざっている間は、照合のたびにもう片方の方式も空回しして、
 /// どちらの値の利用者でも、いない利用者でも、同じだけ時間をかけます。
+/// bcrypt の値が混ざっているときも同じです（方式が 3 つになります）。
 static SEEN: AtomicU8 = AtomicU8::new(0);
 
 /// PBKDF2 の時間をかけるか。方式が PBKDF2 か、PBKDF2 の値を照合したことがあれば真。
@@ -383,6 +413,13 @@ fn pbkdf2_cost(policy: Policy, seen: u8) -> bool {
 /// Argon2id の値を照合したことがあれば真。
 fn argon_cost(policy: Policy, seen: u8) -> bool {
     cfg!(feature = "argon2") && (policy.driver == Driver::Argon2id || seen & SEEN_ARGON2ID != 0)
+}
+
+/// bcrypt の時間をかけるか。フラグがあり、bcrypt の値を照合したことがあれば真。
+///
+/// bcrypt は作らない（方式に選べない）ので、印だけで決まります。
+fn bcrypt_cost(seen: u8) -> bool {
+    cfg!(feature = "bcrypt") && seen & SEEN_BCRYPT != 0
 }
 
 /// パスワードの変換。Laravel の `Hash` に当たります。
@@ -400,6 +437,9 @@ fn argon_cost(policy: Policy, seen: u8) -> bool {
 /// 既定は PBKDF2 です。機能フラグ `argon2` を入れて `HASH_DRIVER=argon2id` にすると、
 /// [`make`](Hash::make) が Argon2id で作ります。[`check`](Hash::check) は保存値の先頭で
 /// 方式を見分けるので、どちらの値でも照合できます。
+///
+/// 機能フラグ `bcrypt` を入れると、Laravel で作った bcrypt（`$2y$`）の値も照合できます。
+/// bcrypt で作ることはできません（照合だけ）。
 ///
 /// # 同時に計算する数
 ///
@@ -467,9 +507,19 @@ impl Hash {
 
     /// 平文と、保存してある値を照合する。
     ///
-    /// 保存値の先頭で方式を見分けます（`$pbkdf2-sha256$` と、フラグ `argon2` があれば `$argon2id$`）。
+    /// 保存値の先頭で方式を見分けます（`$pbkdf2-sha256$` と、フラグ `argon2` があれば `$argon2id$`、
+    /// フラグ `bcrypt` があれば `$2y$`・`$2b$`・`$2a$`）。
     /// 値の形が壊れているとき・知らない方式のときは偽を返します（エラーにはしません）。
     /// 平文が 4096 バイトを超えるときも、計算せずに偽を返します。
+    ///
+    /// bcrypt の値は、PHP の `password_verify` と次の所だけ扱いが違います。
+    ///
+    /// | 入力・値                 | 扱い                                                          |
+    /// |--------------------------|---------------------------------------------------------------|
+    /// | 72 バイトを超える平文    | 先頭 72 バイトだけを使う（PHP と同じ）                        |
+    /// | NUL（`\0`）を含む平文    | **偽**（PHP は NUL で切って照合する）                         |
+    /// | `$2x$`（古い不具合の形） | 偽                                                            |
+    /// | cost が 16 を超える値    | 計算せずに偽（PHP は 31 まで計算する）                        |
     ///
     /// **非同期の処理の中では [`check_async`](Hash::check_async) を使ってください。**
     /// ここでは 0.2 秒ほどスレッドを塞ぎます。
@@ -564,6 +614,17 @@ fn check_using(password: &str, hashed: &str, policy: Policy, seen: &AtomicU8) ->
     if hashed.starts_with(ARGON2ID_PREFIX) {
         return check_argon2id(password, hashed, policy, seen);
     }
+    if let Some(version) = bcrypt_version(hashed) {
+        if version == b'x' {
+            // フラグの有無によらない。照合できる形ではないので、フラグの案内も出さない。
+            tracing::warn!(
+                "保存されているパスワードは `$2x$`（古い不具合のある bcrypt）です。照合しません"
+            );
+            burn_unreadable(password, policy, seen);
+            return false;
+        }
+        return check_bcrypt(password, hashed, policy, seen);
+    }
     tracing::warn!("保存されているパスワードの形が正しくありません（知らない方式です）");
     burn_unreadable(password, policy, seen);
     false
@@ -604,6 +665,9 @@ fn check_pbkdf2(password: &str, hashed: &str, policy: Policy, seen: &AtomicU8) -
     if argon_cost(policy, marks) {
         burn_argon2id(password, policy.argon);
     }
+    if bcrypt_cost(marks) {
+        burn_bcrypt(password);
+    }
     ok
 }
 
@@ -642,6 +706,9 @@ fn check_argon2id(password: &str, hashed: &str, policy: Policy, seen: &AtomicU8)
     if pbkdf2_cost(policy, marks) {
         burn_pbkdf2(password);
     }
+    if bcrypt_cost(marks) {
+        burn_bcrypt(password);
+    }
     ok
 }
 
@@ -662,9 +729,118 @@ fn check_argon2id(password: &str, _hashed: &str, policy: Policy, seen: &AtomicU8
 #[cfg(all(test, not(feature = "argon2")))]
 static MISSING_FLAG_REPORTS: AtomicU32 = AtomicU32::new(0);
 
+/// bcrypt の値（`$2a$`・`$2b$`・`$2x$`・`$2y$` で始まる）なら、版の 1 文字（`a`・`b`・`x`・`y`）。
+fn bcrypt_version(hashed: &str) -> Option<u8> {
+    match hashed.as_bytes() {
+        [b'$', b'2', version @ (b'a' | b'b' | b'x' | b'y'), b'$', ..] => Some(*version),
+        _ => None,
+    }
+}
+
+/// bcrypt の値を照合する。`$2x$` は呼ぶ側で断っています。
+///
+/// # 保存されている cost が小さい値も、同じだけ計算する
+///
+/// PBKDF2 の回数と同じ考え方です。照合した値の cost の最大を覚え（[`MAX_SEEN_BCRYPT_COST`]）、
+/// 保存値がそれより軽ければ、足りないぶん（[`bcrypt_padding`]）を空回しします。
+///
+/// # NUL を含む平文は偽
+///
+/// PHP は NUL で切って照合します（`ab` の値に `ab\0cd` が合う）。これは真似しません。
+/// PHP は NUL を含む平文から bcrypt を作れないので、正しい値が落ちることはありません。
+/// 外れると決まっていても、合うときと同じだけ計算します。
+#[cfg(feature = "bcrypt")]
+fn check_bcrypt(password: &str, hashed: &str, policy: Policy, seen: &AtomicU8) -> bool {
+    let stored = match bcrypt::parse(hashed) {
+        Ok(stored) => stored,
+        Err(reason) => {
+            tracing::warn!("保存されている bcrypt の値を照合できません（{reason}）");
+            burn_unreadable(password, policy, seen);
+            return false;
+        }
+    };
+    let marks = seen.fetch_or(SEEN_BCRYPT, Ordering::Relaxed) | SEEN_BCRYPT;
+    // 空回しが同じだけ計算できるよう、保存されていた cost の最大を覚えておく。
+    MAX_SEEN_BCRYPT_COST.fetch_max(stored.cost, Ordering::Relaxed);
+    let matched = bcrypt::verify(password, &stored);
+    // 弱い値で保存されていても、空回しと同じだけの時間をかける。
+    if let Some(rounds) = bcrypt_padding(stored.cost, seen_bcrypt_cost()) {
+        #[cfg(test)]
+        counts::bump(&counts::BCRYPT_PADS);
+        bcrypt::burn(password, rounds);
+    }
+    if pbkdf2_cost(policy, marks) {
+        burn_pbkdf2(password);
+    }
+    if argon_cost(policy, marks) {
+        burn_argon2id(password, policy.argon);
+    }
+    matched && !password.contains('\0')
+}
+
+/// bcrypt の値を照合する（フラグなし）。照合できないので、空回しして偽を返す。
+#[cfg(not(feature = "bcrypt"))]
+fn check_bcrypt(password: &str, _hashed: &str, policy: Policy, seen: &AtomicU8) -> bool {
+    static REPORTED: AtomicBool = AtomicBool::new(false);
+    if !REPORTED.swap(true, Ordering::Relaxed) {
+        #[cfg(test)]
+        MISSING_BCRYPT_REPORTS.fetch_add(1, Ordering::Relaxed);
+        tracing::error!(
+            "bcrypt（`$2y$`）の値は照合できません。\
+             Cargo.toml の bengara の features に \"bcrypt\" を足すと照合できます"
+        );
+    }
+    burn_unreadable(password, policy, seen);
+    false
+}
+
+/// フラグなしで bcrypt の値を照合したときにエラーを出した回数（テスト用）。
+#[cfg(all(test, not(feature = "bcrypt")))]
+static MISSING_BCRYPT_REPORTS: AtomicU32 = AtomicU32::new(0);
+
+/// これまでに照合した bcrypt の値の cost の最大。0 は「まだ読んでいない」。
+///
+/// [`MAX_SEEN_ITERATIONS`] と同じで、一度上がったら下がりません。
+/// 覚えるのは上限（[`MAX_BCRYPT_COST`]）を通った値だけです。
+static MAX_SEEN_BCRYPT_COST: AtomicU32 = AtomicU32::new(0);
+
+/// 覚えている cost の最大。上限は超えません（念のため寄せます）。
+#[cfg_attr(not(feature = "bcrypt"), allow(dead_code))]
+fn seen_bcrypt_cost() -> u32 {
+    MAX_SEEN_BCRYPT_COST
+        .load(Ordering::Relaxed)
+        .min(MAX_BCRYPT_COST)
+}
+
+/// 保存値（cost）の照合が空回し（`target` の cost）より軽いとき、足りないぶんの回数。
+///
+/// bcrypt の計算はおおよそ 2 の cost 乗に比例するので、差をその回数で埋めます。
+/// 足りていれば `None`。
+#[cfg_attr(not(feature = "bcrypt"), allow(dead_code))]
+fn bcrypt_padding(cost: u32, target: u32) -> Option<u64> {
+    let deficit = (1u64 << target).saturating_sub(1u64 << cost);
+    (deficit > 0).then_some(deficit)
+}
+
+/// 覚えている cost の最大（[`seen_bcrypt_cost`]）で bcrypt を 1 回回す。
+///
+/// 印（[`SEEN_BCRYPT`]）が立ってから呼ばれるので、cost は下限以上です。
+#[cfg(feature = "bcrypt")]
+fn burn_bcrypt(password: &str) {
+    #[cfg(test)]
+    counts::bump(&counts::BCRYPT_BURNS);
+    let cost = seen_bcrypt_cost().max(MIN_BCRYPT_COST);
+    bcrypt::burn(password, 1u64 << cost);
+}
+
+/// フラグなしでは呼ばれない（[`bcrypt_cost`] が偽）。
+#[cfg(not(feature = "bcrypt"))]
+fn burn_bcrypt(_password: &str) {}
+
 /// 外れると決まった照合・いない利用者の空回し。
 ///
-/// [`pbkdf2_cost`] なら PBKDF2 を、[`argon_cost`] なら Argon2id を、それぞれ 1 回回します。
+/// [`pbkdf2_cost`] なら PBKDF2 を、[`argon_cost`] なら Argon2id を、
+/// [`bcrypt_cost`] なら bcrypt を、それぞれ 1 回回します。
 fn burn_unreadable(password: &str, policy: Policy, seen: &AtomicU8) {
     let marks = seen.load(Ordering::Relaxed);
     if pbkdf2_cost(policy, marks) {
@@ -672,6 +848,9 @@ fn burn_unreadable(password: &str, policy: Policy, seen: &AtomicU8) {
     }
     if argon_cost(policy, marks) {
         burn_argon2id(password, policy.argon);
+    }
+    if bcrypt_cost(marks) {
+        burn_bcrypt(password);
     }
 }
 
@@ -765,6 +944,10 @@ fn burn_argon2id(_password: &str, _config: ArgonConfig) {}
 
 /// [`Hash::needs_rehash`] の本体。方式と設定を引数で受け取ります。
 fn needs_rehash_using(hashed: &str, policy: Policy) -> bool {
+    // bcrypt は作らない方式なので、どの方式でも作り直す（ログインのついでに移る）。
+    if bcrypt_version(hashed).is_some() {
+        return true;
+    }
     match policy.driver {
         Driver::Pbkdf2 => {
             if let Some(parsed) = Parsed::parse(hashed) {
@@ -839,6 +1022,9 @@ impl Hash {
     ///   `password_needs_rehash` と同じ）。設定より強い値も、設定にそろえます。
     /// - `m`・`t`・`p` が上限を超えている。値の形が読めない。
     ///
+    /// bcrypt（`$2y$` など）の値は、方式によらず真です。bcrypt では作らないので、
+    /// ログインのついでに `HASH_DRIVER` の方式へ移ります。
+    ///
     /// **設定を上げたら、作り直してください。** 作り直さないかぎり、
     /// 保存されている値は古い設定のままです。
     pub fn needs_rehash(hashed: &str) -> bool {
@@ -853,6 +1039,7 @@ impl Hash {
     /// 回すのは、いまの方式と、これまでに照合した値の方式です（両方のこともあります）。
     /// PBKDF2 は [`dummy_iterations`] 回、Argon2id は [`argon_burn_config`] の m・t・p で 1 回です
     /// （いまの設定と、これまでに照合した値の m・t・p の最大の、大きいほう）。
+    /// bcrypt は、bcrypt の値を照合したことがあるときだけ、照合した cost の最大で 1 回です。
     /// 比べる相手は作りません。計算するだけなので、初回だけ重くなることもありません。
     ///
     /// **送られてきたパスワードをそのまま渡します。** 固定のダミーを使うと、
@@ -1030,6 +1217,228 @@ mod argon {
     }
 }
 
+/// bcrypt の照合。Blowfish の鍵の準備は `blowfish` クレートに任せ、
+/// 値の読み取り・72 バイトの切り詰め・回す回数・比べ方はここで書きます。
+///
+/// 手順は PHP の `password_verify`（crypt_blowfish）と同じです。保存値の塩と cost で
+/// 計算し、塩と結果を bcrypt の base64 に直して、保存値の後ろ 53 文字と比べます。
+///
+/// `$2a$`・`$2b$`・`$2y$` は同じ計算です。版の違いは、昔の実装の不具合
+/// （8 ビットの文字の符号の扱い、255 バイトを超える長さ）を見分けるためのものです。
+/// 前者は正しい UTF-8 には出てこない並び（0xFF の連続）だけで差が出て、
+/// 後者は 72 バイトで切るので起きません。
+#[cfg(feature = "bcrypt")]
+mod bcrypt {
+    use super::{MAX_BCRYPT_COST, MIN_BCRYPT_COST};
+    use crate::support::crypto;
+    use blowfish::Blowfish;
+
+    /// bcrypt の base64 の文字。並びが普通の base64 と違い、`=` で埋めません。
+    const ALPHABET: &[u8; 64] = b"./ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
+
+    /// 値の長さ。`$2y$` + cost 2 桁 + `$` + 塩 22 文字 + 結果 31 文字。
+    const LENGTH: usize = 60;
+
+    /// 塩と結果を base64 にした部分の始まり。
+    const ENCODED_FROM: usize = 7;
+
+    /// 塩の長さ（バイト）。base64 で 22 文字です。
+    const SALT_BYTES: usize = 16;
+
+    /// 塩を base64 にした長さ。
+    const SALT_CHARS: usize = 22;
+
+    /// 結果のうち保存する長さ（バイト）。計算は 24 バイトで、最後の 1 バイトは捨てます。
+    const HASH_BYTES: usize = 23;
+
+    /// 鍵に使う長さの上限（バイト）。終わりの NUL を含めて 72 です。
+    const KEY_BYTES: usize = 72;
+
+    /// 最後に暗号化する文。`OrpheanBeholderScryDoubt` を 4 バイトずつ読んだもの。
+    const MAGIC: [u32; 6] = [
+        0x4f72_7068,
+        0x6561_6e42,
+        0x6568_6f6c,
+        0x6465_7253,
+        0x6372_7944,
+        0x6f75_6274,
+    ];
+
+    /// 読めた保存値。
+    pub(super) struct Stored {
+        pub(super) cost: u32,
+        salt: [u8; SALT_BYTES],
+        /// 保存値の後ろ 53 文字（塩と結果の base64）。
+        encoded: [u8; LENGTH - ENCODED_FROM],
+    }
+
+    /// 保存値を読む。照合してよい値だけを返します。
+    ///
+    /// 版が `a`・`b`・`y`、長さが 60、cost が 2 桁で下限と上限の間、
+    /// 後ろ 53 文字が bcrypt の base64 の文字のもの。
+    pub(super) fn parse(hashed: &str) -> Result<Stored, &'static str> {
+        let bytes = hashed.as_bytes();
+        if bytes.len() != LENGTH {
+            return Err("長さが 60 文字ではありません");
+        }
+        let &[b'$', b'2', b'a' | b'b' | b'y', b'$', tens, ones, b'$', ..] = bytes else {
+            return Err("形が読めません");
+        };
+        if !tens.is_ascii_digit() || !ones.is_ascii_digit() {
+            return Err("cost が数字ではありません");
+        }
+        let cost = u32::from(tens - b'0') * 10 + u32::from(ones - b'0');
+        if cost < MIN_BCRYPT_COST {
+            return Err("cost が 4 より小さいです");
+        }
+        if cost > MAX_BCRYPT_COST {
+            return Err("cost が上限を超えています");
+        }
+        let encoded: [u8; LENGTH - ENCODED_FROM] = bytes[ENCODED_FROM..]
+            .try_into()
+            .map_err(|_| "形が読めません")?;
+        let mut values = [0u8; LENGTH - ENCODED_FROM];
+        for (value, &c) in values.iter_mut().zip(&encoded) {
+            *value = decode_char(c).ok_or("bcrypt の base64 ではない文字があります")?;
+        }
+        let mut salt = [0u8; SALT_BYTES];
+        decode(&values[..SALT_CHARS], &mut salt);
+        Ok(Stored {
+            cost,
+            salt,
+            encoded,
+        })
+    }
+
+    /// 保存値の塩と cost で計算して比べる。比べるのは base64 にした文字（PHP と同じ）です。
+    ///
+    /// 塩と結果の最後の文字に余る bit が 0 でない値（PHP の `password_hash` は作らない）は、
+    /// 作り直した文字と合わないので偽になります。PHP も同じです。
+    pub(super) fn verify(password: &str, stored: &Stored) -> bool {
+        #[cfg(test)]
+        super::counts::bump(&super::counts::BCRYPT_VERIFIES);
+        let (key, used) = key(password);
+        let hash = compute(1u64 << stored.cost, &stored.salt, &key[..used]);
+        let mut encoded = [0u8; LENGTH - ENCODED_FROM];
+        encode(&stored.salt, &mut encoded[..SALT_CHARS]);
+        encode(&hash[..HASH_BYTES], &mut encoded[SALT_CHARS..]);
+        crypto::constant_time_eq(&encoded, &stored.encoded)
+    }
+
+    /// 決まった塩で、鍵の準備を `rounds` 回して捨てる。時間合わせ用です。
+    pub(super) fn burn(password: &str, rounds: u64) {
+        let (key, used) = key(password);
+        std::hint::black_box(compute(rounds, &[0u8; SALT_BYTES], &key[..used]));
+    }
+
+    /// 平文から鍵を作る。終わりに NUL を足し、72 バイトで切ります。
+    ///
+    /// 72 バイト以上の平文は、終わりの NUL も入りません（PHP と同じ）。
+    /// 返すのは鍵と、使う長さです。
+    fn key(password: &str) -> ([u8; KEY_BYTES], usize) {
+        let bytes = password.as_bytes();
+        let len = bytes.len().min(KEY_BYTES);
+        let mut key = [0u8; KEY_BYTES];
+        key[..len].copy_from_slice(&bytes[..len]);
+        (key, (len + 1).min(KEY_BYTES))
+    }
+
+    /// bcrypt の本体（EksBlowfish）。`rounds` は 2 の cost 乗です。
+    fn compute(rounds: u64, salt: &[u8; SALT_BYTES], key: &[u8]) -> [u8; 24] {
+        let mut state = Blowfish::bc_init_state();
+        state.salted_expand_key(salt, key);
+        for _ in 0..rounds {
+            state.bc_expand_key(key);
+            state.bc_expand_key(salt);
+        }
+        let mut output = [0u8; 24];
+        let (pairs, _) = MAGIC.as_chunks::<2>();
+        let (outs, _) = output.as_chunks_mut::<8>();
+        for (pair, out) in pairs.iter().zip(outs) {
+            let mut block = *pair;
+            for _ in 0..64 {
+                block = state.bc_encrypt(block);
+            }
+            out[..4].copy_from_slice(&block[0].to_be_bytes());
+            out[4..].copy_from_slice(&block[1].to_be_bytes());
+        }
+        output
+    }
+
+    /// bcrypt の base64 の 1 文字を 0〜63 に直す。
+    fn decode_char(c: u8) -> Option<u8> {
+        match c {
+            b'.' => Some(0),
+            b'/' => Some(1),
+            b'A'..=b'Z' => Some(c - b'A' + 2),
+            b'a'..=b'z' => Some(c - b'a' + 28),
+            b'0'..=b'9' => Some(c - b'0' + 54),
+            _ => None,
+        }
+    }
+
+    /// 6 bit ずつの値を、`out` が埋まるまでバイトに詰める。余った bit は捨てます。
+    fn decode(values: &[u8], out: &mut [u8]) {
+        let (mut acc, mut bits, mut filled) = (0u32, 0u32, 0);
+        for &value in values {
+            acc = (acc << 6) | u32::from(value);
+            bits += 6;
+            if bits >= 8 {
+                bits -= 8;
+                if filled < out.len() {
+                    out[filled] = (acc >> bits) as u8;
+                    filled += 1;
+                }
+            }
+            acc &= (1 << bits) - 1;
+        }
+    }
+
+    /// バイトを bcrypt の base64 にする。最後の文字の余る bit は 0 で埋めます。
+    fn encode(bytes: &[u8], out: &mut [u8]) {
+        let (mut acc, mut bits, mut written) = (0u32, 0u32, 0);
+        for &byte in bytes {
+            acc = (acc << 8) | u32::from(byte);
+            bits += 8;
+            while bits >= 6 {
+                bits -= 6;
+                out[written] = ALPHABET[((acc >> bits) & 0x3f) as usize];
+                written += 1;
+            }
+            acc &= (1 << bits) - 1;
+        }
+        if bits > 0 {
+            out[written] = ALPHABET[((acc << (6 - bits)) & 0x3f) as usize];
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn base64_は往復できる() {
+            let bytes: Vec<u8> = (0..=255u8).step_by(7).take(23).collect();
+            let mut text = [0u8; 31];
+            encode(&bytes, &mut text);
+            let values: Vec<u8> = text.iter().map(|&c| decode_char(c).unwrap()).collect();
+            let mut back = [0u8; 23];
+            decode(&values, &mut back);
+            assert_eq!(back.as_slice(), bytes.as_slice());
+        }
+
+        #[test]
+        fn 鍵は終わりに_nul_を足して72バイトで切る() {
+            assert_eq!(key("ab").1, 3);
+            assert_eq!(&key("ab").0[..3], b"ab\0");
+            assert_eq!(key(&"a".repeat(71)).1, 72, "71 バイトなら NUL まで入る");
+            assert_eq!(key(&"a".repeat(72)).1, 72, "72 バイトなら NUL は入らない");
+            assert_eq!(key(&"a".repeat(100)).1, 72);
+            assert_eq!(key("").1, 1, "空でも NUL の 1 バイト");
+        }
+    }
+}
+
 /// パスワードの計算を同時に走らせる数の上限。
 ///
 /// Argon2id は 1 件で 64 MiB を使います。ログインが一度に押し寄せると、
@@ -1084,6 +1493,10 @@ mod counts {
         pub(super) static ARGON_VERIFIES: Cell<u32> = const { Cell::new(0) };
         /// 弱い値の照合のあとの埋め合わせ。`take` には入れません（`pads` で読む）。
         pub(super) static ARGON_PADS: Cell<u32> = const { Cell::new(0) };
+        /// bcrypt の数。`take` には入れません（`bcrypt` で読む）。
+        pub(super) static BCRYPT_BURNS: Cell<u32> = const { Cell::new(0) };
+        pub(super) static BCRYPT_VERIFIES: Cell<u32> = const { Cell::new(0) };
+        pub(super) static BCRYPT_PADS: Cell<u32> = const { Cell::new(0) };
     }
 
     pub(super) fn bump(key: &'static LocalKey<Cell<u32>>) {
@@ -1103,6 +1516,16 @@ mod counts {
     #[cfg_attr(not(feature = "argon2"), allow(dead_code))]
     pub(super) fn pads() -> u32 {
         ARGON_PADS.with(|c| c.replace(0))
+    }
+
+    /// bcrypt の数を 0 に戻し、(空回し, 照合, 埋め合わせ) を返す。
+    #[cfg_attr(not(feature = "bcrypt"), allow(dead_code))]
+    pub(super) fn bcrypt() -> (u32, u32, u32) {
+        (
+            BCRYPT_BURNS.with(|c| c.replace(0)),
+            BCRYPT_VERIFIES.with(|c| c.replace(0)),
+            BCRYPT_PADS.with(|c| c.replace(0)),
+        )
     }
 }
 
@@ -1843,6 +2266,283 @@ mod tests {
         if seen_argon() == heavy {
             assert_eq!(counts::pads(), 0, "最大の値は埋めない");
         }
+    }
+
+    // ---- bcrypt（照合だけ） ----
+
+    /// PHP 8.3.6 の `password_hash`（`PASSWORD_BCRYPT`、cost 4）で作った値。
+    /// パスワードは `ひみつのパスワード`。
+    const PHP_BCRYPT: &str = "$2y$04$U.buQHSdNt8UnmLL9HpRyOp6l/Om0N6Akx4oSX7s9lRucYTx.gkOm";
+
+    /// 同じく `あ` × 30（90 バイト）から作った値。PHP は先頭 72 バイトだけを使う。
+    #[cfg_attr(not(feature = "bcrypt"), allow(dead_code))]
+    const PHP_BCRYPT_LONG: &str = "$2y$04$szH9F0Boe08ZvFmtslx58uw6nik0vE0FnrsrJYgbylHt.mPE6Enr6";
+
+    #[test]
+    fn bcrypt_の値かどうかは先頭の4文字で見る() {
+        assert_eq!(bcrypt_version(PHP_BCRYPT), Some(b'y'));
+        assert_eq!(bcrypt_version("$2b$"), Some(b'b'));
+        assert_eq!(bcrypt_version("$2a$10$"), Some(b'a'));
+        assert_eq!(bcrypt_version("$2x$10$"), Some(b'x'));
+        assert_eq!(bcrypt_version("$2$10$"), None);
+        assert_eq!(bcrypt_version("$2z$10$"), None);
+        assert_eq!(bcrypt_version("$argon2id$"), None);
+        assert_eq!(bcrypt_version(""), None);
+    }
+
+    #[test]
+    fn bcrypt_の値はどの方式でも作り直す() {
+        // bcrypt では作らないので、ログインのついでに設定の方式へ移る。
+        for hashed in [
+            PHP_BCRYPT.to_string(),
+            PHP_BCRYPT.replacen("$2y$", "$2b$", 1),
+            PHP_BCRYPT.replacen("$2y$", "$2x$", 1),
+            PHP_BCRYPT.replacen("$04$", "$31$", 1),
+        ] {
+            assert!(needs_rehash_using(&hashed, PBKDF2), "{hashed}");
+            assert!(needs_rehash_using(&hashed, ARGON), "{hashed}");
+        }
+    }
+
+    #[test]
+    fn 作り直した値は設定の方式になり_bcrypt_にはならない() {
+        // `attempt` は合ったときに `needs_rehash` を見て `make` で作り直す。
+        // `make` が bcrypt を作らず、設定の方式の値を作ることを確かめる。
+        install_test_iterations();
+        let marks = AtomicU8::new(0);
+        let made = make_using("ひみつのパスワード", PBKDF2);
+        assert!(made.starts_with(PBKDF2_PREFIX), "{made}");
+        assert!(!needs_rehash_using(&made, PBKDF2), "もう作り直さない");
+        assert!(check_using("ひみつのパスワード", &made, PBKDF2, &marks));
+
+        let made = make_using("ひみつのパスワード", ARGON);
+        if cfg!(feature = "argon2") {
+            assert!(made.starts_with(ARGON2ID_PREFIX), "{made}");
+            assert!(!needs_rehash_using(&made, ARGON), "もう作り直さない");
+            assert!(check_using("ひみつのパスワード", &made, ARGON, &marks));
+        } else {
+            assert!(made.starts_with(PBKDF2_PREFIX), "{made}");
+        }
+    }
+
+    #[test]
+    fn 方式に_bcrypt_を頼むと_pbkdf2_を使う() {
+        // bcrypt は照合だけ。作る方式には選べない。
+        let choice = resolve_driver(" BCRYPT ");
+        assert_eq!(choice.driver, Driver::Pbkdf2);
+        assert!(!choice.missing_flag);
+    }
+
+    #[test]
+    fn 古い不具合のある_2x_は照合しない() {
+        // フラグの有無によらず偽。保存値では計算しない。
+        install_test_iterations();
+        let marks = AtomicU8::new(0);
+        let old = PHP_BCRYPT.replacen("$2y$", "$2x$", 1);
+        counts::take();
+        counts::bcrypt();
+        assert!(!check_using("ひみつのパスワード", &old, PBKDF2, &marks));
+        assert_eq!(counts::take(), (1, 0, 0), "読めない値と同じく空回しする");
+        assert_eq!(counts::bcrypt(), (0, 0, 0), "照合しない");
+        assert_eq!(marks.load(Ordering::Relaxed), 0, "印を立てない");
+    }
+
+    #[cfg(feature = "bcrypt")]
+    #[test]
+    fn php_の_password_hash_で作った_bcrypt_を照合できる() {
+        install_test_iterations();
+        let marks = AtomicU8::new(0);
+        assert!(check_using(
+            "ひみつのパスワード",
+            PHP_BCRYPT,
+            PBKDF2,
+            &marks
+        ));
+        assert!(!check_using("ちがうパスワード", PHP_BCRYPT, PBKDF2, &marks));
+        assert!(!check_using("", PHP_BCRYPT, PBKDF2, &marks));
+        // `$2b$`・`$2a$` は同じ計算。
+        for version in ["$2b$", "$2a$"] {
+            let other = PHP_BCRYPT.replacen("$2y$", version, 1);
+            assert!(
+                check_using("ひみつのパスワード", &other, PBKDF2, &marks),
+                "{other}"
+            );
+        }
+        // 方式が Argon2id でも照合できる。
+        assert!(check_using("ひみつのパスワード", PHP_BCRYPT, ARGON, &marks));
+        assert_ne!(marks.load(Ordering::Relaxed) & SEEN_BCRYPT, 0, "印を立てる");
+    }
+
+    #[cfg(feature = "bcrypt")]
+    #[test]
+    fn bcrypt_は先頭72バイトだけを使う() {
+        install_test_iterations();
+        let marks = AtomicU8::new(0);
+        let check = |n: usize| check_using(&"あ".repeat(n), PHP_BCRYPT_LONG, PBKDF2, &marks);
+        assert!(check(24), "72 バイト");
+        assert!(check(25), "75 バイト。73 バイト目からは使わない");
+        assert!(check(30), "作ったときの 90 バイト");
+        assert!(!check(23), "69 バイト");
+    }
+
+    #[cfg(feature = "bcrypt")]
+    #[test]
+    fn php_の既定の_cost_12_の_bcrypt_を照合できる() {
+        // 遅いのでこの 1 件だけ。覚える cost（ほかのテストの空回しに効く）を
+        // 上げないよう、照合の本体を直接呼ぶ。
+        let stored =
+            bcrypt::parse("$2y$12$RgDTbOsiWkXHv/lL/gSLjujxtYJReiLvCsum/JoVU7qmOX4dfSMK.").unwrap();
+        assert_eq!(stored.cost, 12);
+        assert!(bcrypt::verify("password", &stored));
+    }
+
+    #[cfg(feature = "bcrypt")]
+    #[test]
+    fn nul_を含む平文は_bcrypt_でも偽になる() {
+        // PHP は NUL で切って照合するので真になる。紅殻では真似しない。
+        install_test_iterations();
+        let marks = AtomicU8::new(0);
+        counts::bcrypt();
+        for input in ["ひみつのパスワード\0", "ひみつのパスワード\0おまけ", "\0"]
+        {
+            assert!(!check_using(input, PHP_BCRYPT, PBKDF2, &marks), "{input:?}");
+        }
+        // 外れると決まっていても、合うときと同じだけ計算する。
+        assert_eq!(counts::bcrypt().1, 3, "照合の計算はする");
+    }
+
+    #[cfg(feature = "bcrypt")]
+    #[test]
+    fn 形の壊れた_bcrypt_は偽になる() {
+        install_test_iterations();
+        let marks = AtomicU8::new(0);
+        let shorter = &PHP_BCRYPT[..59];
+        let longer = format!("{PHP_BCRYPT}a");
+        let broken_char = PHP_BCRYPT.replacen('U', "!", 1);
+        let low_cost = PHP_BCRYPT.replacen("$04$", "$03$", 1);
+        let not_digit = PHP_BCRYPT.replacen("$04$", "$0a$", 1);
+        let separator = PHP_BCRYPT.replacen("$04$", "$04_", 1);
+        // 最後の文字の余る 2 bit が 0 でない。読めば同じバイトだが、PHP も偽にする。
+        let loose_tail = format!("{}n", &PHP_BCRYPT[..59]);
+        let non_ascii = format!("{}あ", &PHP_BCRYPT[..57]);
+        assert_eq!(non_ascii.len(), 60);
+        for broken in [
+            shorter,
+            &longer,
+            &broken_char,
+            &low_cost,
+            &not_digit,
+            &separator,
+            &loose_tail,
+            &non_ascii,
+        ] {
+            assert!(
+                !check_using("ひみつのパスワード", broken, PBKDF2, &marks),
+                "{broken}"
+            );
+        }
+    }
+
+    #[cfg(feature = "bcrypt")]
+    #[test]
+    fn cost_が上限を超える_bcrypt_は計算せずに偽になる() {
+        install_test_iterations();
+        let marks = AtomicU8::new(0);
+        counts::bcrypt();
+        for cost in [MAX_BCRYPT_COST + 1, 31, 99] {
+            let over = PHP_BCRYPT.replacen("$04$", &format!("${cost}$"), 1);
+            counts::take();
+            let started = std::time::Instant::now();
+            assert!(!check_using("ひみつのパスワード", &over, PBKDF2, &marks));
+            assert!(started.elapsed().as_secs() < 1, "すぐ返る");
+            assert_eq!(counts::take(), (1, 0, 0), "空回し（方式の PBKDF2）はする");
+        }
+        assert_eq!(counts::bcrypt(), (0, 0, 0), "保存値では計算しない");
+        assert_eq!(marks.load(Ordering::Relaxed), 0, "印を立てない");
+        // ちょうど上限なら読める。
+        let limit = PHP_BCRYPT.replacen("$04$", &format!("${MAX_BCRYPT_COST}$"), 1);
+        assert!(bcrypt::parse(&limit).is_ok());
+    }
+
+    #[cfg(feature = "bcrypt")]
+    #[test]
+    fn bcrypt_の値を照合すると時間合わせの印が立つ() {
+        install_test_iterations();
+        let marks = AtomicU8::new(0);
+        counts::take();
+        counts::bcrypt();
+
+        // まだ bcrypt を見ていなければ、bcrypt は空回ししない。
+        waste_time_using("x", PBKDF2, &marks);
+        assert_eq!(counts::take(), (1, 0, 0));
+        assert_eq!(counts::bcrypt().0, 0);
+
+        // bcrypt の値の照合：方式の PBKDF2 を空回しする。
+        assert!(check_using(
+            "ひみつのパスワード",
+            PHP_BCRYPT,
+            PBKDF2,
+            &marks
+        ));
+        assert_eq!(marks.load(Ordering::Relaxed), SEEN_BCRYPT, "印を立てる");
+        assert_eq!(counts::take(), (1, 0, 0), "PBKDF2 を空回し");
+        assert_eq!(counts::bcrypt().1, 1, "照合は 1 回");
+
+        // 印が立ったら、いない利用者・読めない値・PBKDF2 の値でも bcrypt の時間をかける。
+        waste_time_using("x", PBKDF2, &marks);
+        assert_eq!(counts::take(), (1, 0, 0), "いない利用者");
+        assert_eq!(counts::bcrypt(), (1, 0, 0), "いない利用者：bcrypt も");
+        assert!(!check_using("x", "壊れた値", PBKDF2, &marks));
+        assert_eq!(counts::bcrypt(), (1, 0, 0), "読めない値：bcrypt も");
+        let pbkdf2 = make_pbkdf2("x", FAST);
+        assert!(check_using("x", &pbkdf2, PBKDF2, &marks));
+        assert_eq!(counts::bcrypt(), (1, 0, 0), "PBKDF2 の値：bcrypt を空回し");
+        counts::take();
+
+        // 公開の口でも印が立つ。
+        assert!(Hash::check("ひみつのパスワード", PHP_BCRYPT));
+        assert_ne!(SEEN.load(Ordering::Relaxed) & SEEN_BCRYPT, 0);
+        assert!(
+            MAX_SEEN_BCRYPT_COST.load(Ordering::Relaxed) >= 4,
+            "cost を覚える"
+        );
+    }
+
+    #[test]
+    fn bcrypt_の弱い値は足りないぶんを埋める() {
+        assert_eq!(bcrypt_padding(4, 4), None, "同じなら埋めない");
+        assert_eq!(bcrypt_padding(12, 10), None, "強ければ埋めない");
+        assert_eq!(bcrypt_padding(4, 5), Some(16), "2^5 - 2^4");
+        assert_eq!(bcrypt_padding(10, 12), Some(4096 - 1024));
+        assert_eq!(
+            bcrypt_padding(MIN_BCRYPT_COST, MAX_BCRYPT_COST),
+            Some((1 << MAX_BCRYPT_COST) - (1 << MIN_BCRYPT_COST))
+        );
+    }
+
+    #[cfg(not(feature = "bcrypt"))]
+    #[test]
+    fn フラグが無ければ_bcrypt_の値は偽で案内は1回だけ() {
+        install_test_iterations();
+        let marks = AtomicU8::new(0);
+        counts::take();
+        for _ in 0..2 {
+            assert!(!check_using(
+                "ひみつのパスワード",
+                PHP_BCRYPT,
+                PBKDF2,
+                &marks
+            ));
+        }
+        assert_eq!(
+            MISSING_BCRYPT_REPORTS.load(Ordering::Relaxed),
+            1,
+            "案内は 1 回だけ"
+        );
+        // 読めない値と同じく空回しする。
+        assert_eq!(counts::take(), (2, 0, 0));
+        assert_eq!(marks.load(Ordering::Relaxed), 0);
+        assert!(needs_rehash_using(PHP_BCRYPT, PBKDF2));
     }
 
     // ---- 7.2 計算の同時数 ----
