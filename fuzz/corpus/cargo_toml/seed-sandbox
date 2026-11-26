@@ -1,10 +1,10 @@
 [package]
-name = "bengara-sandbox"
+name = "bengara-rs-sandbox"
 version = "0.1.0"
 edition = "2021"
 rust-version = "1.88"
 publish = false
-default-run = "bengara-sandbox"
+default-run = "bengara-rs-sandbox"
 autobins = false
 autotests = false
 
@@ -14,12 +14,12 @@ bengara = { version = "0.1", features = ["sqlite", "websocket"] }
 [build-dependencies]
 bengara-build = "0.1"
 
-# 開発中は、サブモジュール（bengara/）の手元のソースを使う。
+# 開発中は、サブモジュール（bengara-rs/）の手元のソースを使う。
 # 利用者と同じ `bengara = "0.1"` の書き方を保ったまま差し替えるため。
 [patch.crates-io]
-bengara = { path = "bengara/crates/bengara" }
-bengara-build = { path = "bengara/crates/bengara-build" }
-bengara-macros = { path = "bengara/crates/bengara-macros" }
+bengara = { path = "bengara-rs/crates/bengara" }
+bengara-build = { path = "bengara-rs/crates/bengara-build" }
+bengara-macros = { path = "bengara-rs/crates/bengara-macros" }
 
 [profile.release]
 lto = "fat"
@@ -27,7 +27,7 @@ codegen-units = 1
 strip = true
 
 [[bin]]
-name = "bengara-sandbox"
+name = "bengara-rs-sandbox"
 path = "main.rs"
 
 [[bin]]

@@ -118,7 +118,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          path: bengara
+          path: bengara-rs
       - uses: dtolnay/rust-toolchain@stable
       - name: cargo new してフレームワークを手元のソースに差し替える
         shell: bash
@@ -129,9 +129,9 @@ jobs:
           # 公開前なので、crates.io ではなく手元のソースを使う。
           printf 'bengara = { version = "0.1", features = ["sqlite"] }\n\n' >> Cargo.toml
           printf '[patch.crates-io]\n' >> Cargo.toml
-          printf 'bengara = { path = "../bengara/crates/bengara" }\n' >> Cargo.toml
-          printf 'bengara-build = { path = "../bengara/crates/bengara-build" }\n' >> Cargo.toml
-          printf 'bengara-macros = { path = "../bengara/crates/bengara-macros" }\n' >> Cargo.toml
+          printf 'bengara = { path = "../bengara-rs/crates/bengara" }\n' >> Cargo.toml
+          printf 'bengara-build = { path = "../bengara-rs/crates/bengara-build" }\n' >> Cargo.toml
+          printf 'bengara-macros = { path = "../bengara-rs/crates/bengara-macros" }\n' >> Cargo.toml
           printf 'fn main() { bengara::run() }\n' > src/main.rs
       # ルートに Cargo.toml が無いので、ビルドする myapp を指す。
       # myapp を作った後に置く（無い場所では、キャッシュの鍵を作れない）。
@@ -180,7 +180,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          path: bengara
+          path: bengara-rs
       - uses: dtolnay/rust-toolchain@stable
       - name: cargo new してフレームワークを手元のソースに差し替える
         shell: bash
@@ -189,9 +189,9 @@ jobs:
           cd myapp
           printf 'bengara = { version = "0.1", features = ["sqlite"] }\n\n' >> Cargo.toml
           printf '[patch.crates-io]\n' >> Cargo.toml
-          printf 'bengara = { path = "../bengara/crates/bengara" }\n' >> Cargo.toml
-          printf 'bengara-build = { path = "../bengara/crates/bengara-build" }\n' >> Cargo.toml
-          printf 'bengara-macros = { path = "../bengara/crates/bengara-macros" }\n' >> Cargo.toml
+          printf 'bengara = { path = "../bengara-rs/crates/bengara" }\n' >> Cargo.toml
+          printf 'bengara-build = { path = "../bengara-rs/crates/bengara-build" }\n' >> Cargo.toml
+          printf 'bengara-macros = { path = "../bengara-rs/crates/bengara-macros" }\n' >> Cargo.toml
           printf 'fn main() { bengara::run() }\n' > src/main.rs
       - uses: Swatinem/rust-cache@v2
         with:

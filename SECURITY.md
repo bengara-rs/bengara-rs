@@ -57,7 +57,7 @@ English follows the Japanese text.
 | 対象外のもの                                                                 | 理由・報告先                                    |
 |------------------------------------------------------------------------------|-------------------------------------------------|
 | 利用者のアプリのコードの誤り                                                 | アプリの作り手が直すもの                        |
-| `bengara-sandbox`（試すためのサンプルのアプリ）                              | 公開して使うものではない                        |
+| `bengara-rs-sandbox`（試すためのサンプルのアプリ）                           | 公開して使うものではない                        |
 | [前段のプロキシで守るもの](docs/deployment.md#前段のプロキシで守るもの)に挙げたもの（ヘッダーの待ち時間・同時接続数など） | 前段で掛ける前提にしている |
 | [直さないと決めた制限](docs/backlog.md#直さないと決めた制限)                 | 理由を書いたうえで受け入れている                |
 | `TRUSTED_PROXIES` などの設定の誤り                                           | 設定する人が直すもの                            |
@@ -123,7 +123,7 @@ Fixes are released for the latest minor version only.
 | Out of scope                                                                                  | Reason / where to report                     |
 |-----------------------------------------------------------------------------------------------|----------------------------------------------|
 | Mistakes in the user's own application code                                                   | To be fixed by the application author        |
-| `bengara-sandbox` (a sample application for trying things out)                               | Not meant to be deployed                     |
+| `bengara-rs-sandbox` (a sample application for trying things out)                            | Not meant to be deployed                     |
 | Items listed in [What the front proxy must protect](docs/deployment.md#前段のプロキシで守るもの) (header timeouts, connection limits, etc.) | These are expected to be enforced by the front proxy |
 | [Limitations we decided not to fix](docs/backlog.md#直さないと決めた制限)                     | Accepted, with the reasons written down      |
 | Misconfiguration such as `TRUSTED_PROXIES`                                                    | To be fixed by whoever configures it         |
