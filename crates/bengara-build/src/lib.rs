@@ -17,6 +17,18 @@
 
 mod toml;
 
+/// ファジングのための口（`cargo fuzz` が付ける `cfg(fuzzing)` のときだけ）。公開 API ではありません。
+#[cfg(fuzzing)]
+#[doc(hidden)]
+pub mod fuzzing {
+    /// 言語ファイル（TOML の一部）を読む。読めたら組の数、読めなければ `None`。
+    ///
+    /// bengara-build はパニック禁止なので、どんな入力でも返ること（パニックしないこと）を確かめる。
+    pub fn lang_toml(text: &str) -> Option<usize> {
+        super::toml::parse(text).ok().map(|pairs| pairs.len())
+    }
+}
+
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};

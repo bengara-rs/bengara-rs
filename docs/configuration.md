@@ -236,6 +236,8 @@ MAIL_FROM_NAME="${APP_NAME}"
 | `APP_URL`   | `http://localhost:8000` | `url()` が作る URL の頭                 | `AppConfig`  |
 | `APP_KEY`   | （空）                  | 署名と暗号化の鍵（[APP_KEY](#app_key)） | `AppConfig`  |
 | `RUST_LOG`  | （なし）                | ログの細かさ（[ログ](#ログ)）           | —            |
+| `LOG_CHANNEL`    | `daily`            | ログの出し先（`daily` / `stdout`。[ログ](#ログ)） | —       |
+| `LOG_DAILY_DAYS` | `14`               | ログを残す日数。`0` は消さない（[ログ](#ログ)）   | —       |
 
 `APP_ENV=production` にすると、次の 2 つが変わります。
 
@@ -374,19 +376,17 @@ TRUSTED_PROXIES=10.0.0.1,10.0.0.2
 
 ## ログ
 
-ログは標準出力に出ます。細かさは `RUST_LOG` で決めます。
+ログは標準出力と、`storage/logs/` の日ごとのテキストと SQLite に出ます。くわしくは [logging.md](logging.md) にあります。
 
-| `RUST_LOG`                            | 動き                                        |
-|---------------------------------------|---------------------------------------------|
-| 無い                                  | `APP_DEBUG` が真なら `debug`、偽なら `info` |
-| `trace` `debug` `info` `warn` `error` | その細かさで出す                            |
-| `off`                                 | 何も出さない                                |
-| `info,sqlx=debug`                     | 流した SQL も出す（既定では出さない）       |
-| `myapp=debug`                         | 自分のアプリだけ細かく出す                  |
+| 名前             | 既定      | 何に効くか                                                            |
+|------------------|-----------|-----------------------------------------------------------------------|
+| `LOG_CHANNEL`    | `daily`   | `daily` は標準出力＋日ごとのテキスト＋SQLite。`stdout` は標準出力だけ |
+| `LOG_DAILY_DAYS` | `14`      | 残す日数。`0` は消さない                                              |
+| `RUST_LOG`       | （なし）  | 細かさ。`info,bengara::access=off` のように種類ごとにも止められる     |
 
-- 下の 2 つの書き方には、機能フラグ `log-filter` が要ります（既定で入っています）。
-- ログの細かさは、**環境変数**の `APP_DEBUG` で決まります。`config/app.rs` の `debug` を変えても変わりません。
+- 細かさの既定は、**環境変数**の `APP_DEBUG` が真なら `debug`、偽なら `info` です。`config/app.rs` の `debug` は効きません。
   ログの準備を、`config/` を読む前に済ませるためです。
+- 読めない値は、警告を出して既定にします。
 
 ## 機能フラグ
 
@@ -409,6 +409,7 @@ bengara = { version = "0.1", features = ["sqlite", "mail"] }
 | `argon2`     | 入っていない   | パスワードの Argon2id（`HASH_DRIVER=argon2id`）                 |
 | `bcrypt`     | 入っていない   | Laravel の bcrypt（`$2y$`）の照合だけ（作れない）               |
 | `view`       | 入っていない   | テンプレート（[views.md](views.md)）                            |
+| `metrics-system` | 入っていない | メトリクスに CPU・メモリー・ディスクの空きを足す（[logging.md](logging.md#メトリクス)） |
 | `log-filter` | **入っている** | `RUST_LOG=myapp=debug` のような絞り込み                         |
 
 - `init` で作ると `features = ["sqlite"]` が入ります。**別のデータベースなら書き換えてください。**

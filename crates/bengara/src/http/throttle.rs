@@ -372,15 +372,34 @@ fn key_for_with(req: &Request, trusted: &Trusted, by_ip: bool) -> Option<String>
     }
     // 接続元が分からなければ鍵を作らない。`"unknown"` のような1つの鍵にまとめると、
     // 誰か1人が使い切るだけで全員を締め出せてしまいます。
+    let who = client_ip_with(req, trusted)?;
+    Some(format!("{who}|{target}"))
+}
+
+/// 元の相手のアドレス。回数の制限と同じ判定です（アクセスログの IP に使います）。
+///
+/// 接続元が `TRUSTED_PROXIES` で信頼されているときだけ `X-Forwarded-For` と `X-Real-IP` を見ます。
+/// それ以外は接続元のアドレスです。接続元が分からなければ `None`。
+///
+/// **`Request::ip()` とは違います。** あちらは公開の動きで、接続してきた相手だけを返します。
+pub(crate) fn client_ip(req: &Request) -> Option<IpAddr> {
+    client_ip_with(req, trusted_proxies())
+}
+
+fn client_ip_with(req: &Request, trusted: &Trusted) -> Option<IpAddr> {
     // `::ffff:a.b.c.d` で届いた IPv4 は、照合と鍵の前に IPv4 に直す（`canonical`）。
     let peer = canonical(req.ip()?);
     // ヘッダーから採るのも `IpAddr` です。`user:5` のような文字列は鍵になりません。
-    let who = if trusted.allows(&peer) {
+    Some(if trusted.allows(&peer) {
         forwarded_ip(req, trusted, peer).unwrap_or(peer)
     } else {
         peer
-    };
-    Some(format!("{who}|{target}"))
+    })
+}
+
+/// 接続元を `TRUSTED_PROXIES` で信頼しているか（`X-Request-Id` を受け取ってよいか）。
+pub(crate) fn trusts_peer(peer: IpAddr) -> bool {
+    trusted_proxies().allows(&canonical(peer))
 }
 
 /// 何に対する回数かを表す文字列。上から順に、最初にあるものを使います。

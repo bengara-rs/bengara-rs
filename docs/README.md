@@ -23,6 +23,7 @@ bengara を使う人のための資料です。読むページをここで探し
 | `.env` と設定を知る        | [configuration.md](configuration.md)                   |
 | テストを書く               | [testing.md](testing.md)                               |
 | 本番に置く                 | [deployment.md](deployment.md)                         |
+| ログを読む                 | [logging.md](logging.md)                               |
 
 ## 周辺の機能
 
@@ -44,5 +45,6 @@ bengara を使う人のための資料です。読むページをここで探し
 | ページ                                           | 内容                                                               |
 |--------------------------------------------------|--------------------------------------------------------------------|
 | [laravel-differences.md](laravel-differences.md) | Laravel と違う点                                                   |
+| [releases.md](releases.md)                       | 版の付け方・壊さない約束の範囲・MSRV                               |
 | [backlog.md](backlog.md)                         | まだ無い機能・知っておくべき制限・作らないもの・確かめていない環境 |
 | [decisions.md](decisions.md)                     | 設計判断の記録                                                     |

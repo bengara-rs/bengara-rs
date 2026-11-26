@@ -8,6 +8,8 @@ Laravel と同じディレクトリ構成で、Web アプリを Rust で書け�
 
 > bengara は Laravel 公式とは無関係の、独立したプロジェクトです。
 
+> **脆弱性の報告は [SECURITY.md](SECURITY.md) へ。** 公開の Issue には書かないでください。
+
 ## できること
 
 | 分野       | 中身                                                                             |
@@ -98,6 +100,7 @@ impl HomeController {
 - ファイルを生成する `make:*` コマンドはありません。ファイルは手で作ります。
 - Laravel と違う点は [docs/laravel-differences.md](docs/laravel-differences.md) にあります。
 - 手で動きを確かめているのは Windows 10 だけです。
+- 変更の履歴は [CHANGELOG.md](CHANGELOG.md)、版の付け方と互換性の約束は [docs/releases.md](docs/releases.md) にあります。
 
 ## ライセンス
 

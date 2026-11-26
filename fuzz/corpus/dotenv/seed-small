@@ -1,0 +1,5 @@
+A=1
+export B="x
+y ${A}"
+C='raw $A' # c
+D=p#ss

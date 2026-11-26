@@ -3,7 +3,7 @@
 //! `artisan` は自動検出したモジュールを取り込まないので、アプリがコンパイルできない
 //! 状態でも動きます。`serve` が再ビルドを担えるのはこのためです。
 
-mod cargo_toml;
+pub(crate) mod cargo_toml;
 mod init;
 mod serve;
 

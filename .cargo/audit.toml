@@ -1,0 +1,9 @@
+# cargo-audit の設定（`cargo audit`）。
+# 無視する脆弱性は deny.toml の [advisories] ignore と同じものにそろえます。理由はそちらにあります。
+# mao さんの了承なしに足しません。
+
+[advisories]
+ignore = [
+    "RUSTSEC-2026-0459", # libsqlite3-sys：sqlx 0.9（Rust 1.94）が要る
+    "RUSTSEC-2023-0071", # rsa：上流に直した版が無い（機能フラグ mysql のときだけ）
+]

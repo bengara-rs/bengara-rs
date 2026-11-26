@@ -90,7 +90,7 @@ impl_from_env_parse!(i8, i16, i32, i64, i128, isize, u8, u16, u32, u64, u128, us
 /// 戻り値は読み込んだファイルのパスと、読めなかった行の警告です。
 ///
 /// **警告をその場では出しません。** `.env` の `APP_DEBUG` を見てからログの購読を
-/// 立てる（`init_tracing`）ので、ここで `tracing::warn!` を呼ぶと誰も聞いておらず
+/// 立てる（`logging::init`）ので、ここで `tracing::warn!` を呼ぶと誰も聞いておらず
 /// 捨てられます。呼び出し側が購読を立てた**後**に流し直します。
 pub(crate) fn load_dotenv(base: &Path) -> (Option<std::path::PathBuf>, Vec<String>) {
     let path = base.join(".env");
@@ -187,7 +187,7 @@ pub(crate) fn strip_export(line: &str) -> &str {
 /// `DB_PASSWORD=p#ss` は `p` になり、警告も出ません。
 /// `#` を値に入れたいときは囲みます（`DB_PASSWORD="p#ss"`）。
 /// 囲んだ値の中の `#` は、そのまま値に残ります。
-fn parse_dotenv(
+pub(crate) fn parse_dotenv(
     text: &str,
     real: &dyn Fn(&str) -> Option<String>,
 ) -> (Vec<(String, String)>, Vec<String>) {

@@ -1,0 +1,6 @@
+# ビルドの結果と、回したときに増えるものは入れない。種の入力（seed-*）だけを残す。
+/target
+/artifacts
+/coverage
+/corpus/*/*
+!/corpus/*/seed-*

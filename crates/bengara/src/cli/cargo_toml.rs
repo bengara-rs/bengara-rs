@@ -31,7 +31,7 @@ impl CargoToml {
     /// 先頭の BOM は外して読みます。Windows のメモ帳などが付けるもので、cargo は
     /// BOM つきの `Cargo.toml` を受け付けます。外さないと 1 行目が見出しと
     /// 認められず、`init` と `serve` が「name がありません」で止まっていました。
-    fn from_text(text: &str) -> Self {
+    pub(crate) fn from_text(text: &str) -> Self {
         let (bom, text) = match text.strip_prefix(BOM) {
             Some(rest) => (true, rest),
             None => (false, text),

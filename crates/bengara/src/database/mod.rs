@@ -34,6 +34,9 @@ mod query;
 mod schema;
 #[cfg(feature = "sqlite")]
 mod sqlite;
+/// ログの SQLite（`logging/sqlite.rs` の書き手が使う）。sqlx は `sqlite.rs` の中に閉じます。
+#[cfg(feature = "sqlite")]
+pub(crate) use sqlite::LogStore;
 /// 日時の列を文字列に直す。SQLite は値がそのまま文字列なので要りません。
 #[cfg(any(feature = "mysql", feature = "postgres"))]
 mod temporal;

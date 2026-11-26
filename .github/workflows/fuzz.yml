@@ -1,0 +1,67 @@
+name: Fuzz
+
+# ファジング（fuzz/）。cargo-fuzz は nightly の Rust が要る。
+# - push と pull_request：全部のターゲットがビルドできることだけを確かめる。
+# - 週 1 回：各ターゲットを 120 秒ずつ回す。落ちたら、落とした入力（artifacts）を上げる。
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+  schedule:
+    # 週 1 回（水曜の UTC 5 時 41 分）。
+    - cron: "41 5 * * 3"
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: build
+    if: github.event_name != 'schedule'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-fuzz
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: fuzz -> target
+      - run: cargo fuzz build
+        working-directory: fuzz
+
+  run:
+    name: run (${{ matrix.target }})
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [ multipart, cookie_header, percent, dotenv, cargo_toml, lang_toml, crypto, log_line ]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-fuzz
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: fuzz -> target
+      - name: 120 秒回す
+        working-directory: fuzz
+        shell: bash
+        run: |
+          extra=""
+          if [ "${{ matrix.target }}" = multipart ]; then extra="-max_len=65536"; fi
+          cargo fuzz run "${{ matrix.target }}" -- -max_total_time=120 $extra
+      - name: 落とした入力を上げる
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-artifacts-${{ matrix.target }}
+          path: fuzz/artifacts/${{ matrix.target }}

@@ -22,6 +22,7 @@ impl PostController {
 | 基本       | `method()` `path()` `query_string()` `full_path()` `route_name()` |
 | ルート     | `route_matched()`（ルートに当たったか）                           |
 | 接続元     | `ip()`                                                            |
+| ID         | `request_id()`（`X-Request-Id` と同じ値）                         |
 | パス引数   | `param(name)` `param_as::<T>(name)` `params()`                    |
 | クエリ     | `query(key)` `query_all()` `page()`                               |
 | ヘッダー   | `header(name)` `headers()`                                        |
@@ -439,17 +440,36 @@ Application::configure()
 **ディスクのファイルは、全部をメモリに読んでから返します。** 途中からの取得（`Range`）にも答えません。
 200 MB の動画を 10 人が同時に取ると、約 2 GB 使います。 **動画や大きなファイルは、前段のプロキシ（nginx など）で配ります。**
 
+## リクエスト ID
+
+すべての応答に `X-Request-Id` が付きます。ハンドラからは `req.request_id()` で読めます。
+
+```rust
+pub async fn show(req: Request) -> Result<Response> {
+    bengara::tracing::info!("見ました");      // ログに req=… が付く
+    json(&json!({ "request_id": req.request_id() }))
+}
+```
+
+- ふつうは bengara が作った 32 文字の 16 進です。
+- 前段のプロキシ（`TRUSTED_PROXIES` で信頼したもの）が `X-Request-Id` を付けてきたら、その値を使います。
+  使うのは `[0-9A-Za-z._-]` の 1〜64 文字のときだけです。
+- ハンドラが自分で `X-Request-Id` を付けても、bengara の値で上書きします（ログと同じ値にそろえる）。
+- アプリを通さずに作った `Request` では空文字です。
+- アプリが自分で spawn したタスクと `spawn_blocking` の中のログには、ID が付きません。
+
 ## ログ
 
-リクエストごとに `GET /posts?page=2 -> 200 (0 ms)` の形で出ます。
+リクエストごとに `GET /posts?page=2 -> 200 (0 ms) req=…` の形で出ます。
 
 - 秘密になりうる名前のクエリの値は `***` に伏せます（`?signature=***` など）。
 - 同じ名前のパス引数も伏せます。`/reset/{token}` のルートは `GET /reset/*** -> 200` と出ます。
 - 伏せる名前は、`old()` が覚えない項目と同じです（[validation.md](validation.md)）。
-- 細かさは `RUST_LOG` で決めます。無ければ、`APP_DEBUG` が真なら `debug`、偽なら `info` です。
+- 出し先・形・細かさは [logging.md](logging.md) にあります。
 
 ## 関連
 
 - [routing.md](routing.md)
 - [middleware.md](middleware.md)
 - [configuration.md](configuration.md)
+- [logging.md](logging.md)
