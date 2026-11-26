@@ -85,6 +85,10 @@ websocket = ["dep:tokio-tungstenite", "dep:hyper", "dep:hyper-util", "dep:future
 # エラーになります。
 view = ["dep:minijinja"]
 
+# CPU・メモリー・ディスクの空きをメトリクスに足す。既定では入りません。
+# 依存の木にすでにある libc と windows-sys を直接使うだけで、クレートは増えません。
+metrics-system = ["dep:libc", "dep:windows-sys"]
+
 [dependencies]
 bengara-macros = { workspace = true }
 axum = { version = "0.8", default-features = false, features = ["http1", "tokio"] }
@@ -102,7 +106,8 @@ tokio = { version = "1", features = [
     "time", # 停止の上限時間
 ] }
 tracing = "0.1"
-tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "ansi"] }
+# ログの行は自前の層（logging/layer.rs）で組み立てるので、`fmt` と `ansi` は使いません。
+tracing-subscriber = { version = "0.3", default-features = false, features = ["registry", "std"] }
 getrandom = { version = "0.4.3", features = ["std"] }
 sqlx = { version = "0.8", default-features = false, features = [
     "runtime-tokio",
@@ -153,6 +158,19 @@ minijinja = { version = "3.1", default-features = false, features = [
     "serde",
 ], optional = true }
 
+[target.'cfg(unix)'.dependencies]
+# メトリクスの OS の数（機能フラグ metrics-system）。依存の木にすでにある版です。
+libc = { version = "0.2", optional = true }
+
+[target.'cfg(windows)'.dependencies]
+# メトリクスの OS の数（機能フラグ metrics-system）。依存の木にすでにある版です。
+windows-sys = { version = "0.61", optional = true, features = [
+    "Win32_Foundation",
+    "Win32_Storage_FileSystem",
+    "Win32_System_ProcessStatus",
+    "Win32_System_Threading",
+] }
+
 [dev-dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 # WebSocket の実ソケットのテストで、相手（クライアント）として使う。
@@ -162,4 +180,8 @@ tokio-tungstenite = { version = "0.30", default-features = false, features = [
 
 # docs.rs では、つなげるドライバとメールと WebSocket と Argon2id と bcrypt とテンプレートを入れた状態で説明を出す。
 [package.metadata.docs.rs]
-features = ["sqlite", "mysql", "postgres", "encryption", "argon2", "bcrypt", "mail", "websocket", "view"]
+features = ["sqlite", "mysql", "postgres", "encryption", "argon2", "bcrypt", "mail", "websocket", "view", "metrics-system"]
+
+[lints.rust]
+# `cargo fuzz` が付ける cfg（ファジングのための口）。clippy の警告で落ちないように知らせておく。
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(fuzzing)'] }

@@ -238,11 +238,12 @@ pub fn main(hooks: Hooks, factory: fn() -> Application) {
     // `APP_DEBUG` を見るため）。そのため警告はその場では出せないので、
     // 一覧で受け取って購読の**後**に流し直す。
     let (dotenv, warnings) = env_vars::load_dotenv(&base);
-    init_tracing();
+    // ログの設定（`LOG_CHANNEL` など）の警告も、購読を立てた**後**に流す。
+    let log_warnings = crate::logging::init();
     if let Some(path) = &dotenv {
         tracing::debug!("{} を読み込みました", path.display());
     }
-    for warning in warnings {
+    for warning in warnings.into_iter().chain(log_warnings) {
         tracing::warn!("{warning}");
     }
     // フレームワークのコマンドと同じ名前の自作コマンドは呼ばれない。
@@ -257,6 +258,9 @@ pub fn main(hooks: Hooks, factory: fn() -> Application) {
             eprintln!("エラー: {error}");
             std::process::exit(1);
         }
+        // 日ごとのテキストと SQLite は、`storage/` の場所が決まった後に始める。
+        // それより前のログ（`.env` の警告など）は標準出力にだけ出ます。
+        crate::logging::start_outputs();
     }
 
     let mut registry = Registry::new();
@@ -270,9 +274,12 @@ pub fn main(hooks: Hooks, factory: fn() -> Application) {
     crate::view::install_embedded((hooks.views)());
 
     if let Err(error) = dispatch(target, &args, hooks, factory) {
+        // `exit` はキューを待たないので、先に書き切る（上限 5 秒）。
+        crate::logging::shutdown();
         eprintln!("エラー: {error}");
         std::process::exit(1);
     }
+    crate::logging::shutdown();
 }
 
 /// 引数を「コマンドの名前」と「残り」に分ける。
@@ -332,6 +339,7 @@ fn dispatch(
             let options = ServeOptions::parse(rest)?;
             // 使う絶対パスを出す。設定の間違いはここを見れば分かる。
             crate::ops::log_paths();
+            crate::logging::note_sqlite_missing();
             server::serve(app, &options.host, options.port)
         }
         AppCommand::RouteList => {
@@ -817,6 +825,8 @@ fn print_about(hooks: &Hooks) {
         // `MAIL_MAILER` → `MAIL_DRIVER` の順に見る（`config/mail.rs` があればそちら）。
         ("メール", crate::mail::driver_label()),
         ("停止の上限", crate::server::shutdown_timeout_label()),
+        // Laravel の `about` の「Logs」に当たる（`LOG_CHANNEL`・`LOG_DAILY_DAYS`）。
+        ("ログ", crate::logging::about_label()),
         ("マイグレーション", (hooks.migrations)().len().to_string()),
         ("シーダー", (hooks.seeders)().len().to_string()),
         ("ジョブ", (hooks.jobs)().len().to_string()),
@@ -928,47 +938,6 @@ fn kernel_help() -> String {
     out
 }
 
-/// ログの出力を用意する。
-///
-/// 出力の細かさは `RUST_LOG` で決めます。設定がなければ、`APP_DEBUG` が真なら
-/// `debug`、そうでなければ `info` にします。
-///
-/// **見るのは環境変数の `APP_DEBUG` だけで、`config/app.rs` の `debug` は見ません。**
-/// 起動の順番の都合です。ログの購読は設定（`config/*.rs`）を組み立てる**前**に
-/// 立てます。組み立ての中の警告も拾うためです。`config/app.rs` で `debug` を
-/// `env("APP_DEBUG", …)` 以外から決めても、ログの細かさには効きません。
-///
-/// 機能フラグ `log-filter`（既定で入っています）があると、`RUST_LOG=myapp=debug` のような
-/// 細かい絞り込みが使えます。外した場合は `trace` / `debug` / `info` / `warn` / `error` /
-/// `off` の1語だけを見ます。
-fn init_tracing() {
-    let default = if env("APP_DEBUG", false) {
-        "debug"
-    } else {
-        "info"
-    };
-
-    #[cfg(feature = "log-filter")]
-    let builder = {
-        use tracing_subscriber::EnvFilter;
-        // sqlx は投げた SQL を1本ずつ出すので、既定では黙らせる。
-        // 見たいときは `RUST_LOG=info,sqlx=debug` のように指定する。
-        let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| {
-            EnvFilter::new(format!("{default},hyper=warn,tower=warn,sqlx=warn"))
-        });
-        tracing_subscriber::fmt().with_env_filter(filter)
-    };
-
-    #[cfg(not(feature = "log-filter"))]
-    let builder = {
-        let level = max_level(std::env::var("RUST_LOG").ok().as_deref(), default);
-        tracing_subscriber::fmt().with_max_level(level)
-    };
-
-    // 二重に初期化しても落ちないようにする（テストから複数回呼ばれても安全）。
-    let _ = builder.with_target(false).try_init();
-}
-
 /// `RUST_LOG` の値と既定から、ログの細かさを決める（`log-filter` を外したとき用）。
 ///
 /// 読めない値と空は既定に落とします。`off` は「読めない」ではなく、
@@ -977,7 +946,7 @@ fn init_tracing() {
 /// テストでも使うので、`log-filter` が入っているときもテストにだけ残します
 /// （既定のビルドでは `log-filter` が入るので、外した側の枝は普段コンパイルされません）。
 #[cfg(any(test, not(feature = "log-filter")))]
-fn max_level(raw: Option<&str>, default: &str) -> tracing::level_filters::LevelFilter {
+pub(crate) fn max_level(raw: Option<&str>, default: &str) -> tracing::level_filters::LevelFilter {
     raw.and_then(parse_level)
         .or_else(|| parse_level(default))
         .unwrap_or(tracing::level_filters::LevelFilter::INFO)
@@ -1034,7 +1003,8 @@ pub(crate) fn boot_for_tests(hooks: Hooks) {
 
         let base = paths::base_path().to_path_buf();
         let (_, warnings) = env_vars::load_dotenv(&base);
-        init_tracing();
+        // テストでは標準出力にだけ書く（`LOG_CHANNEL` を見ない）。
+        crate::logging::init_for_tests();
         for warning in warnings {
             tracing::warn!("{warning}");
         }

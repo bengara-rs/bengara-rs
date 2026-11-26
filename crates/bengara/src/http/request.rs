@@ -77,6 +77,8 @@ pub struct Request {
     /// 要求ごとの欄です。共有の表には置きません。`Arc` なので、載せた後の複製は
     /// 同じ行を指します。ふつうの要求では空で、確保もしません。
     access_token: Option<Arc<crate::auth::PersonalAccessToken>>,
+    /// リクエスト ID（`X-Request-Id`）。`Application` が入口で決めます。
+    request_id: Option<Arc<str>>,
 }
 
 /// ログに出してよい形だけを出す。
@@ -165,6 +167,7 @@ impl Request {
             streaming: false,
             back: OnceLock::new(),
             access_token: None,
+            request_id: None,
         }
     }
 
@@ -309,6 +312,21 @@ impl Request {
     pub(crate) fn with_remote_addr(mut self, addr: SocketAddr) -> Self {
         self.remote_addr = Some(addr);
         self
+    }
+
+    /// リクエスト ID を載せる。`server.rs`（受け取った値）と `Application`（作った値）が入れます。
+    pub(crate) fn set_request_id(&mut self, id: Arc<str>) {
+        self.request_id = Some(id);
+    }
+
+    /// 当たったルートの名前（`Arc` のまま。アクセスログに渡す）。
+    pub(crate) fn route_name_arc(&self) -> Option<Arc<str>> {
+        self.route_name.clone()
+    }
+
+    /// 載っているリクエスト ID（`Arc` のまま）。
+    pub(crate) fn request_id_arc(&self) -> Option<Arc<str>> {
+        self.request_id.clone()
     }
 
     pub(crate) fn set_params(&mut self, params: Vec<(String, String)>) {
@@ -563,6 +581,15 @@ impl Request {
     /// ソケットも使わず、アドレスも入れずに作ったときだけ `None` になります。
     pub fn ip(&self) -> Option<IpAddr> {
         self.remote_addr.map(|addr| addr.ip())
+    }
+
+    /// このリクエストの ID。応答の `X-Request-Id` と、ログの `req=` / `request_id` と同じ値です。
+    ///
+    /// ふつうは bengara が作った 32 文字の 16 進です。前段のプロキシ（`TRUSTED_PROXIES` で
+    /// 信頼したもの）が `X-Request-Id` を付けてきたときは、その値（`[0-9A-Za-z._-]` の
+    /// 1〜64 文字）を使います。アプリを通さずに作った `Request` では空文字です。
+    pub fn request_id(&self) -> &str {
+        self.request_id.as_deref().unwrap_or("")
     }
 
     /// ヘッダーの値（名前の大文字小文字は区別しません）。

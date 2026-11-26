@@ -83,7 +83,7 @@ storage           /opt/myapp/storage
 ```
 
 - `APP_KEY` の値は出しません。設定されているかどうかだけです。
-- ほかに、言語・セッション・キャッシュ・メールの設定と、マイグレーションなどの数を出します。
+- ほかに、言語・セッション・キャッシュ・メール・ログ（`daily（storage/logs、14 日、SQLite あり）` など）の設定と、マイグレーションなどの数を出します。
 - `serve` も、起動のときに基準ディレクトリと `storage` の絶対パスをログに出します。
 
 ## storage を作る
@@ -116,7 +116,7 @@ storage           /opt/myapp/storage
 - **鍵を作り直す（`key:generate --force`）と、全員がログアウトします。** 暗号化した値と、配った署名付き URL も無効になります。
 - 環境変数で渡した `APP_KEY` は、`.env` より優先されます。
 - 項目の一覧は [configuration.md](configuration.md) にあります。
-- ログは標準出力に出ます。
+- ログは標準出力と `storage/logs/` に出ます（[下](#ログ)）。
 
 ## 止める
 
@@ -298,6 +298,21 @@ curl -sf http://127.0.0.1:8001/up || echo "まだ"
 - `.stream_body()` のルートは全体の時間を数えません。少しずつ送り続ける相手は、前段の同時接続数の上限などで守ります。
 - nginx はふだん本文を全部受け取ってから本体へ渡します。少しずつ渡したいなら `proxy_request_buffering off` を確かめてください。
 
+## ログ
+
+既定（`LOG_CHANNEL=daily`）では、標準出力に加えて `storage/logs/` に日ごとのテキストと SQLite を書きます。
+形と読み方は [logging.md](logging.md) にあります。
+
+| 気をつけること                   | 中身                                                                                 |
+|----------------------------------|--------------------------------------------------------------------------------------|
+| `storage/logs/` の空き容量       | 残すのは `LOG_DAILY_DAYS`（既定 14）日分です。アクセスが多いなら、1 日分の大きさを見て決めます |
+| 2 つのプロセスが同じファイルに書く | [2 つ動かす](#プロセスを-2-つ動かす)ときも、同じ `storage/logs/` に書いて構いません。行は混ざりません |
+| systemd などが標準出力も残す     | journald と `storage/logs/` の両方に同じ行が残ります。片方で足りるなら、journald に任せて `LOG_CHANNEL=stdout` にするか、ファイルだけ見るか決めます |
+| `storage/logs/` が無い           | 作りません。警告を出し、標準出力だけで動きます（`storage:init` で作る）                |
+| 日付は UTC                       | 日本時間では 9 時にファイルが変わります                                              |
+
+- 強制終了（2 回目の合図・SIGKILL）では、最後の 1 秒ほどのログが残らないことがあります。
+
 ## 常駐させる
 
 systemd の例です。
@@ -358,4 +373,5 @@ TimeoutStopSec=120
 
 - [configuration.md](configuration.md) — `.env` の項目
 - [artisan.md](artisan.md) — コマンドの一覧
+- [logging.md](logging.md) — ログ
 - [queue.md](queue.md) / [scheduling.md](scheduling.md) — 別のプロセスで動かすもの

@@ -42,6 +42,7 @@
 - `key:generate` は、本物の環境変数に `APP_KEY` があると警告します。そちらが優先され、`.env` に書いた鍵は使われないためです。
 - `about` は鍵そのものを出しません。`APP_KEY` は「あり／なし／短すぎる」で出します。
 - `about` のセッションとキャッシュは、実際に使う方式を出します（知らない名前なら `file`）。
+- `about` のログは、`LOG_CHANNEL` と `LOG_DAILY_DAYS` の実際の値と、SQLite に書けるか（機能フラグ `sqlite`）を出します（[logging.md](logging.md)）。
 
 ### データベース
 

@@ -267,6 +267,19 @@ CSRF は、別のサイトからの なりすまし送信のことです。
 
 くわしくは [websocket.md](websocket.md) にあります。
 
+## ログ
+
+| Laravel                                              | bengara                                                              |
+|------------------------------------------------------|----------------------------------------------------------------------|
+| `Log::warning('…', [...])`（`Log` ファサード）       | **`tracing::warn!(key = 値, "…")`**（`bengara::tracing`）            |
+| チャンネルは `stack`・`single`・`daily`・`slack` など | **`daily` と `stdout` だけ**（`LOG_CHANNEL`）。ほかは警告して `daily` |
+| 細かさは `LOG_LEVEL`                                 | **`RUST_LOG`**（`info,bengara::access=off` のように種類ごとにも）     |
+| 時刻は `config/app.php` の `timezone`                | **UTC だけ**。ファイルの日付も UTC                                    |
+| `laravel-YYYY-MM-DD.log`                             | 種類ごとに `access-`・`app-`・`metrics-YYYY-MM-DD.log`。行の形はアプリが Laravel と同じ |
+| ログを SQLite に残す仕組みは無い                     | **`logs-YYYY-MM-DD.sqlite`** にも同じ記録を書く（機能フラグ `sqlite`） |
+
+くわしくは [logging.md](logging.md) にあります。
+
 ## 本番で動かす
 
 | Laravel                                 | bengara                                                     |

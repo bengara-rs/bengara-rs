@@ -36,7 +36,9 @@ pub mod events;
 mod http;
 mod kernel_impl;
 pub mod lang;
+mod logging;
 pub mod mail;
+mod metrics;
 pub(crate) mod ops;
 mod paths;
 pub mod process;
@@ -51,6 +53,11 @@ pub mod view;
 pub mod websocket;
 
 pub mod testing;
+
+/// ファジングのための口（`cargo fuzz` が付ける `cfg(fuzzing)` のときだけ）。公開 API ではありません。
+#[cfg(fuzzing)]
+#[doc(hidden)]
+pub mod fuzzing;
 
 pub use application::{Application, ApplicationBuilder, Exceptions, Routing};
 pub use auth::{

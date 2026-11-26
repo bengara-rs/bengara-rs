@@ -50,6 +50,18 @@ struct Inner {
     /// 起動時に 1 つ作って使い回します。以前は 404 のたびに `Arc` を作っていました。
     /// `Inner` を強く持つと自分を指す輪になって解放されないので、`Weak` で持ちます。
     not_found: Arc<dyn ErasedHandler>,
+    /// 実際に登録した health のパス（`Routing::health`）。アクセスログで見分けます。
+    health: Option<Arc<str>>,
+}
+
+/// アクセスログに出す材料。ルートを引いた後でないと作れないものを返します。
+pub(crate) struct LogInfo {
+    /// 伏せた後の行き先（`server::log_target`）。
+    pub(crate) target: String,
+    /// 当たったルートの名前。
+    pub(crate) route: Option<Arc<str>>,
+    /// health のパスに当たったか。200 ならアクセスとして出しません。
+    pub(crate) health: bool,
 }
 
 /// エラーからレスポンスを作る関数。
@@ -117,23 +129,52 @@ impl Application {
         self.handle_logged(req, false).await.0
     }
 
-    /// 1本のリクエストを処理し、`log` が真ならアクセスログに出す行き先も返す。
+    /// 1本のリクエストを処理し、`log` が真ならアクセスログに出す材料も返す。
     ///
     /// 行き先はルートを引いた**直後**に作ります。パス引数の名前が分かってからでないと、
     /// `/reset/{token}` の値を伏せられないためです（`server::log_target`）。
     /// 共有の表には触らないので、ロックは増えません。
+    ///
+    /// **リクエスト ID はここで決めます**（本物の HTTP もテストも通る）。`server.rs` が受け取って
+    /// よい値を載せていればそれを、無ければ作ります。処理全体を ID の範囲で包むので、
+    /// 中で出たアプリのログに `req=` が付きます。応答には必ず `X-Request-Id` を付けます。
     pub(crate) async fn handle_logged(
         &self,
         mut req: Request,
         log: bool,
-    ) -> (Response, Option<String>) {
+    ) -> (Response, Option<LogInfo>) {
+        let id = match req.request_id_arc() {
+            Some(id) => id,
+            None => {
+                let id = crate::logging::request_id::generate();
+                req.set_request_id(id.clone());
+                id
+            }
+        };
+        let (response, info) =
+            crate::logging::request_id::scope(id.clone(), self.handle_inner(req, log)).await;
+        // ハンドラが付けていても上書きする（ログと同じ値にそろえる）。
+        let response = response.with_header(crate::logging::request_id::HEADER, id.to_string());
+        (response, info)
+    }
+
+    async fn handle_inner(&self, mut req: Request, log: bool) -> (Response, Option<LogInfo>) {
         let is_head = req.method() == "HEAD";
         let options = self.render_options(&req);
 
         // 共通ミドルウェアは、ルートに当たらなかったときも通します（Laravel と同じ）。
         // そのため、ここでは並びを1本だけ回し、分岐は最内側のハンドラに寄せます。
         let (inner, policy) = self.innermost(&mut req, &options);
-        let target = log.then(|| crate::server::log_target(&req));
+        let info = log.then(|| LogInfo {
+            target: crate::server::log_target(&req),
+            route: req.route_name_arc(),
+            health: req.route_matched()
+                && self
+                    .inner
+                    .health
+                    .as_deref()
+                    .is_some_and(|health| req.route_path() == Some(health)),
+        });
 
         // 本文はルートが決まってから受け取る。上限と読み方（全部・少しずつ）がルートごとだからです。
         // 受け取れなかったとき（413・400・408）は、ミドルウェアもハンドラも通さずに返します。
@@ -174,7 +215,7 @@ impl Application {
         // 全部の応答が通るここで落とします。
         (
             crate::http::response::without_forbidden_body(response),
-            target,
+            info,
         )
     }
 
@@ -185,7 +226,15 @@ impl Application {
         req: Request,
         options: RenderOptions,
     ) -> Response {
+        let id = req.request_id_arc();
         let future = Next::new(self.inner.global.clone(), inner, options.clone()).run(req);
+        // spawn すると task-local が切れるので、同じ ID で包み直す。
+        let future = async move {
+            match id {
+                Some(id) => crate::logging::request_id::scope(id, future).await,
+                None => future.await,
+            }
+        };
 
         // ミドルウェアとハンドラのパニックを1リクエストに閉じ込める。
         // 並びの一番外で包むので、共通ミドルウェアの中で起きたものも 500 になります。
@@ -201,6 +250,9 @@ impl Application {
             // ここの `Err` には来ませんが、型を合わせるために同じ関数を通します。
             Ok(result) => crate::http::response::render(result, options),
             Err(join_error) => {
+                if join_error.is_panic() {
+                    crate::metrics::record_panic();
+                }
                 let error = Error::msg(panic_message(join_error, options.debug));
                 tracing::error!("ハンドラがパニックしました: {error}");
                 error_response(&error, options)
@@ -509,6 +561,7 @@ impl ApplicationBuilder {
     /// - 登録していないミドルウェアの名前が使われている
     pub fn create(self) -> Application {
         let mut defs = self.routing.defs;
+        let mut health_path: Option<Arc<str>> = None;
         if let Some(path) = self.routing.health {
             // `path` は `Routing::health` が登録と同じ形にそろえてある（`register_path`）。
             // そろえずに比べると重なりに気づけず、`Routes::build` でパニックしていた。
@@ -519,6 +572,7 @@ impl ApplicationBuilder {
                 defs.extend(crate::http::routing::collect(|| {
                     crate::http::Route::get(&path, health);
                 }));
+                health_path = Some(Arc::from(path.as_str()));
             }
         }
         // 名前を実体に置き換え、ルートごとに1本の並びにして固定する。
@@ -577,6 +631,7 @@ impl ApplicationBuilder {
                     max_body: crate::http::body::max_body_from_env(),
                     exceptions,
                     not_found,
+                    health: health_path,
                 }
             }),
         }
@@ -698,23 +753,174 @@ mod tests {
             .create();
 
         let req = Request::new("GET", "/reset/abc123").with_query("email=a%40b&signature=x");
-        let (response, target) = app.handle_logged(req, true).await;
+        let (response, info) = app.handle_logged(req, true).await;
         assert_eq!(response.status(), 200);
         assert_eq!(
-            target.as_deref(),
+            info.map(|info| info.target).as_deref(),
             Some("/reset/***?email=a%40b&signature=***")
         );
 
         // 当たらなかったパスは、届いたパスのまま（クエリだけ伏せる）。
         let req = Request::new("GET", "/missing/abc").with_query("token=x");
-        let (_, target) = app.handle_logged(req, true).await;
-        assert_eq!(target.as_deref(), Some("/missing/abc?token=***"));
+        let (_, info) = app.handle_logged(req, true).await;
+        assert_eq!(
+            info.map(|info| info.target).as_deref(),
+            Some("/missing/abc?token=***")
+        );
 
         // ログを出さないときは作らない。
-        let (_, target) = app
+        let (_, info) = app
             .handle_logged(Request::new("GET", "/reset/abc123"), false)
             .await;
-        assert_eq!(target, None);
+        assert!(info.is_none());
+    }
+
+    #[tokio::test]
+    async fn healthのパスとルート名をログの材料に返す() {
+        let app = Application::configure()
+            .with_routing(|r| {
+                r.web(|| {
+                    Route::get("/items", ok).name("items.index");
+                })
+                .health("/up")
+            })
+            .create();
+
+        let (response, info) = app.handle_logged(Request::new("GET", "/up"), true).await;
+        assert_eq!(response.status(), 200);
+        let info = info.unwrap();
+        assert!(info.health);
+        assert_eq!(info.route, None);
+
+        let (_, info) = app.handle_logged(Request::new("GET", "/items"), true).await;
+        let info = info.unwrap();
+        assert!(!info.health);
+        assert_eq!(info.route.as_deref(), Some("items.index"));
+
+        // 当たらなかったものは health ではない。
+        let (_, info) = app.handle_logged(Request::new("GET", "/upx"), true).await;
+        assert!(!info.unwrap().health);
+    }
+
+    #[tokio::test]
+    async fn healthを飛ばしたときは利用者のルートをhealthと見ない() {
+        let app = Application::configure()
+            .with_routing(|r| {
+                r.web(|| {
+                    Route::get("/up", ok);
+                })
+                .health("/up")
+            })
+            .create();
+        let (_, info) = app.handle_logged(Request::new("GET", "/up"), true).await;
+        assert!(!info.unwrap().health);
+    }
+
+    #[tokio::test]
+    async fn どの応答にもリクエストidが付く() {
+        async fn boom() -> crate::error::Result<Response> {
+            panic!("わざと");
+        }
+        async fn own_id() -> crate::error::Result<Response> {
+            Ok(Response::text("x").with_header("x-request-id", "handler"))
+        }
+        let app = Application::configure()
+            .with_middleware(|m| m.append(Csrf))
+            .with_routing(|r| {
+                r.web(|| {
+                    Route::get("/", ok);
+                    Route::get("/boom", boom);
+                    Route::get("/own", own_id);
+                    Route::post("/small", ok).max_body(4);
+                    Route::post("/guarded", ok);
+                })
+            })
+            .create();
+
+        let cases = [
+            Request::new("GET", "/"),
+            Request::new("GET", "/missing"),
+            Request::new("DELETE", "/"),
+            Request::new("GET", "/boom"),
+            Request::new("GET", "/own"),
+            Request::new("POST", "/small").with_pending_body(
+                crate::http::body::PendingBody::memory(b"too large body".to_vec()),
+            ),
+            Request::new("POST", "/guarded"),
+        ];
+        let mut seen = std::collections::HashSet::new();
+        for req in cases {
+            let label = format!("{} {}", req.method(), req.path());
+            let response = app.handle(req).await;
+            let id = response
+                .header("x-request-id")
+                .unwrap_or_else(|| panic!("{label}: {}", response.status()))
+                .to_string();
+            assert_eq!(id.len(), 32, "{label}: {id}");
+            assert!(seen.insert(id), "{label}");
+        }
+    }
+
+    /// 書き込みの要求を 419 で止める（テスト用の CSRF の代わり）。
+    struct Csrf;
+
+    impl Middleware for Csrf {
+        fn handle(&self, req: Request, next: Next) -> crate::http::BoxFuture {
+            Box::pin(async move {
+                if req.method() == "POST" && req.path() == "/guarded" {
+                    return Err(Error::http(419, ""));
+                }
+                next.run(req).await
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn 受け取ったidはそのまま返す() {
+        let app = Application::configure()
+            .with_routing(|r| {
+                r.web(|| {
+                    Route::get("/", ok);
+                })
+            })
+            .create();
+        let mut req = Request::new("GET", "/");
+        req.set_request_id(Arc::from("from-proxy.1"));
+        let response = app.handle(req).await;
+        assert_eq!(response.header("x-request-id"), Some("from-proxy.1"));
+    }
+
+    #[tokio::test]
+    async fn ハンドラの中のログにidが付きspawnの後でも同じ() {
+        use crate::logging::{layer::LogLayer, stdout::Stdout, Outputs};
+        use tracing_subscriber::prelude::*;
+
+        async fn warns(req: Request) -> crate::error::Result<Response> {
+            tracing::warn!("ハンドラの中");
+            Ok(Response::text(req.request_id().to_string()))
+        }
+        let app = Application::configure()
+            .with_routing(|r| {
+                r.web(|| {
+                    Route::get("/", warns);
+                })
+            })
+            .create();
+
+        let buffer = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let outputs = Arc::new(Outputs::new(
+            Stdout::capture(buffer.clone()),
+            false,
+            "testing".into(),
+        ));
+        let subscriber = tracing_subscriber::registry().with(LogLayer::new(outputs));
+        // `#[tokio::test]` は 1 スレッドなので、spawn した先も同じ購読者を使う。
+        let _guard = tracing::subscriber::set_default(subscriber);
+        let response = app.handle(Request::new("GET", "/")).await;
+        let id = response.header("x-request-id").unwrap().to_string();
+        assert_eq!(std::str::from_utf8(response.body()).unwrap(), id);
+        let text = String::from_utf8(buffer.lock().unwrap().clone()).unwrap();
+        assert!(text.contains(&format!("ハンドラの中 req={id}")), "{text}");
     }
 
     #[tokio::test]

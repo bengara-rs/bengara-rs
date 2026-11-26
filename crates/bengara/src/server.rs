@@ -40,11 +40,15 @@ pub(crate) fn serve(app: Application, host: &str, port: u16) -> Result<()> {
             "bengara: http://{} で待ち受けます（Ctrl+C で終了）",
             display_addr(local)
         );
+        // ここから先の標準出力のログは、裏のスレッドで書く（上の行と順番が入れ替わらない）。
+        crate::logging::start_stdout_background();
 
         // WebSocket の状態（停止の合図・同時接続の数）。切り替えた後の接続は
         // axum の停止の待ちに入らないので、bengara が自分で数えて待つ。
         let sockets = crate::websocket::ServerState::from_env();
         let router = router(app, sockets.clone());
+        // メトリクスを 60 秒ごとに出す。止めるときは、ランタイムと一緒に終わる。
+        tokio::spawn(crate::metrics::watch(local.port(), sockets.clone()));
 
         // 配信のために「このプロセスはサーバー」と覚え、database なら中継を立てる。
         crate::broadcast::mark_server();
@@ -103,6 +107,8 @@ pub(crate) fn serve(app: Application, host: &str, port: u16) -> Result<()> {
     })?;
 
     finish(runtime, cut_off, CUT_OFF_GRACE);
+    // 裏で書いているログを先に書き切る（「終了しました」と順番を入れ替えない）。
+    crate::logging::flush_stdout();
     println!("bengara: 終了しました");
     Ok(())
 }
@@ -197,6 +203,10 @@ async fn dispatch(
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
     request: axum::extract::Request,
 ) -> axum::response::Response {
+    // 処理中の数。切断で future が落ちても、パニックしても戻る。
+    let _inflight = crate::metrics::Inflight::enter();
+    let started = std::time::Instant::now();
+
     #[cfg_attr(not(feature = "websocket"), allow(unused_mut))]
     let (mut parts, body) = request.into_parts();
 
@@ -239,11 +249,24 @@ async fn dispatch(
         })
         .collect();
 
-    let req = Request::new(parts.method.as_str(), parts.uri.path())
+    let mut req = Request::new(parts.method.as_str(), parts.uri.path())
         .with_query(parts.uri.query().unwrap_or_default())
         .with_headers(headers)
         .with_pending_body(crate::http::body::PendingBody::incoming(body))
         .with_remote_addr(peer);
+    // 前段のプロキシ（`TRUSTED_PROXIES` で信頼したもの）が付けてきた ID は、形が正しければ使う。
+    // 無ければ `Application::handle_logged` が作る。
+    let forwarded_id = crate::logging::request_id::accepted(
+        parts
+            .headers
+            .get_all(crate::logging::request_id::HEADER)
+            .iter()
+            .filter_map(|value| value.to_str().ok()),
+        crate::http::throttle::trusts_peer(peer.ip()),
+    );
+    if let Some(id) = forwarded_id {
+        req.set_request_id(std::sync::Arc::from(id));
+    }
     #[cfg(feature = "websocket")]
     let req = match handoff {
         Some(handoff) => req.with_upgrade(handoff),
@@ -251,25 +274,82 @@ async fn dispatch(
     };
 
     // アクセスログに出す文字列は、ログが有効なときだけ作る。
-    // `RUST_LOG=warn` で動かしているときに、リクエストごとの確保を 2 本減らせます。
-    let logging = tracing::enabled!(tracing::Level::INFO);
-    let started = std::time::Instant::now();
-    let method = logging.then(|| req.method().to_string());
+    // `RUST_LOG=warn` や `bengara::access=off` で動かしているときに、確保を減らせます。
+    let logging = tracing::enabled!(
+        target: crate::logging::layer::ACCESS_TARGET,
+        tracing::Level::INFO
+    );
+    let access = logging.then(|| AccessHead {
+        method: req.method().to_string(),
+        protocol: protocol_label(parts.version),
+        ip: crate::http::throttle::client_ip(&req).map(|ip| ip.to_string()),
+        user_agent: req
+            .header("user-agent")
+            .map(|ua| crate::logging::format::truncate_utf8(ua, USER_AGENT_MAX).to_string()),
+    });
     // 行き先はルートを引いた**あと**で作る（`Application::handle_logged`）。
     // パス引数の名前が分からないと、`/reset/{token}` の値を伏せられないためです。
-    let (response, target) = app.handle_logged(req, logging).await;
+    let (response, info) = app.handle_logged(req, logging).await;
+    let request_id = response
+        .header(crate::logging::request_id::HEADER)
+        .unwrap_or_default()
+        .to_string();
     // 101 なら WebSocket の接続を動かすタスクを立てる（切り替えが載っていなければ 500 に直す）。
     // ログより先に呼ぶのは、直した後のステータスを残すためです。
     let response = crate::websocket::after_response(response, wants_json);
-    if let (Some(method), Some(target)) = (method, target) {
-        tracing::info!(
-            "{method} {target} -> {} ({} ms)",
-            response.status(),
-            started.elapsed().as_millis()
-        );
+    // 作り直した応答（101 → 500）にも ID を付ける。
+    let response = if response
+        .header(crate::logging::request_id::HEADER)
+        .is_none()
+    {
+        response.with_header(crate::logging::request_id::HEADER, request_id.clone())
+    } else {
+        response
+    };
+    let elapsed = started.elapsed();
+    crate::metrics::record(response.status(), elapsed);
+    if let (Some(access), Some(info)) = (access, info) {
+        // health の 200 は出さない（ロードバランサーの確認で埋まるため）。200 以外は出す。
+        if !(info.health && response.status() == 200) {
+            tracing::info!(
+                target: crate::logging::layer::ACCESS_TARGET,
+                method = access.method.as_str(),
+                path = info.target.as_str(),
+                protocol = access.protocol,
+                status = u64::from(response.status()),
+                bytes = response.body().len() as u64,
+                duration_us = u64::try_from(elapsed.as_micros()).unwrap_or(u64::MAX),
+                ip = access.ip.as_deref(),
+                user_agent = access.user_agent.as_deref(),
+                route = info.route.as_deref(),
+                request_id = request_id.as_str(),
+            );
+        }
     }
 
     into_axum(response)
+}
+
+/// アクセスログの User-Agent の上限（バイト）。
+const USER_AGENT_MAX: usize = 512;
+
+/// アクセスログの材料のうち、`Request` を渡す前に取っておくもの。
+struct AccessHead {
+    method: String,
+    protocol: &'static str,
+    ip: Option<String>,
+    user_agent: Option<String>,
+}
+
+/// リクエストの HTTP の版。
+fn protocol_label(version: axum::http::Version) -> &'static str {
+    match version {
+        axum::http::Version::HTTP_09 => "HTTP/0.9",
+        axum::http::Version::HTTP_10 => "HTTP/1.0",
+        axum::http::Version::HTTP_2 => "HTTP/2.0",
+        axum::http::Version::HTTP_3 => "HTTP/3.0",
+        _ => "HTTP/1.1",
+    }
 }
 
 /// ログに出す行き先。クエリは残すが、秘密になりうる値は伏せる。

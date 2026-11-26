@@ -196,6 +196,65 @@ pub(crate) fn format_timestamp(seconds: i64) -> String {
     format!("{year:04}-{month:02}-{day:02} {hour:02}:{minute:02}:{second:02}")
 }
 
+/// UNIX 時刻（ミリ秒）を `YYYY-MM-DDTHH:MM:SS.mmmZ`（UTC）にする。ログの時刻に使います。
+pub(crate) fn format_iso8601_millis(millis: i64) -> String {
+    let seconds = millis.div_euclid(1_000);
+    let fraction = millis.rem_euclid(1_000);
+    let days = seconds.div_euclid(86_400);
+    let rest = seconds.rem_euclid(86_400);
+    let (year, month, day) = civil_from_days(days);
+    format!(
+        "{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}.{fraction:03}Z",
+        rest / 3_600,
+        (rest % 3_600) / 60,
+        rest % 60
+    )
+}
+
+/// UNIX 時刻（ミリ秒）を nginx のアクセスログの時刻（`26/Nov/2026:02:51:00 +0000`）にする。
+///
+/// 月は英語の 3 文字です。時差は常に `+0000`（UTC）です。
+pub(crate) fn format_clf(millis: i64) -> String {
+    const MONTHS: [&str; 12] = [
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+    ];
+    let seconds = millis.div_euclid(1_000);
+    let days = seconds.div_euclid(86_400);
+    let rest = seconds.rem_euclid(86_400);
+    let (year, month, day) = civil_from_days(days);
+    let name = MONTHS
+        .get(month.saturating_sub(1) as usize)
+        .copied()
+        .unwrap_or("Jan");
+    format!(
+        "{day:02}/{name}/{year:04}:{:02}:{:02}:{:02} +0000",
+        rest / 3_600,
+        (rest % 3_600) / 60,
+        rest % 60
+    )
+}
+
+/// 1970-01-01 からの日数を `YYYY-MM-DD` にする。ログのファイル名に使います。
+pub(crate) fn format_date(days: i64) -> String {
+    let (year, month, day) = civil_from_days(days);
+    format!("{year:04}-{month:02}-{day:02}")
+}
+
+/// `YYYY-MM-DD` を 1970-01-01 からの日数に戻す。桁がちょうどで、実在する日付だけを読みます。
+pub(crate) fn parse_date(text: &str) -> Option<i64> {
+    let bytes = text.as_bytes();
+    if bytes.len() != 10 || bytes[4] != b'-' || bytes[7] != b'-' {
+        return None;
+    }
+    let year: i64 = fixed_digits(&text[..4], 4)?.parse().ok()?;
+    let month: u32 = fixed_digits(&text[5..7], 2)?.parse().ok()?;
+    let day: u32 = fixed_digits(&text[8..], 2)?.parse().ok()?;
+    if !(1..=12).contains(&month) || day == 0 || day > days_in_month(year, month) {
+        return None;
+    }
+    Some(days_from_civil(year, month, day))
+}
+
 /// 1970-01-01 からの日数を、年・月・日に直す。
 ///
 /// Howard Hinnant の `civil_from_days` と同じ手順です。
@@ -424,5 +483,55 @@ mod tests {
         assert_eq!(now.as_bytes()[4], b'-');
         assert_eq!(now.as_bytes()[10], b' ');
         assert!(now.starts_with("20"));
+    }
+
+    fn millis_of(year: i64, month: u32, day: u32, h: i64, m: i64, s: i64, ms: i64) -> i64 {
+        (days_from_civil(year, month, day) * 86_400 + h * 3_600 + m * 60 + s) * 1_000 + ms
+    }
+
+    #[test]
+    fn ログの時刻はミリ秒までのutc() {
+        let at = millis_of(2026, 11, 26, 2, 51, 0, 123);
+        assert_eq!(format_iso8601_millis(at), "2026-11-26T02:51:00.123Z");
+        assert_eq!(format_iso8601_millis(0), "1970-01-01T00:00:00.000Z");
+        // 1970 年より前も、端数を正しく繰り下げる。
+        assert_eq!(format_iso8601_millis(-1), "1969-12-31T23:59:59.999Z");
+    }
+
+    #[test]
+    fn nginxの時刻は英語の月と時差0() {
+        let at = millis_of(2026, 11, 26, 2, 51, 0, 999);
+        assert_eq!(format_clf(at), "26/Nov/2026:02:51:00 +0000");
+        assert_eq!(
+            format_clf(millis_of(2026, 1, 5, 23, 0, 9, 0)),
+            "05/Jan/2026:23:00:09 +0000"
+        );
+    }
+
+    #[test]
+    fn 日付の文字列と日数を行き来できる() {
+        let days = days_from_civil(2026, 11, 26);
+        assert_eq!(format_date(days), "2026-11-26");
+        assert_eq!(parse_date("2026-11-26"), Some(days));
+        assert_eq!(parse_date("2024-02-29"), Some(days_from_civil(2024, 2, 29)));
+    }
+
+    #[test]
+    fn 崩れた日付は読まない() {
+        for text in [
+            "2026-1-1",
+            "2026-01-1",
+            "26-01-01",
+            "2026/01/01",
+            "2026-13-01",
+            "2026-02-29",
+            "2026-04-31",
+            "2026-00-10",
+            "2026-01-00",
+            "+026-01-01",
+            "2026-01-01x",
+        ] {
+            assert_eq!(parse_date(text), None, "{text}");
+        }
     }
 }

@@ -170,7 +170,7 @@ app/Jobs/
 | `storage/framework/cache`    | キャッシュ                  |
 | `storage/framework/schedule` | 定期処理の前回の時刻        |
 | `storage/framework/sessions` | セッション                  |
-| `storage/logs`               | メールのログ（`mail.log`）  |
+| `storage/logs`               | ログ（`access-`・`app-`・`metrics-YYYY-MM-DD.log`、`logs-YYYY-MM-DD.sqlite`。[logging.md](logging.md)）とメールのログ（`mail.log`） |
 
 - 手元では `cargo run -- init` が作ります。本番では `./myapp storage:init` を 1 回流します。
 - どちらも、作ったディレクトリを Unix では所有者だけ（0700）にします。すでにあるものには触りません。

@@ -43,6 +43,7 @@
   | WebSocket の接続の表            | `websocket/registry.rs`                                         | 接続・切断・join・leave で書き、publish・local_count で読む。送るのは放してから（接続とチャンネルはリクエスト処理中に増減するため） |
   | パスワードの計算の同時数        | `auth/hashing.rs`                                               | `Semaphore` の permit。計算の間だけ持つ。リクエストの処理中はパスワードを計算するときだけ取る                                       |
 - **実装していない機能をドキュメントに書かない。** 将来の話は `docs/backlog.md` だけに書く。
+- **利用者に見える変更は `CHANGELOG.md` の `[Unreleased]` に書く。** 版の付け方は `docs/releases.md`。
 - 依存クレートを安易に増やさない。入れる前に自前で書けないか考える。
 - `panic = "abort"` にしない。ハンドラのパニックは 1 リクエストに閉じ込めて 500 を返す。
 
@@ -55,6 +56,29 @@ cargo test --workspace
 ```
 
 - 変更を入れたら 3 つすべてを通す。clippy の警告は 0 を保つ。
+
+依存の脆弱性・許諾の検査（CI の `security.yml` と同じ）：
+
+```sh
+cargo deny check   # 設定は deny.toml
+cargo audit        # 無視するものは .cargo/audit.toml（deny.toml とそろえる）
+```
+
+- 無視の一覧（`ignore`）には、mao さんの了承なしに足さない。
+
+ファジング（`fuzz/`。nightly の Rust と `cargo install cargo-fuzz` が要る）：
+
+```sh
+cd fuzz
+cargo +nightly fuzz build                                  # 全部のターゲットをビルドする
+cargo +nightly fuzz run percent -- -max_total_time=600     # 1 つを 10 分回す
+cargo +nightly fuzz run multipart -- -max_total_time=600 -max_len=65536
+```
+
+- ターゲットは `multipart` `cookie_header` `percent` `dotenv` `cargo_toml` `lang_toml` `crypto` `log_line`。
+- 内部の関数は `cfg(fuzzing)` のときだけある `bengara::fuzzing` / `bengara_build::fuzzing` から呼ぶ（公開 API ではない）。
+- Windows では ASan の DLL（`clang_rt.asan_dynamic-x86_64.dll`。Visual Studio の `VC\Tools\MSVC\<版>\bin\Hostx64\x64`）を `PATH` に足す。
+- 見つかった不具合は、最小の入力を通常のテストに回帰テストとして足してから直す。
 
 ## ドキュメントの置き場所
 

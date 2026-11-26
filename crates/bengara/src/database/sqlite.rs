@@ -363,6 +363,413 @@ fn try_in_order(row: &SqliteRow, index: usize, name: &str, type_name: &str) -> R
     Err(super::failure::unsupported_column(name, type_name))
 }
 
+// ---------------------------------------------------------------------------
+// ログの SQLite（`storage/logs/logs-YYYY-MM-DD.sqlite`）
+// ---------------------------------------------------------------------------
+
+/// ログの表の版（`PRAGMA user_version`）。表を変えたら上げます（壊す変更）。
+const LOG_SCHEMA_VERSION: i64 = 1;
+
+/// ログの表。列の順はメトリクスの logfmt の鍵の順と同じです（`id` を除く）。
+const LOG_SCHEMA: &[&str] = &[
+    "CREATE TABLE IF NOT EXISTS access (
+        id          INTEGER PRIMARY KEY,
+        time        TEXT    NOT NULL,
+        request_id  TEXT    NOT NULL,
+        ip          TEXT,
+        method      TEXT    NOT NULL,
+        path        TEXT    NOT NULL,
+        protocol    TEXT    NOT NULL,
+        status      INTEGER NOT NULL,
+        bytes       INTEGER NOT NULL,
+        duration_us INTEGER NOT NULL,
+        route       TEXT,
+        user_agent  TEXT,
+        pid         INTEGER NOT NULL
+    )",
+    "CREATE INDEX IF NOT EXISTS access_request_id ON access (request_id)",
+    "CREATE TABLE IF NOT EXISTS app (
+        id         INTEGER PRIMARY KEY,
+        time       TEXT    NOT NULL,
+        level      TEXT    NOT NULL,
+        target     TEXT    NOT NULL,
+        message    TEXT    NOT NULL,
+        context    TEXT    NOT NULL,
+        request_id TEXT,
+        pid        INTEGER NOT NULL
+    )",
+    "CREATE INDEX IF NOT EXISTS app_request_id ON app (request_id)",
+    "CREATE INDEX IF NOT EXISTS app_level ON app (level)",
+    "CREATE TABLE IF NOT EXISTS metrics (
+        id               INTEGER PRIMARY KEY,
+        time             TEXT    NOT NULL,
+        pid              INTEGER NOT NULL,
+        port             INTEGER NOT NULL,
+        uptime_seconds   INTEGER NOT NULL,
+        requests         INTEGER NOT NULL,
+        status_1xx       INTEGER NOT NULL,
+        status_2xx       INTEGER NOT NULL,
+        status_3xx       INTEGER NOT NULL,
+        status_4xx       INTEGER NOT NULL,
+        status_5xx       INTEGER NOT NULL,
+        status_408       INTEGER NOT NULL,
+        status_413       INTEGER NOT NULL,
+        status_419       INTEGER NOT NULL,
+        status_429       INTEGER NOT NULL,
+        p50_ms           REAL,
+        p95_ms           REAL,
+        p99_ms           REAL,
+        max_ms           REAL,
+        inflight         INTEGER NOT NULL,
+        panics           INTEGER NOT NULL,
+        websockets       INTEGER,
+        dropped          INTEGER NOT NULL,
+        rss_bytes        INTEGER,
+        cpu_percent      REAL,
+        disk_free_bytes  INTEGER,
+        disk_total_bytes INTEGER
+    )",
+];
+
+const ACCESS_COLUMNS: &[&str] = &[
+    "time",
+    "request_id",
+    "ip",
+    "method",
+    "path",
+    "protocol",
+    "status",
+    "bytes",
+    "duration_us",
+    "route",
+    "user_agent",
+    "pid",
+];
+const APP_COLUMNS: &[&str] = &[
+    "time",
+    "level",
+    "target",
+    "message",
+    "context",
+    "request_id",
+    "pid",
+];
+const METRICS_COLUMNS: &[&str] = &[
+    "time",
+    "pid",
+    "port",
+    "uptime_seconds",
+    "requests",
+    "status_1xx",
+    "status_2xx",
+    "status_3xx",
+    "status_4xx",
+    "status_5xx",
+    "status_408",
+    "status_413",
+    "status_419",
+    "status_429",
+    "p50_ms",
+    "p95_ms",
+    "p99_ms",
+    "max_ms",
+    "inflight",
+    "panics",
+    "websockets",
+    "dropped",
+    "rss_bytes",
+    "cpu_percent",
+    "disk_free_bytes",
+    "disk_total_bytes",
+];
+
+/// 1 文の INSERT に入れる行の上限。
+const LOG_ROWS_PER_STATEMENT: usize = 512;
+
+/// ログの SQLite の 1 ファイル。書き手のスレッドが 1 つだけ持ちます。
+///
+/// 上の層（`logging/sqlite.rs`）には文字列と数の行（`AccessRow` など）だけを受け取ります。
+pub(crate) struct LogStore {
+    conn: sqlx::SqliteConnection,
+}
+
+impl LogStore {
+    /// 開く。無ければ作り、表の版が 0 なら表を作って 1 にします。
+    ///
+    /// 版が 1 より大きい（新しい版の bengara が作った）ファイルには書きません。
+    pub(crate) async fn open(path: &std::path::Path) -> Result<Self> {
+        let mut conn = Self::connect(path).await?;
+        let version = Self::read_version(&mut conn).await?;
+        if version > LOG_SCHEMA_VERSION {
+            return Err(Error::msg(format!(
+                "表の版が {version} です（この bengara は {LOG_SCHEMA_VERSION} まで）。新しい版の bengara が作ったファイルなので書きません"
+            )));
+        }
+        if version < LOG_SCHEMA_VERSION {
+            // 2 つのプロセスが同時に作っても重ならないよう、書き込みの権利を取ってから見直す。
+            let mut tx = sqlx::Connection::begin_with(&mut conn, BEGIN)
+                .await
+                .map_err(|e| Error::msg(format!("ログの表を作れません: {e}")))?;
+            let current: i64 = sqlx::query_scalar("PRAGMA user_version")
+                .fetch_one(&mut *tx)
+                .await
+                .map_err(|e| Error::msg(format!("ログの表の版を読めません: {e}")))?;
+            if current < LOG_SCHEMA_VERSION {
+                for statement in LOG_SCHEMA {
+                    sqlx::query(statement)
+                        .execute(&mut *tx)
+                        .await
+                        .map_err(|e| Error::msg(format!("ログの表を作れません: {e}")))?;
+                }
+                sqlx::query(&format!("PRAGMA user_version = {LOG_SCHEMA_VERSION}"))
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(|e| Error::msg(format!("ログの表の版を書けません: {e}")))?;
+            }
+            tx.commit()
+                .await
+                .map_err(|e| Error::msg(format!("ログの表を作れません: {e}")))?;
+        }
+        Ok(Self { conn })
+    }
+
+    async fn connect(path: &std::path::Path) -> Result<sqlx::SqliteConnection> {
+        use sqlx::ConnectOptions as _;
+        SqliteConnectOptions::new()
+            .filename(path)
+            .create_if_missing(true)
+            .journal_mode(SqliteJournalMode::Wal)
+            .synchronous(sqlx::sqlite::SqliteSynchronous::Normal)
+            .busy_timeout(Duration::from_secs(5))
+            // ログを書く文そのものをログに出さない（輪になる）。
+            .disable_statement_logging()
+            .connect()
+            .await
+            .map_err(|e| Error::msg(format!("ログの SQLite を開けません: {e}")))
+    }
+
+    async fn read_version(conn: &mut sqlx::SqliteConnection) -> Result<i64> {
+        sqlx::query_scalar("PRAGMA user_version")
+            .fetch_one(&mut *conn)
+            .await
+            .map_err(|e| Error::msg(format!("ログの表の版を読めません: {e}")))
+    }
+
+    /// まとめた行を、`BEGIN IMMEDIATE` 〜 `COMMIT` の 1 回で書く。
+    pub(crate) async fn write(&mut self, rows: &[&crate::logging::sqlite::Row]) -> Result<()> {
+        use crate::logging::sqlite::Row;
+
+        let accesses: Vec<_> = rows
+            .iter()
+            .filter_map(|row| match row {
+                Row::Access(row) => Some(row),
+                _ => None,
+            })
+            .collect();
+        let apps: Vec<_> = rows
+            .iter()
+            .filter_map(|row| match row {
+                Row::App(row) => Some(row),
+                _ => None,
+            })
+            .collect();
+        let metrics: Vec<_> = rows
+            .iter()
+            .filter_map(|row| match row {
+                Row::Metrics(row) => Some(row),
+                _ => None,
+            })
+            .collect();
+
+        let fail = |e: sqlx::Error| Error::msg(format!("ログの SQLite に書けません: {e}"));
+        let mut tx = sqlx::Connection::begin_with(&mut self.conn, BEGIN)
+            .await
+            .map_err(fail)?;
+        for chunk in accesses.chunks(LOG_ROWS_PER_STATEMENT) {
+            let sql = insert_sql("access", ACCESS_COLUMNS, chunk.len());
+            let mut query = sqlx::query(&sql);
+            for row in chunk {
+                query = query
+                    .bind(&row.time)
+                    .bind(&row.request_id)
+                    .bind(&row.ip)
+                    .bind(&row.method)
+                    .bind(&row.path)
+                    .bind(&row.protocol)
+                    .bind(row.status)
+                    .bind(row.bytes)
+                    .bind(row.duration_us)
+                    .bind(&row.route)
+                    .bind(&row.user_agent)
+                    .bind(row.pid);
+            }
+            query.execute(&mut *tx).await.map_err(fail)?;
+        }
+        for chunk in apps.chunks(LOG_ROWS_PER_STATEMENT) {
+            let sql = insert_sql("app", APP_COLUMNS, chunk.len());
+            let mut query = sqlx::query(&sql);
+            for row in chunk {
+                query = query
+                    .bind(&row.time)
+                    .bind(&row.level)
+                    .bind(&row.target)
+                    .bind(&row.message)
+                    .bind(&row.context)
+                    .bind(&row.request_id)
+                    .bind(row.pid);
+            }
+            query.execute(&mut *tx).await.map_err(fail)?;
+        }
+        for chunk in metrics.chunks(LOG_ROWS_PER_STATEMENT) {
+            let sql = insert_sql("metrics", METRICS_COLUMNS, chunk.len());
+            let mut query = sqlx::query(&sql);
+            for row in chunk {
+                query = query
+                    .bind(&row.time)
+                    .bind(row.pid)
+                    .bind(row.port)
+                    .bind(row.uptime_seconds)
+                    .bind(row.requests)
+                    .bind(row.status_1xx)
+                    .bind(row.status_2xx)
+                    .bind(row.status_3xx)
+                    .bind(row.status_4xx)
+                    .bind(row.status_5xx)
+                    .bind(row.status_408)
+                    .bind(row.status_413)
+                    .bind(row.status_419)
+                    .bind(row.status_429)
+                    .bind(row.p50_ms)
+                    .bind(row.p95_ms)
+                    .bind(row.p99_ms)
+                    .bind(row.max_ms)
+                    .bind(row.inflight)
+                    .bind(row.panics)
+                    .bind(row.websockets)
+                    .bind(row.dropped)
+                    .bind(row.rss_bytes)
+                    .bind(row.cpu_percent)
+                    .bind(row.disk_free_bytes)
+                    .bind(row.disk_total_bytes);
+            }
+            query.execute(&mut *tx).await.map_err(fail)?;
+        }
+        // 途中で失敗したら、`tx` を落とすと巻き戻る。
+        tx.commit().await.map_err(fail)
+    }
+}
+
+/// 複数行の INSERT（`insert into t (a, b) values (?, ?), (?, ?)`）。
+fn insert_sql(table: &str, columns: &[&str], rows: usize) -> String {
+    let one = format!("({})", vec!["?"; columns.len()].join(", "));
+    format!(
+        "INSERT INTO {table} ({}) VALUES {}",
+        columns.join(", "),
+        vec![one.as_str(); rows].join(", ")
+    )
+}
+
+/// テストで中身を確かめる口。
+#[cfg(test)]
+impl LogStore {
+    pub(crate) async fn user_version(path: &std::path::Path) -> Result<i64> {
+        let mut conn = Self::connect(path).await?;
+        Self::read_version(&mut conn).await
+    }
+
+    pub(crate) async fn set_user_version(path: &std::path::Path, version: i64) -> Result<()> {
+        let mut conn = Self::connect(path).await?;
+        sqlx::query(&format!("PRAGMA user_version = {version}"))
+            .execute(&mut conn)
+            .await
+            .map(|_| ())
+            .map_err(|e| Error::msg(e.to_string()))
+    }
+
+    #[allow(clippy::type_complexity)]
+    pub(crate) async fn read_all(
+        path: &std::path::Path,
+    ) -> Result<(
+        Vec<crate::logging::sqlite::AccessRow>,
+        Vec<crate::logging::sqlite::AppRow>,
+        Vec<crate::logging::sqlite::MetricsRow>,
+    )> {
+        use crate::logging::sqlite::{AccessRow, AppRow, MetricsRow};
+        let mut conn = Self::connect(path).await?;
+        let fail = |e: sqlx::Error| Error::msg(e.to_string());
+        let accesses = sqlx::query("SELECT * FROM access ORDER BY id")
+            .fetch_all(&mut conn)
+            .await
+            .map_err(fail)?
+            .iter()
+            .map(|r| AccessRow {
+                time: r.get("time"),
+                request_id: r.get("request_id"),
+                ip: r.get("ip"),
+                method: r.get("method"),
+                path: r.get("path"),
+                protocol: r.get("protocol"),
+                status: r.get("status"),
+                bytes: r.get("bytes"),
+                duration_us: r.get("duration_us"),
+                route: r.get("route"),
+                user_agent: r.get("user_agent"),
+                pid: r.get("pid"),
+            })
+            .collect();
+        let apps = sqlx::query("SELECT * FROM app ORDER BY id")
+            .fetch_all(&mut conn)
+            .await
+            .map_err(fail)?
+            .iter()
+            .map(|r| AppRow {
+                time: r.get("time"),
+                level: r.get("level"),
+                target: r.get("target"),
+                message: r.get("message"),
+                context: r.get("context"),
+                request_id: r.get("request_id"),
+                pid: r.get("pid"),
+            })
+            .collect();
+        let metrics = sqlx::query("SELECT * FROM metrics ORDER BY id")
+            .fetch_all(&mut conn)
+            .await
+            .map_err(fail)?
+            .iter()
+            .map(|r| MetricsRow {
+                time: r.get("time"),
+                pid: r.get("pid"),
+                port: r.get("port"),
+                uptime_seconds: r.get("uptime_seconds"),
+                requests: r.get("requests"),
+                status_1xx: r.get("status_1xx"),
+                status_2xx: r.get("status_2xx"),
+                status_3xx: r.get("status_3xx"),
+                status_4xx: r.get("status_4xx"),
+                status_5xx: r.get("status_5xx"),
+                status_408: r.get("status_408"),
+                status_413: r.get("status_413"),
+                status_419: r.get("status_419"),
+                status_429: r.get("status_429"),
+                p50_ms: r.get("p50_ms"),
+                p95_ms: r.get("p95_ms"),
+                p99_ms: r.get("p99_ms"),
+                max_ms: r.get("max_ms"),
+                inflight: r.get("inflight"),
+                panics: r.get("panics"),
+                websockets: r.get("websockets"),
+                dropped: r.get("dropped"),
+                rss_bytes: r.get("rss_bytes"),
+                cpu_percent: r.get("cpu_percent"),
+                disk_free_bytes: r.get("disk_free_bytes"),
+                disk_total_bytes: r.get("disk_total_bytes"),
+            })
+            .collect();
+        Ok((accesses, apps, metrics))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

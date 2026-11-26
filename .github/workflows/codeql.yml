@@ -1,0 +1,32 @@
+name: CodeQL
+
+# コードの静的な検査（CodeQL）。結果は GitHub の Security タブに送る。
+# 送るには、リポジトリが公開されているか、GitHub Code Security が要る。
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+  schedule:
+    # 週 1 回（月曜の UTC 4 時 23 分）。
+    - cron: "23 4 * * 1"
+
+permissions:
+  contents: read
+  security-events: write
+  actions: read
+
+jobs:
+  analyze:
+    name: analyze (rust)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # Rust はビルドせずに解析する（build-mode: none）。
+      - uses: github/codeql-action/init@v4
+        with:
+          languages: rust
+          build-mode: none
+          queries: security-extended
+      - uses: github/codeql-action/analyze@v4
+        with:
+          category: "/language:rust"
