@@ -20,6 +20,79 @@ use crate::http::{Request, Response};
 /// 数秒だけ待ちます。過ぎたら待つのをやめてプロセスを終えます。
 const CUT_OFF_GRACE: std::time::Duration = std::time::Duration::from_secs(3);
 
+/// 処理中のリクエストのタスク。
+///
+/// `Application::run_stack` は、ハンドラをタスクに切り出して走らせます。相手が切断すると
+/// axum 側の処理は落ちますが、切り出したタスクは走り続けます。axum の停止の待ちには
+/// 入らないので、ここで数えて、停止のときに終わるのを待ちます（[`RequestTasks::wait_idle`]）。
+static REQUESTS: RequestTasks = RequestTasks::new();
+
+/// 処理中のリクエストのタスクの数。
+///
+/// リクエストごとに触るのは数（アトミック）だけです。ロックは取りません。
+/// 0 になったと知らせる（`Notify` を使う）のは、停止の待ちに入った後だけです。
+pub(crate) struct RequestTasks {
+    in_flight: std::sync::atomic::AtomicUsize,
+    /// 停止の待ちに入ったか。立っているときだけ、0 になったら `idle` で知らせる。
+    draining: std::sync::atomic::AtomicBool,
+    idle: tokio::sync::Notify,
+}
+
+/// 処理中のリクエストのタスク 1 本分。タスクが終わる（パニック・取り消しも含む）と数から引く。
+pub(crate) struct RequestTask(&'static RequestTasks);
+
+/// 処理中のリクエストのタスクとして数える。返り値をタスクの中へ持たせる。
+pub(crate) fn track_request() -> RequestTask {
+    REQUESTS.track()
+}
+
+impl RequestTasks {
+    const fn new() -> Self {
+        Self {
+            in_flight: std::sync::atomic::AtomicUsize::new(0),
+            draining: std::sync::atomic::AtomicBool::new(false),
+            idle: tokio::sync::Notify::const_new(),
+        }
+    }
+
+    fn track(&'static self) -> RequestTask {
+        self.in_flight
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        RequestTask(self)
+    }
+
+    fn active(&self) -> usize {
+        self.in_flight.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// 0 本になるまで待つ。上限は呼ぶ側が掛ける。
+    async fn wait_idle(&self) {
+        self.draining
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        loop {
+            let notified = self.idle.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if self.active() == 0 {
+                return;
+            }
+            notified.await;
+        }
+    }
+}
+
+impl Drop for RequestTask {
+    fn drop(&mut self) {
+        use std::sync::atomic::Ordering;
+        let tasks = self.0;
+        if tasks.in_flight.fetch_sub(1, Ordering::SeqCst) == 1
+            && tasks.draining.load(Ordering::SeqCst)
+        {
+            tasks.idle.notify_waiters();
+        }
+    }
+}
+
 /// サーバーを起動して、止まるまで待つ。
 pub(crate) fn serve(app: Application, host: &str, port: u16) -> Result<()> {
     // 埋め込んだテンプレートの構文を、待ち受ける前に確かめる。誤りがあれば起動しない。
@@ -90,7 +163,7 @@ pub(crate) fn serve(app: Application, host: &str, port: u16) -> Result<()> {
                 // HTTP の処理中のものと、WebSocket の接続を同時に待つ。
                 // WebSocket は全接続に 1001 を送り、上限と 5 秒の短いほうだけ待つ。
                 let (served, ()) = tokio::join!(
-                    drain(&mut serving, timeout),
+                    drain(&mut serving, &REQUESTS, timeout),
                     crate::websocket::shutdown(&sockets, timeout)
                 );
                 served
@@ -133,6 +206,9 @@ fn finish(runtime: tokio::runtime::Runtime, cut_off: bool, grace: std::time::Dur
 
 /// 合図を受け取った後、処理中のリクエストが終わるのを待つ。
 ///
+/// 待つのは、axum の接続（`serving`）と、ハンドラを走らせているタスク（`tasks`）の両方です。
+/// 相手が切断した後も走り続けているタスクも、ここで待ちます。上限は両方を合わせた長さです。
+///
 /// 上限時間を過ぎたら、警告を出して打ち切ります。**打ち切ったときは `None`** を
 /// 返します（呼ぶ側がランタイムの片付け方を変えるため。[`finish`]）。
 /// axum に打ち切りの仕組みは無いので、ここで待つのをやめることで打ち切ります。
@@ -140,23 +216,29 @@ fn finish(runtime: tokio::runtime::Runtime, cut_off: bool, grace: std::time::Dur
 /// 待っている間に 2 回目の合図が来たら、[`watch_shutdown`] が強制終了します。
 async fn drain<F>(
     serving: &mut std::pin::Pin<&mut F>,
+    tasks: &RequestTasks,
     timeout: Option<std::time::Duration>,
 ) -> Option<F::Output>
 where
     F: Future<Output = std::io::Result<()>>,
 {
+    let all = async {
+        let result = serving.as_mut().await;
+        tasks.wait_idle().await;
+        result
+    };
     let Some(limit) = timeout else {
         tracing::info!(
             "処理中のリクエストが終わるまで待ちます（上限なし。もう一度合図を送ると強制終了します）"
         );
-        return Some(serving.as_mut().await);
+        return Some(all.await);
     };
 
     tracing::info!(
         "処理中のリクエストが終わるまで待ちます（上限 {} 秒。もう一度合図を送ると強制終了します）",
         limit.as_secs()
     );
-    match tokio::time::timeout(limit, serving.as_mut()).await {
+    match tokio::time::timeout(limit, all).await {
         Ok(result) => Some(result),
         Err(_) => {
             tracing::warn!("{} 秒たったので、残りの接続を打ち切ります", limit.as_secs());
@@ -554,6 +636,9 @@ fn into_axum(response: Response) -> axum::response::Response {
 /// 強制終了のときの終了コード（Ctrl+C の慣わし）。
 const FORCED_EXIT_CODE: i32 = 130;
 
+/// 強制終了の前に、溜まっているログを書き切るのを待つ上限。
+const FORCED_LOG_FLUSH: std::time::Duration = std::time::Duration::from_secs(1);
+
 /// 停止の合図を見張る。**1 回目で `graceful` を呼び、2 回目で強制終了します。**
 ///
 /// `serve` と `queue:work` の両方が使います。別々に書いていたころは、
@@ -566,6 +651,8 @@ const FORCED_EXIT_CODE: i32 = 130;
 pub(crate) async fn watch_shutdown(graceful: impl FnOnce()) {
     two_stage(shutdown_signal, graceful, || {
         eprintln!("\n強制終了します。");
+        // 溜まっているログだけは短い上限で書き切る（ふだんの終わり方は 5 秒まで待つ）。
+        crate::logging::shutdown_within(FORCED_LOG_FLUSH);
         std::process::exit(FORCED_EXIT_CODE);
     })
     .await;
@@ -926,7 +1013,7 @@ mod tests {
         tokio::pin!(never);
 
         let started = std::time::Instant::now();
-        let result = drain(&mut never, Some(Duration::from_millis(50))).await;
+        let result = drain(&mut never, &IDLE_TASKS, Some(Duration::from_millis(50))).await;
 
         // 打ち切ったことは `None` で伝える（ランタイムの片付け方を変えるため）。
         assert!(result.is_none(), "打ち切りは None で返る");
@@ -944,7 +1031,7 @@ mod tests {
         tokio::pin!(done);
 
         let started = std::time::Instant::now();
-        drain(&mut done, Some(Duration::from_secs(30)))
+        drain(&mut done, &IDLE_TASKS, Some(Duration::from_secs(30)))
             .await
             .expect("打ち切っていない")
             .expect("成功する");
@@ -956,10 +1043,63 @@ mod tests {
     async fn 上限なしでも終われば返る() {
         let done = async { Ok::<(), std::io::Error>(()) };
         tokio::pin!(done);
-        drain(&mut done, None)
+        drain(&mut done, &IDLE_TASKS, None)
             .await
             .expect("打ち切っていない")
             .expect("成功する");
+    }
+
+    /// 走っているタスクが無い数え役（drain のテスト用。ほかのテストのリクエストに左右されない）。
+    static IDLE_TASKS: RequestTasks = RequestTasks::new();
+
+    /// 接続が閉じても、ハンドラのタスクが走っていれば終わるまで待つ。
+    #[tokio::test]
+    async fn 走っているハンドラのタスクを待ってから返る() {
+        static TASKS: RequestTasks = RequestTasks::new();
+        let (release, wait) = tokio::sync::oneshot::channel::<()>();
+        let task = TASKS.track();
+        let handler = tokio::spawn(async move {
+            let _task = task;
+            let _ = wait.await;
+        });
+        assert_eq!(TASKS.active(), 1);
+
+        // 上限までに終わらなければ打ち切る。
+        let done = async { Ok::<(), std::io::Error>(()) };
+        tokio::pin!(done);
+        assert!(
+            drain(&mut done, &TASKS, Some(Duration::from_millis(50)))
+                .await
+                .is_none(),
+            "タスクが残っていれば待つ"
+        );
+
+        // 終われば返る。
+        let waiting = tokio::spawn(async move {
+            let done = async { Ok::<(), std::io::Error>(()) };
+            tokio::pin!(done);
+            drain(&mut done, &TASKS, Some(Duration::from_secs(5)))
+                .await
+                .is_some()
+        });
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let _ = release.send(());
+        handler.await.unwrap();
+        assert!(waiting.await.unwrap(), "タスクが終われば返る");
+        assert_eq!(TASKS.active(), 0);
+    }
+
+    /// パニックしたタスクも数から引く。
+    #[tokio::test]
+    async fn パニックしたタスクも数から引く() {
+        static TASKS: RequestTasks = RequestTasks::new();
+        let task = TASKS.track();
+        let handler = tokio::spawn(async move {
+            let _task = task;
+            panic!("わざと");
+        });
+        assert!(handler.await.is_err());
+        assert_eq!(TASKS.active(), 0);
     }
 
     /// 合図の 1 回目と 2 回目で、呼ぶものが分かれる。

@@ -97,6 +97,13 @@ async fn ok(_req: Request) -> Result<Response> {
     Ok(Response::text("ok"))
 }
 
+/// クエリの `id` でセッションにログインする（利用者がいるかは見ない）。
+async fn login(req: Request) -> Result<Response> {
+    let id = req.query("id").unwrap_or_default();
+    req.auth().login_using_id(id)?;
+    Ok(Response::text("ok"))
+}
+
 /// いまのトークンだけを消す（その端末だけログアウト）。
 async fn logout(req: Request) -> Result<Response> {
     if let Some(token) = req.auth().current_access_token() {
@@ -124,6 +131,10 @@ fn app() -> bengara::Application {
                 Route::post("/api/logout", logout)
                     .name("api.logout")
                     .middleware("auth:sanctum");
+                // 利用者の型を決めた形（`provider::<User>()`）。
+                Route::get("/api/strict/me", me).middleware("auth:sanctum:user");
+                Route::get("/web/login", login);
+                Route::get("/web/strict", ok).middleware("auth:user");
             })
         })
         .with_middleware(|m| {
@@ -133,6 +144,11 @@ fn app() -> bengara::Application {
             ))
             .append(VerifyCsrfToken::new().except_route("api.*"))
             .alias("auth:sanctum", Authenticate::token())
+            .alias(
+                "auth:sanctum:user",
+                Authenticate::token().provider::<User>(),
+            )
+            .alias("auth:user", Authenticate::new().provider::<User>())
             .alias(
                 "abilities:posts:write,posts:publish",
                 CheckAbilities::new(["posts:write", "posts:publish"]),
@@ -522,6 +538,73 @@ fn 持ち主の種類が違えばuserはnone() {
         // `tokens()` も種類で分かれる。
         assert_eq!(user.tokens().count().await.unwrap(), 0);
         assert_eq!(admin.tokens().count().await.unwrap(), 1);
+    });
+}
+
+#[test]
+fn 利用者の型を決めると別の種類と消えた利用者のトークンを通さない() {
+    test(|client| async move {
+        let (_db, user) = setup().await;
+        let mine = create(&user, &["*"]).await;
+        let admin = Admin::find(user.id)
+            .await
+            .unwrap()
+            .expect("同じ行を Admin として読む");
+        let other = admin.create_token("admin", &["*"], None).await.unwrap();
+
+        // `User` のトークンは通る。
+        get_with(&client, "/api/strict/me", &mine.plain_text_token)
+            .await
+            .assert_ok()
+            .assert_see(&format!("true:{}:花子", user.id));
+        // 決めていない形では `Admin` のトークンも通り、`id()` は持ち主の ID を返す（今までどおり）。
+        get_with(&client, "/api/me", &other.plain_text_token)
+            .await
+            .assert_ok()
+            .assert_see(&format!("true:{}:（なし）", user.id));
+        // 決めた形では、持ち主の種類が違えば 401。
+        get_with(&client, "/api/strict/me", &other.plain_text_token)
+            .await
+            .assert_status(401);
+
+        // 利用者を消すと、決めた形では 401。決めていない形は通る（DB を引かない）。
+        DB::table("users")
+            .where_("id", user.id)
+            .delete()
+            .await
+            .unwrap();
+        get_with(&client, "/api/strict/me", &mine.plain_text_token)
+            .await
+            .assert_status(401);
+        get_with(&client, "/api/me", &mine.plain_text_token)
+            .await
+            .assert_ok()
+            .assert_see(&format!("true:{}:（なし）", user.id));
+    });
+}
+
+#[test]
+fn 利用者の型を決めるとセッションの利用者が消えたら通さない() {
+    test(|client| async move {
+        let (_db, user) = setup().await;
+
+        // いる利用者でログインすると通る。
+        client
+            .get(&format!("/web/login?id={}", user.id))
+            .await
+            .assert_ok();
+        client.get("/web/strict").await.assert_ok();
+
+        // 利用者を消すと、ログインしていないときと同じ 401。
+        DB::table("users")
+            .where_("id", user.id)
+            .delete()
+            .await
+            .unwrap();
+        client.get("/web/strict").await.assert_status(401);
+
+        // ログインしていなければ、もちろん 401。
+        client.fresh().get("/web/strict").await.assert_status(401);
     });
 }
 

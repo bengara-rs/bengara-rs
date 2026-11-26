@@ -29,6 +29,14 @@ const THROTTLE_SECONDS: i64 = 60;
 ///     // パスワードを書き換える
 /// }
 /// ```
+///
+/// # メールアドレスは、そろえてから渡してください
+///
+/// 渡したアドレスを**そのまま**表の主キーにし、そのまま比べます。大文字小文字や
+/// 前後の空白はそろえません（Laravel も同じです）。`A@example.com` で作ったトークンは、
+/// `a@example.com` では照合できず、作り直しの制限（[`recently_created`](Self::recently_created)）も
+/// 別のアドレスとして数えます。利用者の表に入れるときと同じ形（たとえば小文字にして
+/// 前後の空白を落とした値）にしてから、すべての関数に同じ値を渡してください。
 pub struct PasswordReset;
 
 impl PasswordReset {
@@ -121,8 +129,16 @@ impl PasswordReset {
     /// 同じリンクを 2 回使えます。
     ///
     /// `verify` と `consume` を分けて呼ぶと、その間に別のリクエストが入れば
-    /// 同じトークンを 2 回使えます。ここでは**条件つきの `delete` 1 文**にして、
-    /// 消せた件数で判定します。消せるのは最初の 1 回だけです。
+    /// 同じトークンを 2 回使えます。ここでは最後を**条件つきの `delete` 1 文**
+    /// （アドレスとトークンの両方が合う行）にして、消せた件数で判定します。
+    /// 消せるのは最初の 1 回だけです。
+    ///
+    /// **期限は Rust の側で判定します**（[`verify`](Self::verify) と同じ読み方）。
+    /// SQL で `created_at >= ..` と比べていたころは、文字列として比べていたので、
+    /// ほかの仕組みが `2026-10-09T10:00:00` の形や時差付きで書いた行が、
+    /// 期限切れでも通ることがありました。期限切れの行は消さずに偽を返します
+    /// （片付けは [`sweep_expired`](Self::sweep_expired) の仕事）。
+    /// 時差の無い現地時刻で書かれた行は、UTC として読みます（区別できないため）。
     ///
     /// ```ignore
     /// if !PasswordReset::consume_if_valid(&email, &token).await? {
@@ -137,12 +153,22 @@ impl PasswordReset {
     /// 32 バイトの乱数の SHA-256 なので、かかった時間から手がかりは取れません。
     pub async fn consume_if_valid(email: &str, token: &str) -> Result<bool> {
         let hashed = crypto::to_hex(&crypto::sha256(token.as_bytes()));
-        // `expired` と同じ境目（作ってから LIFETIME_MINUTES 以内なら有効）。
-        let limit = time::format_timestamp(time::now_seconds() - LIFETIME_MINUTES * 60);
+        let Some(row) = DB::table(TABLE)
+            .where_("email", email)
+            .where_("token", hashed.as_str())
+            .first()
+            .await?
+        else {
+            return Ok(false);
+        };
+        let created_at: String = row.get("created_at")?;
+        if Self::expired(&created_at) {
+            return Ok(false);
+        }
+        // 消せた件数で決める。読んでから消すまでに別のリクエストが先に消していれば 0 件。
         let removed = DB::table(TABLE)
             .where_("email", email)
             .where_("token", hashed)
-            .where_op("created_at", ">=", limit)
             .delete()
             .await?;
         Ok(removed > 0)
@@ -508,6 +534,49 @@ mod tests {
             assert!(!PasswordReset::verify(email, &token).await.unwrap());
             // 合わないトークンも偽（理由は区別しない）。
             assert!(!PasswordReset::verify(email, "ちがう").await.unwrap());
+            assert!(!PasswordReset::consume_if_valid(email, &token)
+                .await
+                .unwrap());
+        }
+
+        #[tokio::test]
+        async fn 別の形で書かれた時刻でも期限切れなら通らない() {
+            // SQL で文字列として比べていたころは、`T` 区切りや時差付きで書かれた行が
+            // 期限切れでも通った（`T` は空白より後ろに並ぶ。`+09:00` は 9 時間ぶん先に見える）。
+            let _db = setup().await;
+            let email = "format@example.com";
+            let old = time::now_seconds() - 61 * 60;
+            let jst = time::format_timestamp(old + 9 * 3600) + "+09:00";
+            for (label, written) in [
+                ("T 区切り", time::format_timestamp(old).replace(' ', "T")),
+                ("時差付き", jst),
+            ] {
+                let token = PasswordReset::create(email).await.unwrap();
+                DB::table(TABLE)
+                    .where_("email", email)
+                    .update(&[("created_at", written.clone().into())])
+                    .await
+                    .unwrap();
+                assert!(
+                    !PasswordReset::consume_if_valid(email, &token)
+                        .await
+                        .unwrap(),
+                    "{label}（{written}）は期限切れ"
+                );
+                assert!(!PasswordReset::verify(email, &token).await.unwrap());
+            }
+
+            // 期限の内なら、別の形でも通り、1 回で消える。
+            let token = PasswordReset::create(email).await.unwrap();
+            let fresh = time::format_timestamp(time::now_seconds() - 60).replace(' ', "T");
+            DB::table(TABLE)
+                .where_("email", email)
+                .update(&[("created_at", fresh.into())])
+                .await
+                .unwrap();
+            assert!(PasswordReset::consume_if_valid(email, &token)
+                .await
+                .unwrap());
             assert!(!PasswordReset::consume_if_valid(email, &token)
                 .await
                 .unwrap());

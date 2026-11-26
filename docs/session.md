@@ -74,7 +74,8 @@ req.session().put_json("cart", &cart)?;
 let cart: Option<Cart> = req.session().get_json("cart")?;
 ```
 
-- 同じ鍵に `put` と `flash` の両方を書かないでください。`get` と `all()` で読める値が食い違います。
+- 同じ鍵に `put` と `flash` を書いたときは、**この回の `flash` が勝ちます**（入れた順によらない）。
+  前の回から持ち越した `flash` は、この回に `put` / `flash` した同じ鍵に負けます。`get` と `all()` は同じ値を返します。
 - `all()` には、ログインに使う `bengara_auth_id`・`bengara_auth_at`・`bengara_auth_intended` が入ります。
   画面やログにそのまま出さないでください。
 
@@ -104,6 +105,7 @@ req.auth().logout()?;        // 中身を捨てて、Cookie を消す
 - `login` が ID を作り直すのは、セッション固定（前もって仕込んだ ID を使わせる攻撃）を防ぐためです。
 - **ID を作り直すと、CSRF トークンも変わります。** ログイン後のフォームでは、トークンを取り直します。
 - `logout` は、置き場所からセッションを消し、ブラウザの Cookie も消します。
+- 処理中に別の所から切られていたと分かったとき（保存しない）も、ブラウザの Cookie を消します。
 - **古いセッションを消せなかったときは 500 です。** 盗まれた Cookie を使えなくするためです。
 
 くわしくは [authentication.md](authentication.md) にあります。
@@ -121,6 +123,10 @@ req.auth().logout()?;        // 中身を捨てて、Cookie を消す
 - 本番（`APP_ENV=production`）で `memory` にすると、起動時に警告を出します。止めはしません。
 - `SESSION_LIFETIME` は分で書きます。既定は 120 です。
 - **期限は「最後に使ったとき」から数えます。** 読むだけのリクエストでも延びます。実際に切れるのは、最大 60 秒早くなります。
+- 延ばす書き込みは、最後に書いてから 60 秒（期限が短ければ期限の 1/10）たつまで間引きます。
+  **Cookie を送り直すのも、置き場所が期限を延ばしたときと保存したときだけです。** 読むだけの応答の多くには `Set-Cookie` が付きません。
+- ほかの端末を切ったとき（`logout_other_devices` など）にファイルを消せなかったセッションも、読めません。
+  切った時刻より前にログインしたものは、読むときに無かったことにします。
 - 期限切れは自動で少しずつ消します。まとめて消すなら `cargo artisan session:gc` です。
 - **プロセスを 2 つ以上動かすときは、全部が同じ `storage/` を見るようにします。** `memory` は本番で使えません。
 - ファイルは平文です。秘密を入れすぎないでください。
@@ -163,20 +169,22 @@ req.auth().logout()?;        // 中身を捨てて、Cookie を消す
 StartSession::from_env().with_config(SessionConfig {
     cookie: "myapp_session".into(),
     same_site: SameSite::Strict,
-    lifetime_secs: 60 * 120,
-    ..SessionConfig::default()
+    ..SessionConfig::from_env()
 })
 ```
 
-| 欄              | 既定              | 中身                                                       |
-|-----------------|-------------------|------------------------------------------------------------|
-| `cookie`        | `bengara_session` | Cookie の名前                                              |
-| `lifetime_secs` | 7200              | 放っておいて切れるまでの秒数                               |
-| `secure`        | `false`           | HTTPS のときだけ送る。`APP_ENV=production` では必ず `true` |
-| `same_site`     | `SameSite::Lax`   | 別のサイトからの送信に付けるか（`Lax` は付けない）         |
-| `path`          | `/`               | Cookie を送る範囲                                          |
+| 欄              | 既定              | `from_env()` が読む     | 中身                                                       |
+|-----------------|-------------------|-------------------------|------------------------------------------------------------|
+| `cookie`        | `bengara_session` | -                       | Cookie の名前                                              |
+| `lifetime_secs` | 7200              | `SESSION_LIFETIME`（分）| 放っておいて切れるまでの秒数                               |
+| `secure`        | `false`           | `SESSION_SECURE_COOKIE` | HTTPS のときだけ送る。`APP_ENV=production` では必ず `true` |
+| `same_site`     | `SameSite::Lax`   | -                       | 別のサイトからの送信に付けるか（`Lax` は付けない）         |
+| `path`          | `/`               | -                       | Cookie を送る範囲                                          |
 
-- **`with_config` は `SESSION_LIFETIME` を上書きします。** `lifetime_secs` を省くと 7200 秒です。
+- **`with_config` は設定を丸ごと置き換えます。** 残りは `..SessionConfig::from_env()` で埋めてください。
+  `..SessionConfig::default()` で埋めると、`SESSION_LIFETIME` と `SESSION_SECURE_COOKIE` が読まれず、期限が 7200 秒に戻ります。
+- `SESSION_SECURE_COOKIE=true` にすると、本番以外でも `Secure` が付きます（ステージングを HTTPS で動かすときなど）。
+  Laravel と同じ名前です。本番では、`false` にしても `Secure` が付きます。
 
 ## CSRF
 
@@ -302,6 +310,8 @@ StartSession::new(MyStore::new(7200), SessionConfig::default())
 |-----------------------------------|----------------------------------------------------------|
 | `read` / `write` / `destroy`      | 必ず書く。`read` は**期限切れに `None` を返す**          |
 | `touch` / `read_and_touch`        | 動くが、読み書きが余分に走る                             |
+| `read_and_touch_with_status`      | 動くが、ルートに当たった応答に毎回 `Set-Cookie` が付く   |
+| `blocking`                        | 動く。いつも裏のスレッドを経由する（メモリだけなら `false`） |
 | `destroy_for_user` / `..._except` | `logout_other_devices()` などが警告を出して 0 を返す     |
 | `mark_revoked` / `revoked_at`     | 消したセッションが、処理中の別リクエストに書き戻されうる |
 

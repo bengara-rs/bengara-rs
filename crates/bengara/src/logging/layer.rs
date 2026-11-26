@@ -17,15 +17,11 @@ pub(crate) const ACCESS_TARGET: &str = "bengara::access";
 /// メトリクスのイベントの target。
 pub(crate) const METRICS_TARGET: &str = "bengara::metrics";
 
-/// 記録の種類。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Kind {
-    Access,
-    Metrics,
-    App,
-}
+/// 記録の種類。テキストのファイルの名前の頭と同じものを使う（1 か所で決める）。
+pub(crate) use super::file::Kind;
 
 impl Kind {
+    /// イベントの target から種類を決める。
     pub(crate) fn of(target: &str) -> Self {
         match target {
             ACCESS_TARGET => Kind::Access,
@@ -165,7 +161,7 @@ impl Outputs {
                 self.stdout.write(format::stdout_access(&head, &access));
                 if let Some(files) = files {
                     files.push(file::Record {
-                        kind: file::Kind::Access,
+                        kind: Kind::Access,
                         millis,
                         line: format::text_access(millis, &access),
                     });
@@ -195,7 +191,7 @@ impl Outputs {
                     .write(format!("{head}metrics {}\n", format::logfmt(None, &fields)));
                 if let Some(files) = files {
                     files.push(file::Record {
-                        kind: file::Kind::Metrics,
+                        kind: Kind::Metrics,
                         millis,
                         line: format!("{}\n", format::logfmt(Some(&time), &fields)),
                     });
@@ -218,7 +214,7 @@ impl Outputs {
                 let context = format::context_json(target, id, &fields);
                 if let Some(files) = files {
                     files.push(file::Record {
-                        kind: file::Kind::App,
+                        kind: Kind::App,
                         millis,
                         line: format::text_app(&time, &self.app_env, level, &message, &context),
                     });

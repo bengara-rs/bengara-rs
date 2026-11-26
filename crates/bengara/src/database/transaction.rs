@@ -142,6 +142,19 @@ impl TxShared {
         }
     }
 
+    /// 使えない状態なら、終わった状態にして `true` を返す（`rollback` 用）。
+    ///
+    /// 使えない状態では中身をすでに落としてあり、下回りが巻き戻しています。
+    fn finish_poisoned(&self) -> bool {
+        let mut guard = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        if matches!(&*guard, State::Poisoned) {
+            *guard = State::Finished;
+            true
+        } else {
+            false
+        }
+    }
+
     /// 終わりにする。
     fn finish(&self) -> Result<Box<dyn RawTx>> {
         Ok(self.take()?.into_finished())
@@ -226,7 +239,16 @@ impl Transaction {
     }
 
     /// 巻き戻す。
+    ///
+    /// 問い合わせが失敗した後（使えない状態）でも `Ok(())` を返します。
+    /// 中身はその時点で落としてあり、下回りが巻き戻しているためです。
+    /// `if let Err(e) = ... { tx.rollback().await?; return Err(e); }` と書いたときに、
+    /// 元のエラーが「使えません」のエラーに隠れないようにしています。
+    /// `commit()` は従来どおりエラーを返します。
     pub async fn rollback(self) -> Result<()> {
+        if self.shared.finish_poisoned() {
+            return Ok(());
+        }
         let raw = self.shared.finish()?;
         raw.rollback().await
     }
@@ -576,6 +598,32 @@ mod tests {
         let message = tx.commit().await.expect_err("確定は断られる").to_string();
         assert!(message.contains("使えません"), "{message}");
         assert!(message.contains("DB::begin()"), "{message}");
+    }
+
+    #[tokio::test]
+    async fn 問い合わせが失敗した後の巻き戻しは成功を返す() {
+        // `if let Err(e) = ... { tx.rollback().await?; return Err(e); }` の形で、
+        // 元のエラーが「使えません」に隠れないようにする。
+        let tx = Transaction {
+            shared: Arc::new(shared(Box::new(FailingTx))),
+        };
+        let shared = Arc::clone(&tx.shared);
+        let query = tx.table("posts");
+        let original = tx
+            .statement("insert into users values (1)", &[])
+            .await
+            .expect_err("失敗するはず");
+        assert!(original.to_string().contains("UNIQUE"), "{original}");
+        tx.rollback().await.expect("巻き戻しは成功を返す");
+
+        // 終わった状態になり、残ったクエリビルダは断られる。
+        let message = query
+            .insert(&[("title", Value::Text("x".into()))])
+            .await
+            .expect_err("断られる")
+            .to_string();
+        assert!(message.contains("終わっています"), "{message}");
+        assert!(!is_ready(&shared));
     }
 
     #[test]

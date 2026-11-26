@@ -15,8 +15,8 @@ use sqlx::{Column, Row as SqlxRow, Sqlite, TypeInfo, ValueRef};
 
 use super::backend::{Backend, DbFuture, RawTx};
 use super::failure::{failed, failed_with_hint};
-use super::grammar::Driver;
-use super::value::{Affected, Row, Value};
+use super::grammar::{self, Driver};
+use super::value::{Affected, Row, RowColumns, Value};
 use super::ConnectionConfig;
 use crate::error::{Error, Result};
 
@@ -97,7 +97,20 @@ fn build_options(settings: &ConnectionConfig) -> Result<SqliteConnectOptions> {
         // 接続文字列そのものは出さない（`unreadable_url` の説明を参照）。
         let options = SqliteConnectOptions::from_str(&settings.url)
             .map_err(|e| super::unreadable_url(settings, e))?;
-        return Ok(tune(options, settings));
+        let name = options.get_filename();
+        // メモリ上・名前が空（SQLite の一時ファイル）・`file:` で始まる URI は、
+        // SQLite が自分で解釈するので、そのまま渡す。
+        if settings.is_memory()
+            || name.as_os_str().is_empty()
+            || name.to_str().is_some_and(|text| text.starts_with("file:"))
+        {
+            return Ok(tune(options, settings));
+        }
+        // `DB_URL=sqlite:database/app.db` の相対パスも、`database` と同じく基準ディレクトリから
+        // 見る。以前はいまのディレクトリ（CWD）から見ていたので、`cargo artisan` を別の
+        // ディレクトリから動かすと、別のファイルを作って空の DB につないでいました。
+        let path = rooted_file(options.get_filename())?;
+        return Ok(tune(options.filename(path), settings));
     }
 
     if settings.is_memory() {
@@ -106,8 +119,16 @@ fn build_options(settings: &ConnectionConfig) -> Result<SqliteConnectOptions> {
         return Ok(tune(options, settings));
     }
 
-    // 相対パスは基準ディレクトリから見る。
-    let path = std::path::Path::new(&settings.database);
+    let path = rooted_file(std::path::Path::new(&settings.database))?;
+    Ok(tune(SqliteConnectOptions::new().filename(path), settings))
+}
+
+/// SQLite のファイルの場所を決める。`database` でも `url` でも、ここを通します。
+///
+/// - 相対パスは基準ディレクトリ（`base_path()`）から見る。
+/// - 置くディレクトリが無ければエラーにする。sqlx は「開けない」とだけ言うので、
+///   何を作ればよいかを先に伝えます。
+fn rooted_file(path: &std::path::Path) -> Result<std::path::PathBuf> {
     let path = if path.is_absolute() {
         path.to_path_buf()
     } else {
@@ -121,8 +142,7 @@ fn build_options(settings: &ConnectionConfig) -> Result<SqliteConnectOptions> {
             )));
         }
     }
-
-    Ok(tune(SqliteConnectOptions::new().filename(path), settings))
+    Ok(path)
 }
 
 /// SQLite の接続プール。
@@ -248,14 +268,31 @@ impl RawTx for SqliteTx {
 ///
 /// - 行を入れる文（`insert` / `replace`）である
 /// - 1行以上が変わった（`insert ... select` で0件のときを外す）
+/// - `on conflict ... do update` を含まない
+///
+/// **`do update` を含む文（upsert）では番号を返しません。** 更新の側に進むと行は
+/// 入らないのに、変わった行は 1 になり、`last_insert_rowid()` は同じ接続で前に
+/// 入れた行の番号のままです。どちらに進んだかは結果から分からないので、
+/// 入った側でも `None` にします。番号が要るときは `returning` を付けて
+/// `DB::select` で受け取ってください。
+///
+/// 1 文で何行も入れたときは、**最後の行**の番号です（MySQL は最初の行）。
 ///
 /// MySQL と PostgreSQL も、update / delete では `None` になります。
 fn affected(sql: &str, result: &SqliteQueryResult) -> Affected {
     let rows = result.rows_affected();
     Affected {
         rows,
-        last_insert_id: (rows > 0 && inserts(sql)).then(|| result.last_insert_rowid()),
+        last_insert_id: (rows > 0 && inserts(sql) && !upserts(sql))
+            .then(|| result.last_insert_rowid()),
     }
+}
+
+/// `on conflict ... do update` を含む文か。引用の中の語は見ません。
+fn upserts(sql: &str) -> bool {
+    let text = grammar::outside_text(sql).to_ascii_lowercase();
+    let words: Vec<&str> = text.split_whitespace().collect();
+    words.windows(2).any(|pair| pair == ["do", "update"])
 }
 
 /// 行を入れる文か。先頭の語を、大文字小文字の違いを無視して見ます。
@@ -296,21 +333,23 @@ fn convert_rows(rows: &[SqliteRow]) -> Result<Vec<Row>> {
     let Some(first) = rows.first() else {
         return Ok(Vec::new());
     };
-    let columns: Arc<[String]> = first
-        .columns()
-        .iter()
-        .map(|column| column.name().to_string())
-        .collect();
+    let columns = RowColumns::new(
+        first
+            .columns()
+            .iter()
+            .map(|column| column.name().to_string())
+            .collect(),
+    );
     rows.iter().map(|row| convert_row(row, &columns)).collect()
 }
 
 /// sqlx の行を `Row` に直す。列の名前は呼ぶ側から受け取ります。
-fn convert_row(row: &SqliteRow, columns: &Arc<[String]>) -> Result<Row> {
-    let mut values = Vec::with_capacity(columns.len());
-    for (index, name) in columns.iter().enumerate() {
+fn convert_row(row: &SqliteRow, columns: &RowColumns) -> Result<Row> {
+    let mut values = Vec::with_capacity(columns.names().len());
+    for (index, name) in columns.names().iter().enumerate() {
         values.push(convert_value(row, index, name)?);
     }
-    Ok(Row::with_columns(Arc::clone(columns), values))
+    Ok(columns.row(values))
 }
 
 /// 1つの値を `Value` に直す。
@@ -911,6 +950,79 @@ mod tests {
         assert_eq!(nothing.last_insert_id, None);
     }
 
+    #[tokio::test]
+    async fn 更新の側に進んだ_upsert_は古い番号を返さない() {
+        let db = memory().await;
+        db.execute(
+            "create table k (id integer primary key, code text unique, n integer)",
+            &[],
+        )
+        .await
+        .unwrap();
+        db.execute("insert into k (code, n) values ('a', 1)", &[])
+            .await
+            .unwrap();
+        let other = db
+            .execute("insert into k (code, n) values ('b', 1)", &[])
+            .await
+            .unwrap();
+        assert_eq!(other.last_insert_id, Some(2));
+
+        // `a` は既にあるので更新の側に進む。行は 1 と数えられ、rowid は 2 のまま。
+        // 以前はここで `Some(2)`（別の行の番号）を返していた。
+        let upserted = db
+            .execute(
+                "insert into k (code, n) values ('a', 5) \
+                 ON CONFLICT (code) DO UPDATE SET n = excluded.n",
+                &[],
+            )
+            .await
+            .unwrap();
+        assert_eq!(upserted.rows, 1);
+        assert_eq!(upserted.last_insert_id, None);
+
+        // 番号が要るときは `returning` で受け取れる（同梱の SQLite は 3.35 以降）。
+        let rows = db
+            .fetch_all(
+                "insert into k (code, n) values ('a', 6) \
+                 on conflict (code) do update set n = excluded.n returning id",
+                &[],
+            )
+            .await
+            .unwrap();
+        assert_eq!(rows[0].get::<i64>("id").unwrap(), 1);
+
+        // 文字列の中の `do update` は見ない。
+        assert!(!upserts("insert into k (code) values ('do update')"));
+        assert!(upserts(
+            "insert into k values (1) on conflict do\n  update set n = 1"
+        ));
+    }
+
+    #[test]
+    fn url_の相対パスも基準ディレクトリから見る() {
+        let settings = ConnectionConfig::sqlite("main", "ignored").url("sqlite:bengara-url.db");
+        let options = build_options(&settings).expect("組み立てられる");
+        assert_eq!(
+            options.get_filename(),
+            crate::paths::base_path().join("bengara-url.db")
+        );
+        // 置くディレクトリが無ければ、`database` と同じくつなぐ前に断る。
+        let settings = ConnectionConfig::sqlite("main", "ignored")
+            .url("sqlite://bengara-no-such-dir-7f3a/x.db");
+        let message = build_options(&settings).expect_err("断る").to_string();
+        assert!(message.contains("bengara-no-such-dir-7f3a"), "{message}");
+        assert!(message.contains("ディレクトリを先に作って"), "{message}");
+        // 絶対パスとメモリ上はそのまま。
+        let absolute = crate::paths::base_path().join("abs.db");
+        let settings = ConnectionConfig::sqlite("main", "ignored")
+            .url(format!("sqlite://{}", absolute.display()));
+        let options = build_options(&settings).expect("組み立てられる");
+        assert_eq!(options.get_filename(), absolute);
+        let settings = ConnectionConfig::sqlite("main", "ignored").url("sqlite::memory:");
+        build_options(&settings).expect("メモリ上も組み立てられる");
+    }
+
     #[test]
     fn 行を入れる文かは先頭の語で見る() {
         assert!(inserts("insert into t values (1)"));
@@ -955,9 +1067,10 @@ mod tests {
     #[tokio::test]
     async fn url_でつないだときの失敗は_url_の指定と出す() {
         // 以前は使っていない `database` の値を出していた。
-        // 無いディレクトリの下を読み取り専用で開くので、必ず失敗する。
+        // 無いファイルを読み取り専用で開くので、必ず失敗する。
+        // （無いディレクトリの下は、つなぐ前に `rooted_file` が断る。）
         let settings = ConnectionConfig::sqlite("main", "ignored-database-name")
-            .url("sqlite://bengara-no-such-dir-7f3a/x.db?mode=ro");
+            .url("sqlite://bengara-no-such-file-7f3a.db?mode=ro");
         let message = connect(&settings)
             .await
             .err()

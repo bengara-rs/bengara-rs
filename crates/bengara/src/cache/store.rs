@@ -165,6 +165,11 @@ const TEMP_STALE_SECS: u64 = 300;
 ///
 /// 1つの鍵が1つのファイルになります。
 /// プロセスを2つ以上動かすときは、全プロセスで同じ場所を指してください。
+///
+/// **直接呼ぶときの鍵は、`Cache` が直した形だけです。** 小文字の英数字と `. _ -`、
+/// または `~` と小文字の 16 進 64 文字です。それ以外（`../x` や大文字など）は
+/// `put` / `get` / `has` / `forget` / `increment` がエラーを返します。
+/// `Cache` を通せば、どんな鍵もこの形に直してから渡します。
 pub struct FileCache {
     dir: PathBuf,
     /// 置き場所の権限を直したか。直すのはプロセスで 1 回だけです。
@@ -193,6 +198,23 @@ impl FileCache {
 
     fn path_of(&self, key: &str) -> PathBuf {
         self.dir.join(key)
+    }
+
+    /// 利用者から受け取った鍵を確かめてから、置く場所を返す。
+    ///
+    /// **`Cache` が直した形（`normalize_key`）しか受け取りません。** `FileCache` は
+    /// 公開しているので、直接 `FileCache::new(dir).get("../x")` と呼べます。
+    /// 確かめずに `dir.join(key)` していたころは、置き場所の外のファイルを
+    /// 読み・書き・消しできました。
+    fn key_path(&self, key: &str) -> Result<PathBuf> {
+        if !super::is_normalized_key(key) {
+            return Err(Error::msg(format!(
+                "キャッシュの鍵 `{key}` は FileCache では使えません\
+                 （使えるのは小文字の英数字と `. _ -`、または `~` と 16 進 64 文字です。\
+                 Cache を通すと自動でこの形に直します）"
+            )));
+        }
+        Ok(self.path_of(key))
     }
 
     /// 書き込み途中に使う名前。
@@ -269,8 +291,8 @@ fn restrict_dir(dir: &Path) {
 
 impl CacheStore for FileCache {
     fn put(&self, key: &str, value: &str, seconds: Option<u64>) -> Result<()> {
+        let path = self.key_path(key)?;
         self.ensure_dir()?;
-        let path = self.path_of(key);
         // 書いている途中の中身を読まれないよう、別の名前で書いてから置き換える。
         let temp = self.temp_path_of(key);
         // 中身は所有者だけが読めるようにする（Unix で 0600。セッションと同じ）。
@@ -283,7 +305,7 @@ impl CacheStore for FileCache {
     }
 
     fn get(&self, key: &str) -> Result<Option<String>> {
-        let path = self.path_of(key);
+        let path = self.key_path(key)?;
         let raw = match std::fs::read_to_string(&path) {
             Ok(raw) => Some(raw),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -311,7 +333,7 @@ impl CacheStore for FileCache {
     }
 
     fn forget(&self, key: &str) -> Result<()> {
-        match std::fs::remove_file(self.path_of(key)) {
+        match std::fs::remove_file(self.key_path(key)?) {
             Ok(()) => Ok(()),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
             Err(e) => Err(Error::Io(e)),
@@ -355,7 +377,7 @@ impl CacheStore for FileCache {
     /// 「あるか」を聞かれただけで書き込みを起こさないほうが素直です。
     /// 片づけは `cache:prune` が引き受けます。
     fn has(&self, key: &str) -> Result<bool> {
-        let Some(expires_at) = read_expires_at(&self.path_of(key)) else {
+        let Some(expires_at) = read_expires_at(&self.key_path(key)?) else {
             // 無い・読めない・壊れている。どれも「無い」とします。
             return Ok(false);
         };
@@ -374,6 +396,7 @@ impl CacheStore for FileCache {
     /// **期限は引き継ぎません**（期限なしで書き直します）。Laravel の
     /// `increment` は元の期限を保つので、そこは挙動が違います。
     fn increment(&self, key: &str, by: i64) -> Result<i64> {
+        self.key_path(key)?;
         self.ensure_dir()?;
         let _file = FileLock::acquire(&self.lock_path_of(key))?;
 
@@ -551,6 +574,9 @@ fn sweep_expired(cache: &FileCache) -> Result<usize> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(0),
         Err(e) => return Err(Error::Io(e)),
     };
+    // 錠の置き場所（`+locks/`）に落ちたプロセスが残した一時ファイルも片付ける。
+    // 錠ファイル（`.lock`）は消さない。これも件数には入れない。
+    crate::support::lock::sweep_temps(&dir.join(LOCK_DIR), TEMP_STALE_SECS);
     let mut removed = 0;
     for entry in entries.flatten() {
         let path = entry.path();
@@ -972,6 +998,79 @@ mod tests {
         assert!(!stale.exists(), "残骸は消す");
         assert!(!store.path_of("gone").exists());
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn 掃除は錠の置き場所の古い一時ファイルも消す() {
+        let dir = temp_dir("prunelocks");
+        let store = FileCache::new(&dir);
+        store.increment("n", 1).unwrap();
+        // `increment` の途中で落ちたプロセスの残骸と、握ったままの錠。
+        let locks = dir.join(LOCK_DIR);
+        let left = locks.join("n.new.1.0");
+        let held = store.lock_path_of("n");
+        std::fs::write(&left, "印").unwrap();
+        std::fs::write(&held, "印").unwrap();
+        let old =
+            std::time::SystemTime::now() - std::time::Duration::from_secs(TEMP_STALE_SECS + 60);
+        for path in [&left, &held] {
+            std::fs::File::options()
+                .write(true)
+                .open(path)
+                .unwrap()
+                .set_modified(old)
+                .unwrap();
+        }
+
+        // 以前は誰も消さず、`+locks/` に溜まる一方だった。件数には入れない。
+        assert_eq!(sweep_expired(&store).unwrap(), 0);
+        assert!(!left.exists(), "残骸は消す");
+        assert!(held.exists(), "錠ファイルは消さない（外すのは FileLock）");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn 直した形でない鍵は断る() {
+        let dir = temp_dir("badkey");
+        let store = FileCache::new(&dir);
+        // 置き場所の外に、狙われるファイルを置いておく。
+        let outside = dir.with_extension("outside");
+        std::fs::write(&outside, "0|外の中身").unwrap();
+        let escape = format!("../{}", outside.file_name().unwrap().to_str().unwrap());
+
+        // 以前は `dir.join(key)` のままで、置き場所の外を読み・書き・消しできた。
+        for key in [
+            escape.as_str(),
+            "..",
+            "a/b",
+            "a\\b",
+            "User",
+            "",
+            "~zz",
+            "a:b",
+        ] {
+            assert!(store.get(key).is_err(), "{key}");
+            assert!(store.has(key).is_err(), "{key}");
+            assert!(store.put(key, "x", None).is_err(), "{key}");
+            assert!(store.forget(key).is_err(), "{key}");
+            assert!(store.increment(key, 1).is_err(), "{key}");
+        }
+        assert_eq!(
+            std::fs::read_to_string(&outside).unwrap(),
+            "0|外の中身",
+            "外のファイルは触らない"
+        );
+
+        // `Cache` が直した形（素通しとハッシュ側）は使える。
+        let hashed = crate::cache::normalize_key("User:1");
+        for key in ["posts.count", "a_b-c.d", hashed.as_str()] {
+            store.put(key, "値", Some(60)).unwrap();
+            assert_eq!(store.get(key).unwrap().as_deref(), Some("値"), "{key}");
+        }
+
+        let _ = std::fs::remove_file(&outside);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

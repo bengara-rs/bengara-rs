@@ -51,7 +51,7 @@ pub(crate) fn collect(define: impl FnOnce()) -> Vec<RouteDef> {
     })
 }
 
-fn push(def: RouteDef) -> Registered {
+fn push(def: RouteDef, group_name: String) -> Registered {
     COLLECTING.with(|c| {
         let mut slot = c.borrow_mut();
         match slot.as_mut() {
@@ -59,6 +59,7 @@ fn push(def: RouteDef) -> Registered {
                 list.push(def);
                 Registered {
                     index: Some(list.len() - 1),
+                    group_name,
                 }
             }
             None => {
@@ -68,7 +69,10 @@ fn push(def: RouteDef) -> Registered {
                     def.method.to_ascii_lowercase(),
                     def.path
                 );
-                Registered { index: None }
+                Registered {
+                    index: None,
+                    group_name,
+                }
             }
         }
     })
@@ -90,16 +94,19 @@ macro_rules! route_method {
             Args: 'static,
         {
             let group = folded();
-            push(RouteDef {
-                method: $method,
-                path: register_path(&format!("{}{}", group.prefix, normalize(path))),
-                name: None,
-                middleware: group.middleware,
-                handler: Arc::new(Erased::new(handler)),
-                stack: None,
-                max_body: None,
-                stream_body: false,
-            })
+            push(
+                RouteDef {
+                    method: $method,
+                    path: register_path(&format!("{}{}", group.prefix, normalize(path))),
+                    name: None,
+                    middleware: group.middleware,
+                    handler: Arc::new(Erased::new(handler)),
+                    stack: None,
+                    max_body: None,
+                    stream_body: false,
+                },
+                group.name,
+            )
         }
     };
 }
@@ -152,14 +159,19 @@ impl Route {
 /// ```
 pub struct Registered {
     index: Option<usize>,
+    /// 登録したときのグループの名前の頭（`Route::name("admin.")` を畳んだもの）。
+    ///
+    /// `name()` を呼んだ時点のグループではなく、**登録した時点**のものを使うためです。
+    group_name: String,
 }
 
 impl Registered {
     /// ルートに名前を付ける。`route("home")` で URL を引けるようになります。
     ///
     /// グループの中なら、外側の `name(...)` が頭に付きます。
+    /// 頭は**ルートを登録した時点**のグループで決まります。
     pub fn name(self, name: &str) -> Self {
-        let full = format!("{}{name}", folded().name);
+        let full = format!("{}{name}", self.group_name);
         self.edit(move |def| def.name = Some(full.into()))
     }
 
@@ -400,8 +412,16 @@ fn encode_outside_braces(segment: &str) -> String {
 /// 通るようにするための入口です。片方だけ素のパスで比べると、`.health("up")` と
 /// `Route::get("/up", ..)` が重なっていることに気づけず、`Routes::build` が
 /// 起動時にパニックしていました。
+///
+/// `%xx` の16進は大文字にそろえます。照合（`Routes::find`）は届いたパスを大文字に
+/// そろえてから引くので、`Route::get("/caf%c3%a9", ..)` と小文字で書いたルートは
+/// そろえる前は**必ず 404** でした。
 pub(crate) fn register_path(path: &str) -> String {
-    encode_static_segments(&normalize(path))
+    let encoded = encode_static_segments(&normalize(path));
+    match super::percent::upcase_hex(&encoded) {
+        std::borrow::Cow::Borrowed(_) => encoded,
+        std::borrow::Cow::Owned(upper) => upper,
+    }
 }
 
 /// 照合に使うパス。登録側（`normalize`）と同じ規則で、末尾の `/` を落とします。
@@ -993,6 +1013,45 @@ mod tests {
         assert_eq!(register_path("/あ"), "/%E3%81%82");
         // 何回通しても形が変わらない（`%` は残すので二重にならない）。
         assert_eq!(register_path(&register_path("/あ")), "/%E3%81%82");
+        // 小文字の16進で書いても大文字にそろえる。
+        assert_eq!(register_path("/caf%c3%a9"), "/caf%C3%A9");
+    }
+
+    #[test]
+    fn 小文字の十六進で登録したルートにも当たる() {
+        // 以前は登録側だけ小文字のまま残り、照合側は大文字にそろえるので必ず 404 だった。
+        let defs = collect(|| {
+            Route::get("/caf%c3%a9", ok);
+            Route::get("/x%2fy/{id}", ok);
+        });
+        let routes = Routes::build(defs);
+        for sent in ["/caf%c3%a9", "/caf%C3%A9", "/caf%c3%A9/"] {
+            assert!(
+                matches!(routes.find("GET", sent), Matched::Found { .. }),
+                "{sent}"
+            );
+        }
+        assert!(matches!(
+            routes.find("GET", "/x%2Fy/1"),
+            Matched::Found { .. }
+        ));
+    }
+
+    #[test]
+    fn 名前の頭は登録した時点のグループで決まる() {
+        // 以前は `name()` を呼んだ時点のグループを読んでいた。
+        let defs = collect(|| {
+            let mut kept = None;
+            Route::name("admin.").group(|| {
+                kept = Some(Route::get("/a", ok));
+            });
+            Route::name("other.").group(|| {
+                if let Some(registered) = kept.take() {
+                    registered.name("a");
+                }
+            });
+        });
+        assert_eq!(defs[0].name.as_deref(), Some("admin.a"));
     }
 
     #[test]

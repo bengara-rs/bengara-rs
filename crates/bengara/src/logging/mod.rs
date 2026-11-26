@@ -238,10 +238,17 @@ pub(crate) fn flush_stdout() {
 
 /// 終わるとき。全部のキューを書き切るのを待ちます（全体で上限 5 秒）。
 pub(crate) fn shutdown() {
+    shutdown_within(SHUTDOWN_LIMIT);
+}
+
+/// 全部のキューを書き切るのを、全体で `limit` まで待つ。
+///
+/// 強制終了（2 回目の合図）のときは、短い上限でこれを呼んでから終わります。
+pub(crate) fn shutdown_within(limit: Duration) {
     let Some(outputs) = OUTPUTS.get() else {
         return;
     };
-    let deadline = Instant::now() + SHUTDOWN_LIMIT;
+    let deadline = Instant::now() + limit;
     outputs.stdout.flush(deadline);
     if let Some(files) = outputs.files.get() {
         files.flush(deadline);

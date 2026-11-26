@@ -45,8 +45,10 @@ pub struct Request {
     ///
     /// `OnceLock` なので、入れ替えはできても書き換えはできません。
     /// `Clone` は中身ごと複製します（解析済みなら、複製も解析済みのままです）。
-    form_cache: OnceLock<Vec<(String, String)>>,
-    input_cache: OnceLock<Vec<(String, String)>>,
+    ///
+    /// フォーム（urlencoded）の組は `input_cache` の前半に 1 回だけ持ちます
+    /// （`form_pairs` はそこを借ります。別に写しません）。
+    input_cache: OnceLock<InputPairs>,
     cookie_cache: OnceLock<Vec<(String, String)>>,
     query_cache: OnceLock<Vec<(String, String)>>,
     /// `multipart/form-data` の本文を読んだ結果（文字の欄とファイル）。
@@ -79,6 +81,21 @@ pub struct Request {
     access_token: Option<Arc<crate::auth::PersonalAccessToken>>,
     /// リクエスト ID（`X-Request-Id`）。`Application` が入口で決めます。
     request_id: Option<Arc<str>>,
+    /// 本文を受け取れずに断ったか（413・400・408）。`Application` が載せます。
+    ///
+    /// 断った要求も共通のミドルウェアは通します（CORS の見出しを付けるため）。
+    /// そのとき `VerifyCsrfToken` は確かめずに通します。ハンドラは動かず、
+    /// 中で返るのは断ったときのエラーだけだからです。
+    body_rejected: bool,
+}
+
+/// クエリと本文をまとめた入力（[`Request::input_pairs`]）。
+#[derive(Debug, Clone, Default)]
+struct InputPairs {
+    /// 本文の組を先に、クエリの組を後ろに並べたもの。
+    pairs: Vec<(String, String)>,
+    /// 前から何組が本文か。
+    body_len: usize,
 }
 
 /// ログに出してよい形だけを出す。
@@ -156,7 +173,6 @@ impl Request {
             matched: false,
             session: None,
             remote_addr: None,
-            form_cache: OnceLock::new(),
             input_cache: OnceLock::new(),
             cookie_cache: OnceLock::new(),
             query_cache: OnceLock::new(),
@@ -168,6 +184,7 @@ impl Request {
             back: OnceLock::new(),
             access_token: None,
             request_id: None,
+            body_rejected: false,
         }
     }
 
@@ -185,7 +202,20 @@ impl Request {
     /// | `.stream_body()` | 読まずに `body_stream()` で取り出せるようにする（`multipart` も分けない） |
     ///
     /// 長さの申告（`Content-Length`）が上限を超えていれば、どちらも読まずに 413 です。
-    /// エラー（413・400・408）はミドルウェアを通さずに返します。
+    /// エラー（413・400・408）では、ハンドラもルートのミドルウェアも通しません
+    /// （共通のミドルウェアだけを通します。`Application::handle_inner`）。
+    ///
+    /// 組の数も、全部読んだここで確かめます。上限は multipart と同じ
+    /// [`MAX_PARTS`](crate::http::multipart::MAX_PARTS)（1000）で、超えたら 413 です。
+    ///
+    /// | 本文 | 数えるもの |
+    /// |---|---|
+    /// | フォーム（urlencoded） | `&` で区切った空でない組 |
+    /// | JSON | 最上位のオブジェクトの鍵（入れ子は数えない） |
+    /// | multipart | 欄（`multipart::parse`） |
+    ///
+    /// ルートに当たらなかった要求（404・405）では、組を数えず、multipart も分けません。
+    /// 壊れた multipart を無いパスへ送ると、404 ではなく 400 になっていました。
     pub(crate) async fn receive_body(
         &mut self,
         policy: crate::http::body::BodyPolicy,
@@ -219,13 +249,30 @@ impl Request {
             return Ok(());
         }
         self.body = Arc::new(read_all(pending, policy.limit, declared).await?);
+        if !self.matched {
+            return Ok(());
+        }
         // `multipart/form-data` はここで読む。壊れた本文（400）と上限超え（413）を、
-        // 本文の受け取りの失敗と同じく、ミドルウェアもハンドラも通さずに返すためです。
+        // 本文の受け取りの失敗と同じく、ハンドラを通さずに返すためです。
         if self.is_multipart() {
             let parsed = crate::http::multipart::parse(&self.body, self.content_type())?;
             let _ = self.multipart_cache.set(parsed);
+        } else if self.is_form() {
+            check_pair_count(form_pair_count(&self.body))?;
+        } else if self.is_json_body() {
+            check_pair_count(json_key_count(&self.body))?;
         }
         Ok(())
+    }
+
+    /// 本文を受け取れずに断ったことを覚える。`Application` が呼びます。
+    pub(crate) fn mark_body_rejected(&mut self) {
+        self.body_rejected = true;
+    }
+
+    /// 本文を受け取れずに断った要求か（`VerifyCsrfToken` が見ます）。
+    pub(crate) fn body_rejected(&self) -> bool {
+        self.body_rejected
     }
 
     /// 本文を少しずつ読む口を取り出す。`.stream_body()` を付けたルートだけで使えます。
@@ -773,17 +820,18 @@ impl Request {
     }
 
     /// フォームを解析した結果。1リクエストに1回だけ解析します。
+    ///
+    /// urlencoded の組は、入力の一覧（`input_pairs`）の前半を借ります。
+    /// 以前は別の置き場所に解析したものを、入力の一覧へもう 1 回写していました。
     fn form_pairs(&self) -> &[(String, String)] {
         if self.is_multipart() {
             return &self.multipart().fields;
         }
-        self.form_cache.get_or_init(|| {
-            if self.is_form() {
-                parse_query(&self.body_text())
-            } else {
-                Vec::new()
-            }
-        })
+        if !self.is_form() {
+            return &[];
+        }
+        let input = self.parsed_input();
+        &input.pairs[..input.body_len]
     }
 
     /// クエリと本文をまとめた入力の一覧。
@@ -801,12 +849,19 @@ impl Request {
     /// CSRF の検査が `_token` を見て、ハンドラが `validate()` を呼ぶので、
     /// 1本のリクエストで何度も聞かれます。毎回解析すると本文の分だけ無駄になります。
     pub(crate) fn input_pairs(&self) -> &[(String, String)] {
+        &self.parsed_input().pairs
+    }
+
+    /// 入力の一覧と、そのうち前から何組が本文か。1リクエストに1回だけ解析します。
+    fn parsed_input(&self) -> &InputPairs {
         self.input_cache.get_or_init(|| {
             let mut out = Vec::new();
             // ファイルの欄は入れない。CSRF の `_token` と `validate` の文字の欄はここから読み、
             // 検査に落ちたときに覚える入力（`old`）にもファイルが入らない。
-            if self.is_form() || self.is_multipart() {
+            if self.is_multipart() {
                 out.extend_from_slice(self.form_pairs());
+            } else if self.is_form() {
+                out = parse_query(&self.body_text());
             } else if self.is_json_body() {
                 if let Ok(serde_json::Value::Object(map)) =
                     serde_json::from_slice::<serde_json::Value>(&self.body)
@@ -822,8 +877,12 @@ impl Request {
                     }
                 }
             }
+            let body_len = out.len();
             out.extend_from_slice(self.query_pairs());
-            out
+            InputPairs {
+                pairs: out,
+                body_len,
+            }
         })
     }
 
@@ -842,12 +901,11 @@ impl Request {
     /// 本文はフォームなら組として、JSON なら最上位の値だけを読みます。
     /// CSRF のトークンを探すのに使います（URL に載った値は漏れやすいため）。
     ///
-    /// [`input_pairs`](Self::input_pairs) は「本文 → クエリ」の順に並べているので、
-    /// 末尾のクエリのぶんを除いた前半が本文です。解析し直しません。
+    /// [`input_pairs`](Self::input_pairs) は「本文 → クエリ」の順に並べ、本文の組の数を
+    /// 一緒に覚えています。その前半だけを見ます。解析し直しません。
     pub(crate) fn body_input(&self, key: &str) -> Option<String> {
-        let pairs = self.input_pairs();
-        let body_len = pairs.len().saturating_sub(self.query_pairs().len());
-        pairs[..body_len]
+        let input = self.parsed_input();
+        input.pairs[..input.body_len]
             .iter()
             .find(|(k, _)| k == key)
             .map(|(_, v)| v.clone())
@@ -1245,6 +1303,57 @@ pub(crate) fn json_content_type(value: &str) -> bool {
 /// `req.file`・`req.files` と、検査（`validation.rs`）が同じ決まりで引くために 1 か所に置きます。
 pub(crate) fn file_field_is(field: &str, name: &str) -> bool {
     field == name || field.strip_suffix("[]") == Some(name)
+}
+
+/// 組の数が上限（[`MAX_PARTS`](crate::http::multipart::MAX_PARTS)）を超えていれば 413。
+///
+/// PHP の `max_input_vars` と同じ上限です。PHP は超えた分を黙って捨てますが、
+/// multipart と同じく、欄が抜けたまま進むより断るほうを選びます。
+fn check_pair_count(count: usize) -> Result<()> {
+    let limit = crate::http::multipart::MAX_PARTS;
+    if count > limit {
+        return Err(Error::http(
+            413,
+            format!("本文の項目が {limit} を超えています"),
+        ));
+    }
+    Ok(())
+}
+
+/// urlencoded の本文の組の数（`parse_query` が作る組の数と同じ）。文字列は作りません。
+fn form_pair_count(body: &[u8]) -> usize {
+    body.split(|byte| *byte == b'&')
+        .filter(|pair| !pair.is_empty())
+        .count()
+}
+
+/// JSON の本文の、最上位のオブジェクトの鍵の数。オブジェクトでなければ 0。
+///
+/// 鍵は最低 1 つの `:` を伴うので、`:` が上限より少なければ読まずに済ませます。
+/// 読むときも値は組み立てず（`IgnoredAny`）、鍵を数えるだけです。
+fn json_key_count(body: &[u8]) -> usize {
+    use serde::de::{Deserializer as _, IgnoredAny, MapAccess, Visitor};
+
+    if body.iter().filter(|byte| **byte == b':').count() <= crate::http::multipart::MAX_PARTS {
+        return 0;
+    }
+    struct Keys;
+    impl<'de> Visitor<'de> for Keys {
+        type Value = usize;
+        fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("JSON のオブジェクト")
+        }
+        fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> std::result::Result<usize, A::Error> {
+            let mut count = 0;
+            while map.next_entry::<IgnoredAny, IgnoredAny>()?.is_some() {
+                count += 1;
+            }
+            Ok(count)
+        }
+    }
+    serde_json::Deserializer::from_slice(body)
+        .deserialize_map(Keys)
+        .unwrap_or(0)
 }
 
 /// `a=1&b=2` を組に分ける。値は `%xx` と `+` を元に戻します。

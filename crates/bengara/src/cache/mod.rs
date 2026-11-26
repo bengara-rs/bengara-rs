@@ -130,7 +130,17 @@ where
 /// 書いた中身が捨てられ、`con` は読み戻しで戻ってきません。判定は
 /// `Storage` と同じ [`crate::storage::usable_name`] に任せます（決定記録 #074）。
 pub(crate) fn normalize_key(key: &str) -> String {
-    let safe = !key.is_empty()
+    if passes_through(key) {
+        // 通した文字に `~` は入っていないので、そのまま使える。
+        key.to_string()
+    } else {
+        format!("~{}", crypto::to_hex(&crypto::sha256(key.as_bytes())))
+    }
+}
+
+/// [`normalize_key`] がそのまま使う鍵か（ハッシュにしない鍵か）。
+fn passes_through(key: &str) -> bool {
+    !key.is_empty()
         && key.len() <= 150
         // `:` を含む鍵はハッシュ側に回す。置換先の `~` が NTFS の短い名前と
         // 区別できないため（上の説明）。
@@ -140,13 +150,24 @@ pub(crate) fn normalize_key(key: &str) -> String {
         && crate::storage::usable_name(key).is_ok()
         && key.bytes().all(|b| {
             b.is_ascii_lowercase() || b.is_ascii_digit() || matches!(b, b'.' | b'_' | b'-')
-        });
-    if safe {
-        // 通した文字に `~` は入っていないので、そのまま使える。
-        key.to_string()
-    } else {
-        format!("~{}", crypto::to_hex(&crypto::sha256(key.as_bytes())))
-    }
+        })
+}
+
+/// [`normalize_key`] が返しうる形か。`FileCache` が受け取る鍵を確かめるのに使います。
+///
+/// 通すのは次の 2 つだけです。どちらも `/`・`\`・`..` を含まないので、
+/// 置き場所の外を指せません。
+///
+/// - そのまま使う鍵（小文字の英数字と `. _ -`。[`normalize_key`] と同じ規則）
+/// - `~` と小文字の 16 進 64 文字（ハッシュ側の形）
+pub(crate) fn is_normalized_key(key: &str) -> bool {
+    passes_through(key)
+        || key.strip_prefix('~').is_some_and(|hex| {
+            hex.len() == 64
+                && hex
+                    .bytes()
+                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        })
 }
 
 /// キャッシュの入口。Laravel の `Cache` に当たります。

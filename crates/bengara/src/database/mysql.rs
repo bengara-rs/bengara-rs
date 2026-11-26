@@ -18,7 +18,7 @@ use super::backend::{Backend, DbFuture, RawTx};
 use super::failure::{failed, unsupported_column};
 use super::grammar::Driver;
 use super::temporal;
-use super::value::{Affected, Row, Value};
+use super::value::{Affected, Row, RowColumns, Value};
 use super::ConnectionConfig;
 use crate::error::{Error, Result};
 
@@ -198,20 +198,22 @@ fn convert_rows(rows: &[MySqlRow]) -> Result<Vec<Row>> {
     let Some(first) = rows.first() else {
         return Ok(Vec::new());
     };
-    let columns: Arc<[String]> = first
-        .columns()
-        .iter()
-        .map(|column| column.name().to_string())
-        .collect();
+    let columns = RowColumns::new(
+        first
+            .columns()
+            .iter()
+            .map(|column| column.name().to_string())
+            .collect(),
+    );
     rows.iter().map(|row| convert_row(row, &columns)).collect()
 }
 
-fn convert_row(row: &MySqlRow, columns: &Arc<[String]>) -> Result<Row> {
-    let mut values = Vec::with_capacity(columns.len());
-    for (index, name) in columns.iter().enumerate() {
+fn convert_row(row: &MySqlRow, columns: &RowColumns) -> Result<Row> {
+    let mut values = Vec::with_capacity(columns.names().len());
+    for (index, name) in columns.names().iter().enumerate() {
         values.push(convert_value(row, index, name)?);
     }
-    Ok(Row::with_columns(Arc::clone(columns), values))
+    Ok(columns.row(values))
 }
 
 /// 1つの値を `Value` に直す。

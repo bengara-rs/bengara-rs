@@ -31,9 +31,13 @@ pub(crate) fn normalize(raw: &str) -> String {
         return format!("{head}.{kept}");
     }
     // `-0.0` は `0` にする。`-0` と `0` が別の文字列になると、同じ値を比べて食い違う。
+    // 整数部の無い形（`.000` / `-.0`）も `0` にする。いまのドライバは整数部を必ず付けて
+    // 返すので通りませんが、空の文字列や `-` だけを返さないようにしておきます。
     if head
         .strip_prefix('-')
-        .is_some_and(|digits| !digits.is_empty() && digits.bytes().all(|b| b == b'0'))
+        .unwrap_or(head)
+        .bytes()
+        .all(|b| b == b'0')
     {
         return "0".to_string();
     }
@@ -60,6 +64,10 @@ mod tests {
         assert_eq!(normalize("-0.0"), "0");
         assert_eq!(normalize("-0.000"), "0");
         assert_eq!(normalize("-10.0"), "-10");
+        // 整数部の無い形も、空の文字列や `-` だけにしない。
+        assert_eq!(normalize(".000"), "0");
+        assert_eq!(normalize("-.0"), "0");
+        assert_eq!(normalize(".50"), ".5");
     }
 
     #[test]

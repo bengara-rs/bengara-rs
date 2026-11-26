@@ -1,7 +1,8 @@
 //! 下回りのドライバが満たすトレイト。利用者には見せません。
 //!
-//! ここから先（`sqlite.rs`）だけが sqlx を知っています。上の層は SQL の文字列と
-//! `Value` の一覧しか扱いません。
+//! ここから先（`sqlite.rs`・`mysql.rs`・`postgres.rs`）だけが sqlx の接続と問い合わせを
+//! 知っています。上の層は SQL の文字列と `Value` の一覧しか扱いません
+//! （日時の型を文字列に直す `temporal.rs` も sqlx の型を使います）。
 
 use std::future::Future;
 use std::pin::Pin;

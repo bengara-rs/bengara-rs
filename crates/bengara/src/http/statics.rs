@@ -40,6 +40,26 @@
 //! 埋め込みは「長さと中身のハッシュ」から作ります（起動時に 1 回だけ）。
 //! ディスクのファイルは、開いて長さと更新時刻を採るだけで決まります。
 //! 304 を返すときは本文を読みません。
+//!
+//! ディスクのファイルには `Last-Modified` も付けます。`If-None-Match` が無いときだけ
+//! `If-Modified-Since` を見て、更新されていなければ 304 です（RFC 9110 の 13.1.3。
+//! `If-None-Match` があればそちらが優先します）。埋め込みには更新時刻が無いので付けません。
+//!
+//! ## 一部だけの読み込み（`Range`）
+//!
+//! `Accept-Ranges: bytes` を付け、`Range: bytes=...` の**1 つだけの範囲**に 206 で応えます。
+//! iOS の Safari は、範囲で読めないと `<video>` を再生しません。
+//!
+//! | 届いたもの | 応答 |
+//! |---|---|
+//! | 範囲が 1 つ（`bytes=0-99`・`bytes=100-`・`bytes=-100`） | 206 ＋ `Content-Range: bytes 0-99/長さ` |
+//! | 範囲がファイルの外（`bytes=999-` で長さが 10 など） | 416 ＋ `Content-Range: bytes */長さ` |
+//! | 範囲が 2 つ以上・形が読めない・`bytes` 以外の単位 | 範囲を無視して 200 で全部 |
+//! | `If-Range` が合わない（弱い ETag はいつも合わない） | 範囲を無視して 200 で全部 |
+//! | `HEAD` | 範囲を無視して 200（本文は読まない） |
+//!
+//! ディスクのファイルは、範囲の分だけを読みます。範囲の無い 200 は今までどおり全部を
+//! メモリに読んでから返します。
 
 use std::collections::HashMap;
 use std::path::{Component, Path, PathBuf};
@@ -142,6 +162,36 @@ const CACHE_CONTROL: &str = "public, max-age=0, must-revalidate";
 /// `.html` や `.svg` が同じオリジンのスクリプトとして動くのを止めます。
 const NO_SNIFF: &str = "nosniff";
 
+/// 静的ファイルの応答を変える、要求の見出し（条件つきの取得と範囲）。
+///
+/// `Application` が要求から写して作ります。ディスクを読むときは裏のスレッドへ
+/// 渡すので、借りずに持ちます。
+#[derive(Debug, Default, Clone)]
+pub(crate) struct Conditions {
+    /// `If-None-Match`。
+    pub(crate) if_none_match: Option<String>,
+    /// `If-Modified-Since`。`If-None-Match` があれば見ません。
+    pub(crate) if_modified_since: Option<String>,
+    /// `Range`。
+    pub(crate) range: Option<String>,
+    /// `If-Range`。合わなければ `Range` を無視します。
+    pub(crate) if_range: Option<String>,
+}
+
+impl Conditions {
+    /// 要求の見出しから写す。
+    pub(crate) fn from_request(req: &crate::http::Request) -> Self {
+        let header = |name: &str| req.header(name).map(str::to_string);
+        Self {
+            if_none_match: header("if-none-match"),
+            if_modified_since: header("if-modified-since"),
+            // `HEAD` では範囲を見ない（`Range` が決まっているのは GET だけ。RFC 9110 の 14.2）。
+            range: header("range").filter(|_| req.method() != "HEAD"),
+            if_range: header("if-range"),
+        }
+    }
+}
+
 /// 埋め込んだ1本ぶん。
 pub(crate) struct EmbeddedFile {
     body: &'static [u8],
@@ -190,7 +240,7 @@ pub(crate) fn embedded() -> &'static Embedded {
 pub(crate) fn serve_embedded(
     files: &'static Embedded,
     request_path: &str,
-    if_none_match: Option<&str>,
+    conditions: &Conditions,
 ) -> Option<Response> {
     if files.is_empty() {
         return None;
@@ -204,25 +254,38 @@ pub(crate) fn serve_embedded(
 
     // そのままの鍵で探し、無ければディレクトリとして index.html を探す。
     if let Some(file) = files.get(key.as_str()) {
-        return Some(embedded_response(&key, file, if_none_match));
+        return Some(embedded_response(&key, file, conditions));
     }
     let nested = format!("{key}/index.html");
     let file = files.get(nested.as_str())?;
-    Some(embedded_response(&nested, file, if_none_match))
+    Some(embedded_response(&nested, file, conditions))
 }
 
-fn embedded_response(
-    key: &str,
-    file: &'static EmbeddedFile,
-    if_none_match: Option<&str>,
-) -> Response {
-    if etag_matches(if_none_match, &file.etag) {
-        return not_modified(&file.etag);
+fn embedded_response(key: &str, file: &'static EmbeddedFile, conditions: &Conditions) -> Response {
+    if etag_matches(conditions.if_none_match.as_deref(), &file.etag) {
+        return not_modified(&file.etag, None);
     }
+    let length = file.body.len() as u64;
+    let body = match requested_range(conditions, &file.etag, None, length) {
+        RangeAnswer::Full => file.body,
+        RangeAnswer::Unsatisfiable => return range_not_satisfiable(length),
+        RangeAnswer::Partial(start, end) => {
+            // `static_bytes` は `&'static [u8]` をそのまま持つので、範囲もコピーしない。
+            let slice = &file.body[start as usize..=end as usize];
+            return Response::static_bytes(content_type(Path::new(key)), slice)
+                .with_status(206)
+                .with_header("content-range", format!("bytes {start}-{end}/{length}"))
+                .with_header("etag", file.etag.clone())
+                .with_header("cache-control", CACHE_CONTROL)
+                .with_header("accept-ranges", "bytes")
+                .with_header("x-content-type-options", NO_SNIFF);
+        }
+    };
     // `static_bytes` は `&'static [u8]` をそのまま持つので、本文をコピーしない。
-    Response::static_bytes(content_type(Path::new(key)), file.body)
+    Response::static_bytes(content_type(Path::new(key)), body)
         .with_header("etag", file.etag.clone())
         .with_header("cache-control", CACHE_CONTROL)
+        .with_header("accept-ranges", "bytes")
         .with_header("x-content-type-options", NO_SNIFF)
 }
 
@@ -234,7 +297,7 @@ pub(crate) fn serve_storage(
     public_disk: &Path,
     canonical_root: Option<&Path>,
     request_path: &str,
-    if_none_match: Option<&str>,
+    conditions: &Conditions,
     want_body: bool,
 ) -> Option<Response> {
     let rest = request_path.strip_prefix(STORAGE_PREFIX)?;
@@ -247,7 +310,7 @@ pub(crate) fn serve_storage(
     if rest.trim_start_matches('/').is_empty() {
         return None;
     }
-    let response = serve(public_disk, canonical_root, rest, if_none_match, want_body)?;
+    let response = serve(public_disk, canonical_root, rest, conditions, want_body)?;
     // 利用者が置いたファイルを配る入口なので、`.svg` や `.html` を直接開いても
     // 同じオリジンのスクリプトとして動かないようにする。304 には本文が無いので付けない。
     if response.status() == 304 {
@@ -285,18 +348,19 @@ fn to_key(relative: &Path) -> Option<String> {
 ///
 /// 本文は**全部をメモリに読んでから**返します（流しながらは返しません）。
 /// 大きなファイルを同時に取りに来られると、その数だけメモリを使います。
+/// `Range` の 206 では、範囲の分だけを読みます。
 pub(crate) fn serve(
     public_dir: &Path,
     canonical_root: Option<&Path>,
     request_path: &str,
-    if_none_match: Option<&str>,
+    conditions: &Conditions,
     want_body: bool,
 ) -> Option<Response> {
     serve_from(
         public_dir,
         canonical_root,
         request_path,
-        if_none_match,
+        conditions,
         want_body,
         false,
     )
@@ -315,14 +379,14 @@ pub(crate) fn serve_public(
     public_dir: &Path,
     canonical_root: Option<&Path>,
     request_path: &str,
-    if_none_match: Option<&str>,
+    conditions: &Conditions,
     want_body: bool,
 ) -> Option<Response> {
     serve_from(
         public_dir,
         canonical_root,
         request_path,
-        if_none_match,
+        conditions,
         want_body,
         true,
     )
@@ -333,7 +397,7 @@ fn serve_from(
     public_dir: &Path,
     canonical_root: Option<&Path>,
     request_path: &str,
-    if_none_match: Option<&str>,
+    conditions: &Conditions,
     want_body: bool,
     hide_storage: bool,
 ) -> Option<Response> {
@@ -369,23 +433,224 @@ fn serve_from(
     }
 
     let etag = disk_etag(&metadata);
-    if etag_matches(if_none_match, &etag) {
-        return Some(not_modified(&etag));
+    let modified = modified_seconds(&metadata);
+    if not_modified_since(conditions, &etag, modified) {
+        return Some(not_modified(&etag, modified));
     }
 
-    let response = Response::new(200)
+    let length = metadata.len();
+    let mut response = Response::new(200)
         .with_header("content-type", content_type(&canonical))
-        .with_header("etag", etag)
+        .with_header("etag", etag.clone())
         .with_header("cache-control", CACHE_CONTROL)
+        .with_header("accept-ranges", "bytes")
         .with_header("x-content-type-options", NO_SNIFF);
+    if let Some(modified) = modified {
+        response = response.with_header("last-modified", http_date(modified));
+    }
     if !want_body {
-        // 本文を読まないので、長さは自分で知らせる。
-        return Some(response.with_header("content-length", metadata.len().to_string()));
+        // 本文を読まないので、長さは自分で知らせる。範囲は見ない（HEAD）。
+        return Some(response.with_header("content-length", length.to_string()));
+    }
+    match requested_range(conditions, &etag, modified, length) {
+        RangeAnswer::Full => {}
+        RangeAnswer::Unsatisfiable => return Some(range_not_satisfiable(length)),
+        RangeAnswer::Partial(start, end) => {
+            // 範囲の分だけを、開いたままのハンドルから読む。
+            use std::io::{Read, Seek, SeekFrom};
+            file.seek(SeekFrom::Start(start)).ok()?;
+            let wanted = end - start + 1;
+            let mut body = Vec::with_capacity(usize::try_from(wanted).unwrap_or(0));
+            file.take(wanted).read_to_end(&mut body).ok()?;
+            // 読む間に縮んだときは、長さの合わない 206 を返さない。
+            if body.len() as u64 != wanted {
+                return None;
+            }
+            return Some(
+                response
+                    .with_status(206)
+                    .with_header("content-range", format!("bytes {start}-{end}/{length}"))
+                    .with_body(body),
+            );
+        }
     }
     // 開いたままのハンドルから読む。ETag と同じ中身であることが保証されます。
-    let mut body = Vec::with_capacity(usize::try_from(metadata.len()).unwrap_or(0));
+    let mut body = Vec::with_capacity(usize::try_from(length).unwrap_or(0));
     std::io::Read::read_to_end(&mut file, &mut body).ok()?;
     Some(response.with_body(body))
+}
+
+/// `If-None-Match` か `If-Modified-Since` から見て、本文を返さずに 304 にしてよいか。
+///
+/// `If-None-Match` があれば、それだけで決めます（RFC 9110 の 13.1.3）。
+fn not_modified_since(conditions: &Conditions, etag: &str, modified: Option<u64>) -> bool {
+    if conditions.if_none_match.is_some() {
+        return etag_matches(conditions.if_none_match.as_deref(), etag);
+    }
+    match (modified, conditions.if_modified_since.as_deref()) {
+        (Some(modified), Some(since)) => {
+            parse_http_date(since).is_some_and(|since| modified <= since)
+        }
+        _ => false,
+    }
+}
+
+/// 範囲の求めにどう応えるか。
+#[derive(Debug, PartialEq, Eq)]
+enum RangeAnswer {
+    /// 全部を 200 で返す。
+    Full,
+    /// `start..=end` を 206 で返す。
+    Partial(u64, u64),
+    /// 416 を返す。
+    Unsatisfiable,
+}
+
+/// `Range` と `If-Range` を読む。
+///
+/// `If-Range` は、強い ETag か `Last-Modified` と同じ日時のときだけ合います。
+/// 作る ETag はいつも弱いので、ETag で送られた `If-Range` は合わず、全部を返します
+/// （RFC 9110 の 13.1.5。弱い ETag で範囲をつなぐと、違う版の中身が混ざりえます）。
+fn requested_range(
+    conditions: &Conditions,
+    etag: &str,
+    modified: Option<u64>,
+    length: u64,
+) -> RangeAnswer {
+    let Some(range) = conditions.range.as_deref() else {
+        return RangeAnswer::Full;
+    };
+    if let Some(if_range) = conditions.if_range.as_deref() {
+        let if_range = if_range.trim();
+        let fresh = if if_range.starts_with('"') {
+            // 強い ETag どうしの比較。作る ETag は弱いので、ここは合いません。
+            !etag.starts_with("W/") && if_range == etag
+        } else if if_range.starts_with("W/") {
+            false
+        } else {
+            modified.is_some() && parse_http_date(if_range) == modified
+        };
+        if !fresh {
+            return RangeAnswer::Full;
+        }
+    }
+    parse_range(range, length)
+}
+
+/// `bytes=0-99` の形を読む。1 つだけの範囲に応えます。
+///
+/// 読めない形・2 つ以上の範囲・`bytes` 以外の単位は `Full`（範囲を無視する。RFC 9110 の 14.2）。
+fn parse_range(header: &str, length: u64) -> RangeAnswer {
+    let header = header.trim();
+    let Some((unit, spec)) = header.split_once('=') else {
+        return RangeAnswer::Full;
+    };
+    if !unit.trim().eq_ignore_ascii_case("bytes") || spec.contains(',') {
+        return RangeAnswer::Full;
+    }
+    let Some((first, last)) = spec.trim().split_once('-') else {
+        return RangeAnswer::Full;
+    };
+    let digits = |text: &str| -> Option<Option<u64>> {
+        if text.is_empty() {
+            return Some(None);
+        }
+        if !text.bytes().all(|b| b.is_ascii_digit()) {
+            return None;
+        }
+        // 桁が多すぎて読めない値は、ファイルの長さより大きいものとして扱う。
+        Some(Some(text.parse::<u64>().unwrap_or(u64::MAX)))
+    };
+    let (Some(first), Some(last)) = (digits(first.trim()), digits(last.trim())) else {
+        return RangeAnswer::Full;
+    };
+    match (first, last) {
+        // `bytes=-100`：末尾の 100 バイト。
+        (None, Some(suffix)) => {
+            if suffix == 0 || length == 0 {
+                return RangeAnswer::Unsatisfiable;
+            }
+            RangeAnswer::Partial(length.saturating_sub(suffix), length - 1)
+        }
+        // `bytes=100-`：100 バイト目から最後まで。
+        (Some(start), None) => {
+            if start >= length {
+                return RangeAnswer::Unsatisfiable;
+            }
+            RangeAnswer::Partial(start, length - 1)
+        }
+        (Some(start), Some(end)) => {
+            if start > end {
+                return RangeAnswer::Full;
+            }
+            if start >= length {
+                return RangeAnswer::Unsatisfiable;
+            }
+            RangeAnswer::Partial(start, end.min(length - 1))
+        }
+        (None, None) => RangeAnswer::Full,
+    }
+}
+
+/// 範囲がファイルの外だった（416）。
+fn range_not_satisfiable(length: u64) -> Response {
+    Response::new(416)
+        .with_header("content-range", format!("bytes */{length}"))
+        .with_header("accept-ranges", "bytes")
+}
+
+/// 更新時刻（UNIX 時刻の秒）。採れなければ `None`。
+fn modified_seconds(metadata: &std::fs::Metadata) -> Option<u64> {
+    metadata
+        .modified()
+        .ok()?
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .map(|elapsed| elapsed.as_secs())
+}
+
+/// UNIX 時刻（秒）を `Sun, 06 Nov 1994 08:49:37 GMT` の形（IMF-fixdate）にする。
+fn http_date(seconds: u64) -> String {
+    const DAYS: [&str; 7] = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+    const MONTHS: [&str; 12] = [
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+    ];
+    let seconds = i64::try_from(seconds).unwrap_or(i64::MAX);
+    let days = seconds.div_euclid(86_400);
+    let in_day = seconds.rem_euclid(86_400);
+    let (year, month, day) = crate::support::time::civil_from_days(days);
+    // 1970-01-01 は木曜日。
+    let weekday = DAYS[(days + 4).rem_euclid(7) as usize];
+    format!(
+        "{weekday}, {day:02} {} {year:04} {:02}:{:02}:{:02} GMT",
+        MONTHS[(month - 1) as usize],
+        in_day / 3600,
+        in_day % 3600 / 60,
+        in_day % 60
+    )
+}
+
+/// `Sun, 06 Nov 1994 08:49:37 GMT` の形を UNIX 時刻（秒）にする。読めなければ `None`。
+///
+/// 読むのはこの形（IMF-fixdate）だけです。古い 2 つの形（RFC 850 と asctime）は
+/// 読まず、条件が無いものとして扱います（全部を返す側に倒れます）。
+fn parse_http_date(text: &str) -> Option<u64> {
+    const MONTHS: [&str; 12] = [
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+    ];
+    let (_weekday, rest) = text.trim().split_once(", ")?;
+    let mut parts = rest.split(' ');
+    let day = parts.next()?;
+    let month = parts.next()?;
+    let year = parts.next()?;
+    let time = parts.next()?;
+    if parts.next() != Some("GMT") || parts.next().is_some() || day.len() != 2 {
+        return None;
+    }
+    let month = MONTHS.iter().position(|m| *m == month)? + 1;
+    let seconds =
+        crate::support::time::parse_timestamp(&format!("{year}-{month:02}-{day} {time}"))?;
+    u64::try_from(seconds).ok()
 }
 
 /// 置き場所からの相対パス（実体）が `storage/` の下か。
@@ -399,11 +664,15 @@ fn starts_in_storage(below_root: &Path) -> bool {
     )
 }
 
-/// 本文を返さない 304。
-fn not_modified(etag: &str) -> Response {
-    Response::new(304)
+/// 本文を返さない 304。`Last-Modified` は、ディスクのファイルのときだけ付けます。
+fn not_modified(etag: &str, modified: Option<u64>) -> Response {
+    let response = Response::new(304)
         .with_header("etag", etag.to_string())
-        .with_header("cache-control", CACHE_CONTROL)
+        .with_header("cache-control", CACHE_CONTROL);
+    match modified {
+        Some(modified) => response.with_header("last-modified", http_date(modified)),
+        None => response,
+    }
 }
 
 /// ディスクのファイルの弱い ETag。長さと更新時刻から作ります。
@@ -522,6 +791,14 @@ fn content_type(path: &Path) -> &'static str {
 mod tests {
     use super::*;
 
+    /// `If-None-Match` だけを持つ条件。
+    fn etag_only(etag: &str) -> Conditions {
+        Conditions {
+            if_none_match: Some(etag.to_string()),
+            ..Conditions::default()
+        }
+    }
+
     #[test]
     fn 親ディレクトリへは出られない() {
         assert_eq!(safe_relative("/../secret"), None);
@@ -590,7 +867,8 @@ mod tests {
 
     #[test]
     fn 埋め込みから配信できる() {
-        let res = serve_embedded(files(), "/css/app.css", None).expect("あるはず");
+        let res =
+            serve_embedded(files(), "/css/app.css", &Conditions::default()).expect("あるはず");
         assert_eq!(res.status(), 200);
         assert_eq!(res.body(), b"body{}");
         assert_eq!(
@@ -603,13 +881,13 @@ mod tests {
 
     #[test]
     fn 埋め込みのルートはindexを指す() {
-        let res = serve_embedded(files(), "/", None).expect("あるはず");
+        let res = serve_embedded(files(), "/", &Conditions::default()).expect("あるはず");
         assert_eq!(res.body(), b"<h1>top</h1>");
     }
 
     #[test]
     fn 埋め込みのディレクトリはindexを探す() {
-        let res = serve_embedded(files(), "/docs", None).expect("あるはず");
+        let res = serve_embedded(files(), "/docs", &Conditions::default()).expect("あるはず");
         assert_eq!(res.body(), b"<h1>docs</h1>");
         assert_eq!(
             res.header("content-type").unwrap(),
@@ -619,27 +897,29 @@ mod tests {
 
     #[test]
     fn 埋め込みに無ければnone() {
-        assert!(serve_embedded(files(), "/none.txt", None).is_none());
-        assert!(serve_embedded(files(), "/../secret", None).is_none());
+        assert!(serve_embedded(files(), "/none.txt", &Conditions::default()).is_none());
+        assert!(serve_embedded(files(), "/../secret", &Conditions::default()).is_none());
     }
 
     #[test]
     fn 埋め込みが空ならnone() {
-        assert!(serve_embedded(empty(), "/css/app.css", None).is_none());
+        assert!(serve_embedded(empty(), "/css/app.css", &Conditions::default()).is_none());
     }
 
     #[test]
     fn 埋め込みは同じetagなら304を返す() {
-        let first = serve_embedded(files(), "/css/app.css", None).expect("あるはず");
+        let first =
+            serve_embedded(files(), "/css/app.css", &Conditions::default()).expect("あるはず");
         let etag = first.header("etag").expect("etag が付く").to_string();
 
-        let again = serve_embedded(files(), "/css/app.css", Some(&etag)).expect("あるはず");
+        let again = serve_embedded(files(), "/css/app.css", &etag_only(&etag)).expect("あるはず");
         assert_eq!(again.status(), 304);
         assert!(again.body().is_empty(), "304 に本文は付けない");
         assert_eq!(again.header("etag"), Some(etag.as_str()));
 
         // 別の値なら 200 で中身を返す。
-        let other = serve_embedded(files(), "/css/app.css", Some("W/\"0-0\"")).expect("あるはず");
+        let other =
+            serve_embedded(files(), "/css/app.css", &etag_only("W/\"0-0\"")).expect("あるはず");
         assert_eq!(other.status(), 200);
     }
 
@@ -665,48 +945,51 @@ mod tests {
     #[test]
     fn storageの頭が合わなければnone() {
         let dir = std::env::temp_dir();
-        assert!(serve_storage(&dir, None, "/css/app.css", None, true).is_none());
-        assert!(serve_storage(&dir, None, "/storage", None, true).is_none());
+        assert!(serve_storage(&dir, None, "/css/app.css", &Conditions::default(), true).is_none());
+        assert!(serve_storage(&dir, None, "/storage", &Conditions::default(), true).is_none());
     }
 
     #[test]
     fn storageだけで来たらnone() {
         // `/storage/` は index.html を指さない。`public/` 用の規則を持ち込まない。
         let dir = std::env::temp_dir();
-        assert!(serve_storage(&dir, None, STORAGE_PREFIX, None, true).is_none());
+        assert!(serve_storage(&dir, None, STORAGE_PREFIX, &Conditions::default(), true).is_none());
         // `/` が続いても同じ。先頭の `/` を落としてから空かどうかを見る。
-        assert!(serve_storage(&dir, None, "/storage//", None, true).is_none());
-        assert!(serve_storage(&dir, None, "/storage///", None, true).is_none());
+        assert!(serve_storage(&dir, None, "/storage//", &Conditions::default(), true).is_none());
+        assert!(serve_storage(&dir, None, "/storage///", &Conditions::default(), true).is_none());
     }
 
     #[test]
     fn storageの配信にはcspが付く() {
         let dir = temp_dir("storage-csp");
         std::fs::write(dir.join("a.svg"), "<svg/>").unwrap();
-        let res = serve_storage(&dir, None, "/storage/a.svg", None, true).expect("あるはず");
+        let res = serve_storage(&dir, None, "/storage/a.svg", &Conditions::default(), true)
+            .expect("あるはず");
         assert_eq!(res.header("content-security-policy"), Some(STORAGE_CSP));
         // 304 には付けない（本文が無い）。
         let etag = res.header("etag").unwrap().to_string();
-        let res = serve_storage(&dir, None, "/storage/a.svg", Some(&etag), true).unwrap();
+        let res = serve_storage(&dir, None, "/storage/a.svg", &etag_only(&etag), true).unwrap();
         assert_eq!(res.status(), 304);
         assert_eq!(res.header("content-security-policy"), None);
         // public/ 側には付けない。
         std::fs::write(dir.join("b.svg"), "<svg/>").unwrap();
-        let res = serve(&dir, None, "/b.svg", None, true).expect("あるはず");
+        let res = serve(&dir, None, "/b.svg", &Conditions::default(), true).expect("あるはず");
         assert_eq!(res.header("content-security-policy"), None);
     }
 
     #[test]
     fn 静的ファイルにはnosniffが付く() {
         // 埋め込みから。
-        let res = serve_embedded(files(), "/css/app.css", None).expect("あるはず");
+        let res =
+            serve_embedded(files(), "/css/app.css", &Conditions::default()).expect("あるはず");
         assert_eq!(res.header("x-content-type-options"), Some(NO_SNIFF));
 
         // ディスクから。
         let dir = temp_dir("nosniff");
         std::fs::write(dir.join("a.txt"), "x").unwrap();
         let root = dir.canonicalize().unwrap();
-        let res = serve(&dir, Some(&root), "/a.txt", None, true).expect("あるはず");
+        let res =
+            serve(&dir, Some(&root), "/a.txt", &Conditions::default(), true).expect("あるはず");
         assert_eq!(res.header("x-content-type-options"), Some(NO_SNIFF));
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -786,11 +1069,13 @@ mod tests {
         for raw in ["/STORAGE/x.css", "/Storage/x.css"] {
             let path = normalize_path(raw);
             assert!(
-                serve_storage(&dir, None, &path, None, true).is_none(),
+                serve_storage(&dir, None, &path, &Conditions::default(), true).is_none(),
                 "{raw} は 404"
             );
         }
-        assert!(serve_storage(&dir, None, "/storage/x.css", None, true).is_some());
+        assert!(
+            serve_storage(&dir, None, "/storage/x.css", &Conditions::default(), true).is_some()
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -839,25 +1124,39 @@ mod tests {
             "/css/../storage/x.css",
         ] {
             assert!(
-                serve_public(&dir, Some(&root), path, None, true).is_none(),
+                serve_public(&dir, Some(&root), path, &Conditions::default(), true).is_none(),
                 "{path} は返さない"
             );
             assert!(
-                serve_public(&dir, None, path, None, true).is_none(),
+                serve_public(&dir, None, path, &Conditions::default(), true).is_none(),
                 "{path} は返さない（実体をその場で解決する道）"
             );
         }
         // 似た名前と、2 つ目以降の区間が `storage` のものは今までどおり配る。
         for path in ["/storageroom.css", "/css/storage/z.css"] {
             assert!(
-                serve_public(&dir, Some(&root), path, None, true).is_some(),
+                serve_public(&dir, Some(&root), path, &Conditions::default(), true).is_some(),
                 "{path} は配る"
             );
         }
         // `storage/app/public/` の配信（`serve`）は、この制限を持たない。
         // `/storage/storage/x.css`（置き場所の中の `storage/` ディレクトリ）は配れる。
-        assert!(serve(&dir, Some(&root), "/storage/x.css", None, true).is_some());
-        assert!(serve_storage(&dir, Some(&root), "/storage/storage/x.css", None, true).is_some());
+        assert!(serve(
+            &dir,
+            Some(&root),
+            "/storage/x.css",
+            &Conditions::default(),
+            true
+        )
+        .is_some());
+        assert!(serve_storage(
+            &dir,
+            Some(&root),
+            "/storage/storage/x.css",
+            &Conditions::default(),
+            true
+        )
+        .is_some());
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -885,9 +1184,12 @@ mod tests {
                 .collect()
         });
         for path in ["/storage/x.css", "/storage", "/Storage/y.css"] {
-            assert!(serve_embedded(files, path, None).is_none(), "{path}");
+            assert!(
+                serve_embedded(files, path, &Conditions::default()).is_none(),
+                "{path}"
+            );
         }
-        assert!(serve_embedded(files, "/storageroom.css", None).is_some());
+        assert!(serve_embedded(files, "/storageroom.css", &Conditions::default()).is_some());
     }
 
     #[test]
@@ -897,7 +1199,7 @@ mod tests {
             let path = normalize_path(raw);
             assert!(is_storage_path(&path), "{raw} は storage 側");
             assert!(
-                serve_storage(&dir, None, &path, None, true).is_none(),
+                serve_storage(&dir, None, &path, &Conditions::default(), true).is_none(),
                 "{raw} は 404"
             );
         }
@@ -936,13 +1238,14 @@ mod tests {
         std::fs::write(dir.join("a.txt"), "やきそば").unwrap();
         let root = dir.canonicalize().unwrap();
 
-        let res = serve(&dir, Some(&root), "/a.txt", None, true).expect("あるはず");
+        let res =
+            serve(&dir, Some(&root), "/a.txt", &Conditions::default(), true).expect("あるはず");
         assert_eq!(res.status(), 200);
         assert_eq!(res.body_text(), "やきそば");
         let etag = res.header("etag").expect("etag が付く").to_string();
 
         // 同じ etag なら 304。本文もファイルも読まない。
-        let again = serve(&dir, Some(&root), "/a.txt", Some(&etag), true).expect("あるはず");
+        let again = serve(&dir, Some(&root), "/a.txt", &etag_only(&etag), true).expect("あるはず");
         assert_eq!(again.status(), 304);
         assert!(again.body().is_empty());
 
@@ -978,7 +1281,8 @@ mod tests {
         std::fs::write(dir.join("a.txt"), "0123456789").unwrap();
         let root = dir.canonicalize().unwrap();
 
-        let res = serve(&dir, Some(&root), "/a.txt", None, true).expect("あるはず");
+        let res =
+            serve(&dir, Some(&root), "/a.txt", &Conditions::default(), true).expect("あるはず");
         let etag = res.header("etag").expect("etag が付く").to_string();
         // ETag の頭は長さ（16進）。本文の長さと必ずそろう。
         let head = format!("W/\"{:x}-", res.body().len());
@@ -993,7 +1297,8 @@ mod tests {
         std::fs::write(dir.join("a.txt"), "0123456789").unwrap();
         let root = dir.canonicalize().unwrap();
 
-        let res = serve(&dir, Some(&root), "/a.txt", None, false).expect("あるはず");
+        let res =
+            serve(&dir, Some(&root), "/a.txt", &Conditions::default(), false).expect("あるはず");
         assert_eq!(res.status(), 200);
         assert!(res.body().is_empty(), "本文は読まない");
         assert_eq!(res.header("content-length"), Some("10"));
@@ -1007,8 +1312,8 @@ mod tests {
         std::fs::write(dir.join("a.txt"), "x").unwrap();
 
         // 実体を渡さない場合は、その場で解決する（起動時に無かった置き場所のため）。
-        assert!(serve(&dir, None, "/a.txt", None, true).is_some());
-        assert!(serve(&dir, None, "/../a.txt", None, true).is_none());
+        assert!(serve(&dir, None, "/a.txt", &Conditions::default(), true).is_some());
+        assert!(serve(&dir, None, "/../a.txt", &Conditions::default(), true).is_none());
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1025,8 +1330,8 @@ mod tests {
         std::os::unix::fs::symlink(outside.join("secret.txt"), dir.join("link.txt")).unwrap();
         let root = dir.canonicalize().unwrap();
 
-        assert!(serve(&dir, Some(&root), "/link.txt", None, true).is_none());
-        assert!(serve(&dir, None, "/link.txt", None, true).is_none());
+        assert!(serve(&dir, Some(&root), "/link.txt", &Conditions::default(), true).is_none());
+        assert!(serve(&dir, None, "/link.txt", &Conditions::default(), true).is_none());
 
         let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::remove_dir_all(&outside);
@@ -1036,7 +1341,206 @@ mod tests {
     fn 無いファイルはnone() {
         let dir = temp_dir("missing");
         let root = dir.canonicalize().unwrap();
-        assert!(serve(&dir, Some(&root), "/none.txt", None, true).is_none());
+        assert!(serve(&dir, Some(&root), "/none.txt", &Conditions::default(), true).is_none());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `Range` だけを持つ条件。
+    fn range(value: &str) -> Conditions {
+        Conditions {
+            range: Some(value.to_string()),
+            ..Conditions::default()
+        }
+    }
+
+    #[test]
+    fn 範囲の読み方() {
+        use RangeAnswer::*;
+        assert_eq!(parse_range("bytes=0-3", 10), Partial(0, 3));
+        assert_eq!(parse_range("bytes=4-", 10), Partial(4, 9));
+        assert_eq!(parse_range("bytes=-3", 10), Partial(7, 9));
+        // 末尾より大きい範囲は末尾までに縮める。
+        assert_eq!(parse_range("bytes=5-999", 10), Partial(5, 9));
+        assert_eq!(parse_range("bytes=-999", 10), Partial(0, 9));
+        assert_eq!(parse_range("BYTES = 1-2", 10), Partial(1, 2));
+        // ファイルの外は 416。
+        assert_eq!(parse_range("bytes=10-", 10), Unsatisfiable);
+        assert_eq!(
+            parse_range("bytes=99999999999999999999999-", 10),
+            Unsatisfiable
+        );
+        assert_eq!(parse_range("bytes=-0", 10), Unsatisfiable);
+        assert_eq!(parse_range("bytes=0-", 0), Unsatisfiable);
+        // 読めない形・2 つ以上・ほかの単位は無視して全部。
+        for ignored in [
+            "bytes=0-1,4-5",
+            "bytes=5-1",
+            "bytes=a-b",
+            "bytes=-",
+            "bytes=+1-2",
+            "items=0-1",
+            "0-1",
+        ] {
+            assert_eq!(parse_range(ignored, 10), Full, "{ignored}");
+        }
+    }
+
+    #[test]
+    fn ディスクのファイルを範囲で返す() {
+        let dir = temp_dir("range");
+        std::fs::write(dir.join("v.mp4"), "0123456789").unwrap();
+        let root = dir.canonicalize().unwrap();
+
+        let full = serve(&dir, Some(&root), "/v.mp4", &Conditions::default(), true).unwrap();
+        assert_eq!(full.status(), 200);
+        assert_eq!(full.header("accept-ranges"), Some("bytes"));
+
+        let res = serve(&dir, Some(&root), "/v.mp4", &range("bytes=2-5"), true).unwrap();
+        assert_eq!(res.status(), 206);
+        assert_eq!(res.body(), b"2345");
+        assert_eq!(res.header("content-range"), Some("bytes 2-5/10"));
+        assert_eq!(res.header("content-type"), Some("video/mp4"));
+        assert_eq!(res.header("etag"), full.header("etag"));
+
+        let res = serve(&dir, Some(&root), "/v.mp4", &range("bytes=-2"), true).unwrap();
+        assert_eq!(res.body(), b"89");
+
+        let res = serve(&dir, Some(&root), "/v.mp4", &range("bytes=10-"), true).unwrap();
+        assert_eq!(res.status(), 416);
+        assert_eq!(res.header("content-range"), Some("bytes */10"));
+        assert!(res.body().is_empty());
+
+        // 2 つ以上の範囲は全部を 200 で返す。
+        let res = serve(&dir, Some(&root), "/v.mp4", &range("bytes=0-1,3-4"), true).unwrap();
+        assert_eq!(res.status(), 200);
+        assert_eq!(res.body(), b"0123456789");
+
+        // storage の入口でも同じ。CSP も付く。
+        let res = serve_storage(
+            &dir,
+            Some(&root),
+            "/storage/v.mp4",
+            &range("bytes=0-0"),
+            true,
+        )
+        .unwrap();
+        assert_eq!(res.status(), 206);
+        assert_eq!(res.body(), b"0");
+        assert_eq!(res.header("content-security-policy"), Some(STORAGE_CSP));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn if_rangeが合わなければ全部を返す() {
+        let dir = temp_dir("if-range");
+        let path = dir.join("v.mp4");
+        std::fs::write(&path, "0123456789").unwrap();
+        let file = std::fs::File::options().write(true).open(&path).unwrap();
+        file.set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(784_111_777))
+            .unwrap();
+        drop(file);
+        let root = dir.canonicalize().unwrap();
+        let full = serve(&dir, Some(&root), "/v.mp4", &Conditions::default(), true).unwrap();
+        let etag = full.header("etag").unwrap().to_string();
+        assert_eq!(
+            full.header("last-modified"),
+            Some("Sun, 06 Nov 1994 08:49:37 GMT")
+        );
+
+        let with_if_range = |if_range: &str| Conditions {
+            range: Some("bytes=0-1".into()),
+            if_range: Some(if_range.into()),
+            ..Conditions::default()
+        };
+        // 日時が `Last-Modified` と同じなら範囲で返す。
+        let res = serve(
+            &dir,
+            Some(&root),
+            "/v.mp4",
+            &with_if_range("Sun, 06 Nov 1994 08:49:37 GMT"),
+            true,
+        )
+        .unwrap();
+        assert_eq!(res.status(), 206);
+        // 弱い ETag・違う日時は合わない。全部を返す。
+        for stale in [etag.as_str(), "\"x\"", "Sun, 06 Nov 1994 08:49:38 GMT"] {
+            let res = serve(&dir, Some(&root), "/v.mp4", &with_if_range(stale), true).unwrap();
+            assert_eq!(res.status(), 200, "{stale}");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn 更新されていなければif_modified_sinceで304() {
+        let dir = temp_dir("ims");
+        let path = dir.join("a.txt");
+        std::fs::write(&path, "x").unwrap();
+        let file = std::fs::File::options().write(true).open(&path).unwrap();
+        file.set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(784_111_777))
+            .unwrap();
+        drop(file);
+        let root = dir.canonicalize().unwrap();
+        let since = |value: &str| Conditions {
+            if_modified_since: Some(value.into()),
+            ..Conditions::default()
+        };
+
+        for fresh in [
+            "Sun, 06 Nov 1994 08:49:37 GMT",
+            "Mon, 07 Nov 1994 00:00:00 GMT",
+        ] {
+            let res = serve(&dir, Some(&root), "/a.txt", &since(fresh), true).unwrap();
+            assert_eq!(res.status(), 304, "{fresh}");
+            assert_eq!(
+                res.header("last-modified"),
+                Some("Sun, 06 Nov 1994 08:49:37 GMT")
+            );
+        }
+        // 古い日時・読めない日時は 200。
+        for stale in [
+            "Sun, 06 Nov 1994 08:49:36 GMT",
+            "Sunday, 06-Nov-94 08:49:37 GMT",
+            "x",
+        ] {
+            let res = serve(&dir, Some(&root), "/a.txt", &since(stale), true).unwrap();
+            assert_eq!(res.status(), 200, "{stale}");
+        }
+        // `If-None-Match` があればそちらが優先する（合わなければ日時は見ない）。
+        let both = Conditions {
+            if_none_match: Some("W/\"0-0\"".into()),
+            if_modified_since: Some("Mon, 07 Nov 1994 00:00:00 GMT".into()),
+            ..Conditions::default()
+        };
+        let res = serve(&dir, Some(&root), "/a.txt", &both, true).unwrap();
+        assert_eq!(res.status(), 200);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn 埋め込みも範囲で返す() {
+        let res = serve_embedded(files(), "/css/app.css", &range("bytes=1-3")).unwrap();
+        assert_eq!(res.status(), 206);
+        assert_eq!(res.body(), b"ody");
+        assert_eq!(res.header("content-range"), Some("bytes 1-3/6"));
+        assert_eq!(res.header("accept-ranges"), Some("bytes"));
+        let res = serve_embedded(files(), "/css/app.css", &range("bytes=6-")).unwrap();
+        assert_eq!(res.status(), 416);
+        // 埋め込みには更新時刻が無いので `Last-Modified` は付けない。
+        let res = serve_embedded(files(), "/css/app.css", &Conditions::default()).unwrap();
+        assert_eq!(res.header("last-modified"), None);
+        assert_eq!(res.header("accept-ranges"), Some("bytes"));
+    }
+
+    #[test]
+    fn http_dateの往復() {
+        assert_eq!(http_date(784_111_777), "Sun, 06 Nov 1994 08:49:37 GMT");
+        assert_eq!(http_date(0), "Thu, 01 Jan 1970 00:00:00 GMT");
+        assert_eq!(
+            parse_http_date("Sun, 06 Nov 1994 08:49:37 GMT"),
+            Some(784_111_777)
+        );
+        assert_eq!(parse_http_date("Sun, 6 Nov 1994 08:49:37 GMT"), None);
+        assert_eq!(parse_http_date("Sun, 06 Nov 1994 08:49:37 UTC"), None);
     }
 }

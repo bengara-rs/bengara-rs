@@ -111,6 +111,12 @@ macro_rules! from_int {
 // 符号なしで同じ幅の `u64` と `usize` だけは、下の `try_from` の形にします。
 from_int!(i8, i16, i32, i64, u8, u16, u32, isize);
 
+/// `i64` に収まらない値（`i64::MAX` より大きい値）は `Value::Text` になります。
+///
+/// 桁を落とさないためです。`u64::from_value` は文字列からも読み戻せます。
+/// ただし**データベースには文字列として書かれます。** 整数の列でも、比べ方や並び順が
+/// 数としてではなく文字列として扱われることがあります（SQLite は列の型で数に直す
+/// ことがあり、PostgreSQL は `bigint` の列に文字列を渡すと断ります）。
 impl From<u64> for Value {
     fn from(v: u64) -> Self {
         // i64 に収まらない値は、桁を落とさないように文字列にする。
@@ -414,7 +420,7 @@ impl<T: FromValue> FromValue for Option<T> {
 #[derive(Debug, Clone)]
 pub struct Row {
     columns: Arc<[String]>,
-    /// 列名から位置を引く表。列が少ないときは `None`（下の `column_index` を参照）。
+    /// 列名から位置を引く表。列が少ないときは `None`（下の `RowColumns` を参照）。
     index: Option<Arc<ColumnIndex>>,
     values: Vec<Value>,
 }
@@ -426,47 +432,51 @@ type ColumnIndex = std::collections::HashMap<String, usize>;
 ///
 /// 数列しかないときは、ハッシュを1回計算するより `==` を並べたほうが速いためです。
 ///
-/// 表を作るのは `column_index`（下回りから行を受け取るときだけ）なので、
+/// 表を作るのは [`RowColumns::new`]（下回りから行を受け取るときだけ）なので、
 /// 機能フラグが無いビルドでは使いません。`#[cfg]` を外すと
 /// `cargo clippy -p bengara --no-default-features` が「使われていない」で落ちます。
 #[cfg(feature = "database")]
 const INDEX_FROM: usize = 9;
 
-/// 列名から位置を引く表を、1つの問い合わせにつき1回だけ作る。
+/// 1 つの問い合わせの行が共有する、列の名前と位置の表。下回りのドライバが使います。
 ///
-/// `with_columns` は行ごとに呼ばれるので、直前に作った表を覚えておいて使い回します。
-/// 覚えるときは `Arc` ごと持つので、番地が別の列名に使い回されることはありません
-/// （`Arc::ptr_eq` で同じ割り当てだと確かめられます）。
+/// **表は問い合わせ 1 本につき 1 回だけ作ります。** ドライバが最初の行から作り、
+/// 全部の行に `Arc` で分けます。以前はスレッドごとの置き場所に「直前の表」を覚えて
+/// 行ごとに引き当てていました。同じことを、置き場所なしで、作る所を 1 か所にして行います。
 #[cfg(feature = "database")]
-fn column_index(columns: &Arc<[String]>) -> Option<Arc<ColumnIndex>> {
-    use std::cell::RefCell;
+pub(crate) struct RowColumns {
+    names: Arc<[String]>,
+    index: Option<Arc<ColumnIndex>>,
+}
 
-    /// 直前に作った（列名, 表）の組。
-    type Last = Option<(Arc<[String]>, Arc<ColumnIndex>)>;
-
-    thread_local! {
-        static LAST: RefCell<Last> = const { RefCell::new(None) };
-    }
-
-    if columns.len() < INDEX_FROM {
-        return None;
-    }
-    LAST.with(|cell| {
-        let mut slot = cell.borrow_mut();
-        if let Some((names, index)) = slot.as_ref() {
-            if Arc::ptr_eq(names, columns) {
-                return Some(Arc::clone(index));
+#[cfg(feature = "database")]
+impl RowColumns {
+    /// 列の名前から作る。列が多いとき（[`INDEX_FROM`] 以上）だけ位置の表を作ります。
+    pub(crate) fn new(names: Arc<[String]>) -> Self {
+        let index = (names.len() >= INDEX_FROM).then(|| {
+            let mut map = ColumnIndex::with_capacity(names.len());
+            for (position, name) in names.iter().enumerate() {
+                // 同じ名前が2つあるときは左を採る。順に比べていた頃と同じ。
+                map.entry(name.clone()).or_insert(position);
             }
+            Arc::new(map)
+        });
+        Self { names, index }
+    }
+
+    /// 列の名前。
+    pub(crate) fn names(&self) -> &[String] {
+        &self.names
+    }
+
+    /// 値を並べて 1 行にする。名前と位置の表は複製せず共有します。
+    pub(crate) fn row(&self, values: Vec<Value>) -> Row {
+        Row {
+            columns: Arc::clone(&self.names),
+            index: self.index.clone(),
+            values,
         }
-        let mut map = ColumnIndex::with_capacity(columns.len());
-        for (position, name) in columns.iter().enumerate() {
-            // 同じ名前が2つあるときは左を採る。順に比べていた頃と同じ。
-            map.entry(name.clone()).or_insert(position);
-        }
-        let index = Arc::new(map);
-        *slot = Some((Arc::clone(columns), Arc::clone(&index)));
-        Some(index)
-    })
+    }
 }
 
 /// 列の名前と値が同じなら同じ行とみなす。
@@ -496,19 +506,6 @@ impl Row {
         Self {
             columns: Arc::from(columns),
             index: None,
-            values,
-        }
-    }
-
-    /// 列の名前を共有して作る。同じ問い合わせの行をまとめて作るときに使います。
-    ///
-    /// 呼ぶのは下回りのドライバだけなので、ドライバを1つも入れないときは出番がありません。
-    #[cfg(feature = "database")]
-    pub(crate) fn with_columns(columns: Arc<[String]>, values: Vec<Value>) -> Self {
-        let index = column_index(&columns);
-        Self {
-            columns,
-            index,
             values,
         }
     }
@@ -591,6 +588,15 @@ pub struct Affected {
     /// 変わった行の数。
     pub rows: u64,
     /// 自動採番された ID（`insert` のとき）。
+    ///
+    /// | ドライバ   | 入るもの                                                         |
+    /// |------------|------------------------------------------------------------------|
+    /// | SQLite     | 入れた行の rowid。1 文で何行も入れたときは**最後の行**            |
+    /// | MySQL      | `last_insert_id()`。1 文で何行も入れたときは**最初の行**          |
+    /// | PostgreSQL | 常に `None`。`returning` を付けて `DB::select` で受け取る         |
+    ///
+    /// `update` / `delete` などでは `None` です。SQLite では `on conflict ... do update`
+    /// を含む文も `None` です（更新の側に進むと、前に入れた行の番号が残るため）。
     pub last_insert_id: Option<i64>,
 }
 
@@ -775,12 +781,16 @@ mod tests {
     fn 列が多い行も位置の表で読める() {
         // 列が多いときは名前から位置を引く表を作る。読める値は変わらないこと。
         let names: Vec<String> = (0..30).map(|i| format!("c{i}")).collect();
-        let columns: Arc<[String]> = Arc::from(names);
+        let columns = RowColumns::new(Arc::from(names));
         let values: Vec<Value> = (0..30).map(Value::Int).collect();
 
-        // 同じ問い合わせの行は、列名の `Arc` を共有する。
-        let first = Row::with_columns(Arc::clone(&columns), values.clone());
-        let second = Row::with_columns(Arc::clone(&columns), values);
+        // 同じ問い合わせの行は、列名と位置の表の `Arc` を共有する。
+        let first = columns.row(values.clone());
+        let second = columns.row(values);
+        assert!(Arc::ptr_eq(
+            first.index.as_ref().expect("列が多いので表がある"),
+            second.index.as_ref().expect("列が多いので表がある"),
+        ));
         for i in 0..30 {
             assert_eq!(first.get::<i64>(&format!("c{i}")).unwrap(), i);
             assert_eq!(second.get::<i64>(&format!("c{i}")).unwrap(), i);
@@ -788,11 +798,19 @@ mod tests {
         assert!(first.get::<i64>("none").is_err());
         assert_eq!(first, second);
 
-        // 列名が別の問い合わせに変わっても、前の表を使い回さない。
-        let other: Arc<[String]> = Arc::from((0..30).map(|i| format!("d{i}")).collect::<Vec<_>>());
-        let row = Row::with_columns(other, (0..30).map(|i| Value::Int(i + 100)).collect());
+        // 列名が別の問い合わせに変わったら、別の表を作る。
+        let other = RowColumns::new(Arc::from(
+            (0..30).map(|i| format!("d{i}")).collect::<Vec<_>>(),
+        ));
+        let row = other.row((0..30).map(|i| Value::Int(i + 100)).collect());
         assert_eq!(row.get::<i64>("d5").unwrap(), 105);
         assert_eq!(row.try_get::<i64>("c5"), None);
+
+        // 列が少ないときは表を作らず、順に比べる。
+        let few = RowColumns::new(Arc::from(vec!["a".to_string(), "b".to_string()]));
+        let row = few.row(vec![Value::Int(1), Value::Int(2)]);
+        assert!(row.index.is_none());
+        assert_eq!(row.get::<i64>("b").unwrap(), 2);
     }
 
     #[cfg(feature = "database")]
@@ -801,7 +819,7 @@ mod tests {
         // 順に比べていた頃と同じ。表を作る側でも左を採ること。
         let mut names: Vec<String> = (0..30).map(|i| format!("c{i}")).collect();
         names[20] = "c0".to_string();
-        let row = Row::with_columns(Arc::from(names), (0..30).map(Value::Int).collect());
+        let row = RowColumns::new(Arc::from(names)).row((0..30).map(Value::Int).collect());
         assert_eq!(row.get::<i64>("c0").unwrap(), 0);
     }
 }

@@ -163,12 +163,17 @@ impl Session {
 
     /// 値を読む。1 回だけの値（flash）も読めます。
     ///
-    /// **入れた順番に関係なく、`flash` の値が勝ちます。** 今回の `flash` →
-    /// 持ち越しの `flash` → `put` の値、の順で探します。
-    /// `flash("status", "2")` のあとに `put("status", "1")` しても、読めるのは `"2"` です。
-    /// [`all`](Self::all) は、持ち越しの `flash` と `put` が同じ鍵のときだけ逆（`put`）になります。
-    /// 逆にすると、`put("status", "1")` のあとの `flash("status", "2")` が
-    /// `get` から永久に見えなくなります。
+    /// 今回の `flash` → 持ち越しの `flash` → `put` の値、の順で探します。
+    /// [`all`](Self::all) も同じ順で勝ちます（`get` と `all` は食い違いません）。
+    ///
+    /// - **今回の `flash` は、入れた順番に関係なく勝ちます。**
+    ///   `flash("status", "2")` のあとに `put("status", "1")` しても、読めるのは `"2"` です。
+    ///   逆にすると、`put("status", "1")` のあとの `flash("status", "2")` が
+    ///   `get` から見えなくなります。
+    /// - **持ち越しの `flash` は、今回 `put` / `flash` した同じ鍵に負けます。**
+    ///   入れたときに持ち越しのほうを消すためです。消していなかったころは、
+    ///   前の画面の「保存しました」が残っているあいだ、`put("status", ..)` した値が
+    ///   `get` から見えませんでした。
     pub fn get(&self, key: &str) -> Option<String> {
         self.lock().lookup(key).cloned()
     }
@@ -225,8 +230,11 @@ impl Session {
     }
 
     /// 鍵の名前を確かめずに入れる。フレームワークの中から内部の鍵を入れる口です。
+    ///
+    /// 同じ鍵の持ち越しの flash は消します（今回入れた値のほうを読ませるため。[`get`](Self::get)）。
     pub(crate) fn put_internal(&self, key: &str, value: String) {
         let mut inner = self.lock();
+        inner.old_flash.remove(key);
         inner.data.insert(key.to_string(), value);
         inner.touch(key);
     }
@@ -242,8 +250,11 @@ impl Session {
     }
 
     /// 鍵の名前を確かめずに flash する（中だけで使います）。
+    ///
+    /// 同じ鍵の持ち越しの flash は消します（`put_internal` と同じ）。
     fn flash_internal(&self, key: &str, value: String) {
         let mut inner = self.lock();
+        inner.old_flash.remove(key);
         inner.flash.insert(key.to_string(), value);
         inner.touch(key);
     }
@@ -316,13 +327,13 @@ impl Session {
     /// 要るときは `req.csrf_token()` と [`old`](Self::old) で取り出してください。
     pub fn all(&self) -> BTreeMap<String, String> {
         let inner = self.lock();
-        // 後ろに並べたほうが勝つ（持ち越し → `put` → 今回の flash）。
-        // 今回の flash が一番強いのは `get` と同じ。持ち越しと `put` が同じ鍵のときは
-        // `get`（持ち越しが勝つ）と逆になる。
+        // 後ろに並べたほうが勝つ（`put` → 持ち越し → 今回の flash）。
+        // `get` の探す順（今回の flash → 持ち越し → `put`）と同じ勝ち方にそろえる。
+        // 前は持ち越しと `put` の順が逆で、同じ鍵のときに `get` と `all` が食い違った。
         inner
-            .old_flash
+            .data
             .iter()
-            .chain(&inner.data)
+            .chain(&inner.old_flash)
             .chain(&inner.flash)
             .filter(|(key, _)| !key.starts_with(RESERVED_PREFIX))
             .map(|(key, value)| (key.clone(), value.clone()))
@@ -502,8 +513,8 @@ impl Session {
 
 /// 期限切れのセッションを消す（`session:gc` から呼びます）。
 ///
-/// 「切った」印を残す秒数は、置き場所が読むときと同じ（1 時間と
-/// `SESSION_LIFETIME` の長いほう）にそろえます。
+/// 「切った」印は、印に書いてある期限（印を付けた置き場所が決めたもの）で消します。
+/// 期限の行が無い前の版の印だけ、1 時間と `SESSION_LIFETIME` の長いほうで判断します。
 pub(crate) fn sweep_expired(dir: &std::path::Path) -> crate::error::Result<usize> {
     store::sweep(dir, middleware::lifetime_secs_from_env())
 }
@@ -913,6 +924,32 @@ mod tests {
         s.put("status", "1");
         assert_eq!(s.get("status").as_deref(), Some("2"));
         assert_eq!(s.all().get("status").map(String::as_str), Some("2"));
+    }
+
+    #[test]
+    fn 持ち越しのflashより今回のputを読む() {
+        // 前の画面の flash が残っているあいだ、同じ鍵に put した値が
+        // `get` から見えず、`get` と `all` も食い違っていた。
+        let mut old_flash = Data::new();
+        old_flash.insert("status".into(), "古い".into());
+        let s = Session::new("id".into(), Data::new(), old_flash);
+        s.put("status", "新しい");
+        assert_eq!(s.get("status").as_deref(), Some("新しい"));
+        assert_eq!(s.all().get("status").map(String::as_str), Some("新しい"));
+        // 保存しても、持ち越しの古い値は次に残らない。
+        let saved = s.snapshot_keeping_flash();
+        assert!(!saved.contains_key("__flash:status"), "{saved:?}");
+        assert_eq!(saved.get("status").map(String::as_str), Some("新しい"));
+
+        // 置き場所に `put` の値と持ち越しが両方あるとき（前の回までに入れたもの）も、
+        // `get` と `all` は同じ値を返す。
+        let mut data = Data::new();
+        data.insert("status".into(), "put した値".into());
+        let mut old_flash = Data::new();
+        old_flash.insert("status".into(), "持ち越し".into());
+        let s = Session::new("id".into(), data, old_flash);
+        assert_eq!(s.get("status").as_deref(), Some("持ち越し"));
+        assert_eq!(s.all().get("status").map(String::as_str), Some("持ち越し"));
     }
 
     #[test]

@@ -27,11 +27,16 @@ const LOCK_ID: i64 = 1;
 /// 札に書く「誰が取ったか」。
 ///
 /// プロセス番号と、分かればホスト名を入れます。残った札の持ち主を探せるようにするためです。
+///
+/// **後ろに乱数を付けて、取るたびに違う値にします。** 札を返すときは、この値が
+/// 一致する札だけを消します（[`Migrator::unlock`]）。ホスト名とプロセス番号だけだと、
+/// コンテナの中（どれも `pid 1`）や番号の使い回しで、別のプロセスと同じ値になりえます。
 fn lock_owner() -> String {
     let pid = std::process::id();
+    let tag = crate::support::crypto::to_hex(&crate::support::crypto::random_bytes::<4>());
     match std::env::var("COMPUTERNAME").or_else(|_| std::env::var("HOSTNAME")) {
-        Ok(host) if !host.trim().is_empty() => format!("{host}:{pid}"),
-        _ => format!("pid {pid}"),
+        Ok(host) if !host.trim().is_empty() => format!("{host}:{pid}:{tag}"),
+        _ => format!("pid {pid}:{tag}"),
     }
 }
 
@@ -131,6 +136,8 @@ pub(crate) struct Migrator {
     /// 1つのコマンドで `lock` / `lock_holder` / `unlock` と2〜3回通るので、
     /// 作るのは最初の1回だけにします。
     lock_table_ready: std::sync::OnceLock<()>,
+    /// このプロセスが札に書く持ち主（[`lock_owner`]）。返すときに照らします。
+    owner: String,
 }
 
 impl Migrator {
@@ -146,6 +153,7 @@ impl Migrator {
             backend,
             source,
             lock_table_ready: std::sync::OnceLock::new(),
+            owner: lock_owner(),
         })
     }
 
@@ -194,12 +202,11 @@ impl Migrator {
     pub(crate) async fn lock(&self) -> Result<()> {
         self.ensure_lock_table().await?;
 
-        let owner = lock_owner();
         let now = super::now();
         let inserted = super::QueryBuilder::new(self.source.clone(), LOCK_TABLE)
             .insert(&[
                 ("id", Value::Int(LOCK_ID)),
-                ("owner", Value::Text(owner)),
+                ("owner", Value::Text(self.owner.clone())),
                 ("acquired_at", Value::Text(now)),
             ])
             .await;
@@ -222,8 +229,24 @@ impl Migrator {
         })
     }
 
-    /// 札を返す。取れていなくても失敗にしません。
+    /// 自分が取った札を返す。取れていなくても失敗にしません。
+    ///
+    /// **持ち主が自分の札だけを消します。** 長く走っている間に、ほかの人が
+    /// `migrate:unlock` で札を外し、別のプロセスが札を取り直すことがあります。
+    /// 以前は持ち主を見ずに消していたので、後から終わった古いプロセスが、
+    /// 新しい持ち主の札を消していました。
     pub(crate) async fn unlock(&self) -> Result<u64> {
+        self.ensure_lock_table().await?;
+        let affected = super::QueryBuilder::new(self.source.clone(), LOCK_TABLE)
+            .where_("id", LOCK_ID)
+            .where_("owner", self.owner.as_str())
+            .delete()
+            .await?;
+        Ok(affected)
+    }
+
+    /// 持ち主を見ずに札を消す。`migrate:unlock` だけが使います。
+    async fn force_unlock(&self) -> Result<u64> {
         self.ensure_lock_table().await?;
         let affected = super::QueryBuilder::new(self.source.clone(), LOCK_TABLE)
             .where_("id", LOCK_ID)
@@ -251,7 +274,8 @@ impl Migrator {
         let _ = self.lock_table_ready.set(());
         let held = self.lock_holder().await?;
         if held.is_some() {
-            self.unlock().await?;
+            // 残った札は別のプロセスのもの。持ち主を見ずに外す。
+            self.force_unlock().await?;
         }
         Ok(held)
     }
@@ -603,6 +627,8 @@ mod tests {
             owner.contains(&std::process::id().to_string()),
             "{owner} にプロセス番号が入っていない"
         );
+        // 同じプロセスでも、作るたびに違う値になる（返すときに照らすため）。
+        assert_ne!(owner, lock_owner());
     }
 
     #[test]
@@ -767,6 +793,7 @@ mod tests {
             backend: Arc::clone(&backend),
             source: Source::Default,
             lock_table_ready: std::sync::OnceLock::new(),
+            owner: lock_owner(),
         };
 
         let rows = migrator.status(LIST).await.expect("表が無くても読める");
@@ -812,11 +839,41 @@ mod tests {
             .await
             .expect("外せる")
             .expect("持ち主が返る");
-        assert_eq!(owner, lock_owner());
+        assert_eq!(owner, migrator.owner);
         assert_eq!(migrator.lock_holder().await.unwrap(), None);
         // 表はあるが札が無いときも `None`。
         assert_eq!(migrator.clear_lock().await.unwrap(), None);
         assert!(has_lock_table().await, "あった表は消さない");
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn 札を返すときは自分の札だけを消す() {
+        // 古いプロセスが走っている間に `migrate:unlock` で札が外され、
+        // 別のプロセスが取り直した。古いプロセスが終わっても、新しい札は残る。
+        let _db = crate::testing::refresh_database().await;
+        let old = Migrator::connect(None).await.expect("つながる");
+        let new = Migrator::connect(None).await.expect("つながる");
+        assert_ne!(old.owner, new.owner, "取るたびに違う持ち主になる");
+        // ほかのテストが残した札を消して、無い状態から始める。
+        old.source
+            .execute(&format!("drop table if exists {LOCK_TABLE}"), &[])
+            .await
+            .expect("消せる");
+
+        old.lock().await.expect("古いプロセスが札を取る");
+        // 運用者が札を外し、新しいプロセスが取り直す。
+        assert!(new.clear_lock().await.unwrap().is_some());
+        new.lock().await.expect("新しいプロセスが札を取る");
+
+        // 古いプロセスが終わって札を返す。新しい札は消さない。
+        assert_eq!(old.unlock().await.unwrap(), 0);
+        let (holder, _) = new.lock_holder().await.unwrap().expect("札は残る");
+        assert_eq!(holder, new.owner);
+
+        // 持ち主が返すと消える。
+        assert_eq!(new.unlock().await.unwrap(), 1);
+        assert_eq!(new.lock_holder().await.unwrap(), None);
     }
 
     #[test]

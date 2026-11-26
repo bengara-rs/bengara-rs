@@ -15,6 +15,10 @@ use sqlx::types::time::{Date, PrimitiveDateTime, Time};
 use sqlx::types::time::{OffsetDateTime, UtcOffset};
 
 /// `YYYY-MM-DD`。
+///
+/// 年は 4 桁に 0 で埋めます。**紀元前（0 年より前）の年は `-` が付き、桁がそろいません**
+/// （`-001-01-01`）。`YYYY-MM-DD` の形をそのまま当てにする所（文字列の並び替えなど）では
+/// 扱えません。PostgreSQL の `date` が紀元前の値を返したときだけ起きます。
 pub(crate) fn date_string(value: Date) -> String {
     format!(
         "{:04}-{:02}-{:02}",
@@ -24,7 +28,11 @@ pub(crate) fn date_string(value: Date) -> String {
     )
 }
 
-/// `HH:MM:SS`。小数の秒は落とします。
+/// `HH:MM:SS`。小数の秒は落とします（丸めず切り捨て）。
+///
+/// `datetime(6)` / `timestamp(6)` の列に入っているマイクロ秒は、読むと消えます。
+/// 読んだ値をそのまま書き戻すと、小数の秒が 0 になります。
+/// 小数の秒が要るときは、`cast(列 as char)`（MySQL）／`列::text`（PostgreSQL）で文字列として読んでください。
 pub(crate) fn time_string(value: Time) -> String {
     format!(
         "{:02}:{:02}:{:02}",
@@ -77,6 +85,8 @@ mod tests {
         // 4桁に足りない年も0で埋める。
         assert_eq!(date_string(date(999, 365)), "0999-12-31");
         assert_eq!(date_string(date(2026, OCT_9)), "2026-10-09");
+        // 紀元前の年は `-` が付く（説明のとおり）。
+        assert_eq!(date_string(date(-1, 1)), "-001-01-01");
     }
 
     #[test]

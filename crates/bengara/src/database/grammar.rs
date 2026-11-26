@@ -1,7 +1,11 @@
-//! ドライバごとの SQL の書き分け。
+//! ドライバごとの SQL の書き分けと、名前・演算子の検査。
 //!
-//! 引用符、プレースホルダ、列の型名の3つだけが違います。ここに集めておくと、
-//! MySQL と PostgreSQL を足すときに触る場所が1つで済みます。
+//! 引用符、プレースホルダ、`offset` だけのときの `limit`、`truncate`、表を全部消す文、
+//! `returning`、`like` の逃がしの文字などを、ドライバごとに書き分けます。
+//! 列の型名だけは `schema.rs` にあります。
+//!
+//! 利用者が書いた SQL の `?` と `$` の数え方・振り直し方、名前と演算子の許可一覧も
+//! ここに集めてあります。数え方を 1 か所にして、食い違わせないためです。
 
 /// 使うデータベース。
 ///
@@ -190,10 +194,10 @@ pub(crate) fn null_comparison(operator: &str) -> Option<bool> {
 /// **素通しの判定は `is_expression` です。** 空白・`(`・`*` のどれかを含む名前は
 /// くくらずそのまま返します。`drop table x` のような文字列も素通しします。
 ///
-/// **`schema.rs` は [`is_plain_identifier`] を1度も呼んでいません。** 表名・列名は
-/// この関数を通るだけなので、検査されません。`Schema::create` や `table(...)` に
+/// `schema.rs` も、表名・列名・索引名を先に検査します（外れたら SQL を流す前のエラー）。
+/// 決まりは [`is_plain_identifier`] に `-` を足したものです。
+/// ただし `raw_column` の型・`default_raw`・`Schema::raw` は SQL をそのまま置きます。
 /// 外から来た文字列（リクエストの値、設定ファイルの値）を渡してはいけません。
-/// 移行ファイルに直接書いた名前だけを渡してください。
 pub(crate) fn quote(driver: Driver, name: &str) -> String {
     let trimmed = name.trim();
     if is_expression(trimmed) {
@@ -239,8 +243,8 @@ fn is_expression(name: &str) -> bool {
 /// **`.` で区切った各部は空にできません。** `.`・`a..b`・`users.` は断ります。
 /// 通すと `"".""` や `"users".""` のような壊れた SQL になります。
 ///
-/// **呼ぶのはクエリビルダ（`query.rs`）だけです。** `schema.rs` は呼んでいません。
-/// 移行の表名・列名は [`quote`] を通るだけで、検査されません。
+/// **呼ぶのはクエリビルダ（`query.rs`）だけです。** 移行（`schema.rs`）は `-` も通す
+/// 自前の決まりで検査します。
 pub(crate) fn is_plain_identifier(name: &str) -> bool {
     name.trim().split('.').all(is_identifier_part)
 }
@@ -308,7 +312,11 @@ pub(crate) const VALUE_OPERATORS: &[&str] = &[
 pub(crate) const SET_OPERATORS: &[&str] = &["in", "not in", "between", "not between"];
 
 /// 大文字小文字と空白をそろえる。
-fn normalize_operator(operator: &str) -> String {
+///
+/// クエリビルダは、そろえた後の演算子を SQL に書きます（`query.rs`）。
+/// 照合だけをそろえた形で行い、SQL には打ったままの形を書いていた頃は、
+/// `"not\u{3000}like"` のような全角の空白入りが一覧を通って、壊れた SQL になっていました。
+pub(crate) fn normalize_operator(operator: &str) -> String {
     operator
         .split_whitespace()
         .collect::<Vec<_>>()
@@ -343,6 +351,37 @@ pub(crate) fn operator_driver(operator: &str) -> Option<Driver> {
 /// 値を2つ以上とる演算子か。
 pub(crate) fn is_set_operator(operator: &str) -> bool {
     SET_OPERATORS.contains(&normalize_operator(operator).as_str())
+}
+
+/// `like` / `not like` の後ろに足す、逃がしの文字の指定。
+///
+/// 渡す演算子は [`normalize_operator`] でそろえた後のものです。
+///
+/// | ドライバ   | 足すもの      | 理由                                               |
+/// |------------|---------------|----------------------------------------------------|
+/// | SQLite     | ` escape '\'` | 既定では逃がしの文字が無い。`\%` が `\` と `%` になる |
+/// | MySQL      | 無し          | 既定の逃がしの文字が `\`                           |
+/// | PostgreSQL | 無し          | 既定の逃がしの文字が `\`                           |
+///
+/// どのドライバでも、`100\%` が「`100%` という文字列」に当たるようにそろえます。
+/// MySQL と PostgreSQL は既定のままにします（値はプレースホルダで渡すので、
+/// 文字列リテラルの `\` の扱いには左右されません）。
+pub(crate) fn like_escape(driver: Driver, operator: &str) -> &'static str {
+    match (driver, operator) {
+        (Driver::Sqlite, "like" | "not like") => " escape '\\'",
+        _ => "",
+    }
+}
+
+/// 利用者が書いた SQL の、引用の外の文字だけを残した文字列。
+///
+/// 引用の中の文字は空白に置き換えます（[`outside_quotes`] と同じ見分け方）。
+/// 語を探すとき（`do update` など）に、文字列の中の語を拾わないために使います。
+#[cfg(feature = "sqlite")]
+pub(crate) fn outside_text(sql: &str) -> String {
+    outside_quotes(sql)
+        .map(|(c, outside)| if outside { c } else { ' ' })
+        .collect()
 }
 
 /// `offset` だけを付けたときに補う `limit`。
@@ -650,6 +689,28 @@ mod tests {
         assert!(has_dollar("label = '$100' and views > $1"));
         // JSONB の `?` は従来どおり置き場所として数える。
         assert_eq!(count_placeholders("data ? 'key'"), 1);
+    }
+
+    #[test]
+    fn like_の逃がしの文字はsqliteだけ足す() {
+        assert_eq!(like_escape(Driver::Sqlite, "like"), " escape '\\'");
+        assert_eq!(like_escape(Driver::Sqlite, "not like"), " escape '\\'");
+        assert_eq!(like_escape(Driver::Sqlite, "="), "");
+        // MySQL と PostgreSQL は既定の逃がしの文字が `\`。
+        assert_eq!(like_escape(Driver::MySql, "like"), "");
+        assert_eq!(like_escape(Driver::Postgres, "not like"), "");
+        // 全角の空白もそろえる。
+        assert_eq!(normalize_operator(" NOT\u{3000}LIKE "), "not like");
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[test]
+    fn 引用の外の文字だけを残す() {
+        assert_eq!(
+            outside_text("a 'do update' b"),
+            format!("a{}b", " ".repeat(13))
+        );
+        assert_eq!(outside_text(r#"x "y" z"#), format!("x{}z", " ".repeat(5)));
     }
 
     #[test]

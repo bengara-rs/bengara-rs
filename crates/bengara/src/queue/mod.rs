@@ -208,10 +208,9 @@ impl Queue {
 
     /// そのキューで、いますぐ処理できるジョブの数。
     ///
-    /// **古い予約は数えません。** ワーカーが落ちて `reserved_at` が残った行は、
-    /// `retry_after` 秒を過ぎるとワーカーが取り直します。ただ `retry_after` は
-    /// ワーカーの起動時の引数（`--retry-after`）で、ここからは見えません。
-    /// そのため、取り直せる行も「処理中」として数から外れます。
+    /// **古い予約は数えません。** ワーカーが落ちて `reserved_at`（予約の期限）が
+    /// 残った行は、期限を過ぎるとワーカーが取り直します。ここでは予約が入っている行を
+    /// まとめて外すので、期限を過ぎて取り直せる行も「処理中」として数から外れます。
     pub async fn ready_size_on(queue: &str) -> Result<i64> {
         let now = crate::support::time::format_timestamp(crate::support::time::now_seconds());
         DB::table(TABLE)

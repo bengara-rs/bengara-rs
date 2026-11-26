@@ -332,7 +332,7 @@ let rows = Post::query()
 | `u16`     | `u8`                              |
 | `u32`     | `u8` `u16`                        |
 | `u64`     | `u8` `u16` `u32`                  |
-| `f64`     | `f32`                             |
+| `f64`     | `f32` `i8` `i16` `i32` `u8` `u16` `u32`（整数は小数にして渡す） |
 | `String`  | `&str` `&String`                  |
 | `Vec<u8>` | `&[u8]`                           |
 
@@ -344,7 +344,7 @@ let rows = Post::query()
 | `where_(User::EMAIL, "a@example.com")`（`Post::query()` で） | 別のモデルの列                                      |
 | `where_(Post::VIEWS, n)`（`n` は `u64`）                     | `i64` に収まらない値がある                          |
 | `where_(Post::PUBLISHED_AT, 5)`                              | `Option<Carbon>` の列に整数                         |
-| `where_(f64 の列, 2)`                                        | 整数は小数に広げない。`2.0` と書く                  |
+| `where_(f64 の列, n)`（`n` は `i64`）                        | `f64` に収まらない整数がある                        |
 | `where_(Post::VIEWS, Value::Int(1))`                         | 型付きの列に `Value` は渡せない。文字列の列名を使う |
 | `where_like(Post::PUBLISHED_AT, "2026-%")`                   | パターンも列の型で受ける。`.name()` を渡す          |
 

@@ -84,7 +84,7 @@ Laravel から来た人がつまずきやすい違いを、分野ごとに並べ
 | Laravel                            | bengara                                                                                          |
 |------------------------------------|--------------------------------------------------------------------------------------------------|
 | `welcome.blade.php`                | `welcome.html`                                                                                   |
-| `view("welcome")`                  | `view("welcome", ())`。値が無くても第 2 引数を書く                                               |
+| `view("welcome")`                  | `req.view("welcome", ())` か `bengara::view("welcome", ())`。値が無くても第 2 引数を書く         |
 | `{{ $title }}`                     | `{{ title }}`（`$` は付けない）                                                                  |
 | `{!! $html !!}`                    | `{{ html\|safe }}`                                                                               |
 | `@extends` / `@section` / `@yield` | `{% extends %}` / `{% block %}`                                                                  |

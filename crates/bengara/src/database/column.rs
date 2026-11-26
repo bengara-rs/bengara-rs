@@ -63,6 +63,41 @@
 //! Post::query().where_(Post::VIEWS, n);
 //! ```
 //!
+//! 小数の列（`f64`）には、32 ビットまでの整数（リテラルも）を渡せます。
+//! 値は小数（`Value::Float`）にして渡します。
+//!
+//! ```
+//! use bengara::Model;
+//!
+//! #[derive(Model)]
+//! #[model(table = "items", columns)]
+//! struct Item {
+//!     id: i64,
+//!     price: f64,
+//!     discount: Option<f64>,
+//! }
+//!
+//! let (_, bindings) = Item::query()
+//!     .where_op(Item::PRICE, ">", 100)
+//!     .where_(Item::DISCOUNT, 5u8)
+//!     .to_sql();
+//! assert_eq!(
+//!     bindings,
+//!     vec![bengara::Value::Float(100.0), bengara::Value::Float(5.0)]
+//! );
+//! ```
+//!
+//! `i64` は欠けるおそれがあるので、小数の列には渡せません。
+//!
+//! ```compile_fail,E0277
+//! # use bengara::Model;
+//! # #[derive(Model)]
+//! # #[model(table = "items", columns)]
+//! # struct Item { id: i64, price: f64 }
+//! let n: i64 = 5;
+//! Item::query().where_(Item::PRICE, n);
+//! ```
+//!
 //! 日時の列（`Option<Carbon>`）に整数は渡せません。
 //!
 //! ```compile_fail,E0277
@@ -191,8 +226,10 @@ impl<M, T> ModelColumn<M> for Column<M, T> {}
 /// | `Column<_, Option<T>>` | 上に加えて、その `Option` |
 ///
 /// 広げられる組は、小さい整数から大きい整数（符号付きの列へは符号なしも）、
-/// `f32` から `f64`、`&str` / `&String` から `String`、`&[u8]` から `Vec<u8>` です。
-/// `u64` を `i64` の列へ渡すような、欠けるおそれのある組はコンパイルで止まります。
+/// `f32` と 32 ビットまでの整数から `f64`、`&str` / `&String` から `String`、
+/// `&[u8]` から `Vec<u8>` です。
+/// `u64` を `i64` の列へ渡すような、欠けるおそれのある組はコンパイルで止まります
+/// （`i64` を `f64` の列へ渡すのも止まります）。
 ///
 /// 型付きの列に [`Value`] をそのまま渡す口はありません。文字列の列名を使ってください。
 pub trait Bind<A> {
@@ -285,6 +322,40 @@ bind_widen!(u32 => u8, u16);
 bind_widen!(u64 => u8, u16, u32);
 bind_widen!(f64 => f32);
 bind_widen!('a, String => &'a str, &'a String);
+
+/// 小数の列（`f64`）に、32 ビットまでの整数を渡せるようにする。
+///
+/// `f64` は 53 ビットまでの整数を欠けなく表せるので、`i32` / `u32` 以下なら値が変わりません。
+/// `i64` / `u64` は欠けるおそれがあるので入れません。
+///
+/// 値は `Value::Float` にして渡します。`Value::Int` のまま渡すと、PostgreSQL では
+/// 同じ SQL でも値の型が変わり、`f64` の値と食い違うためです（判断 191 と同じ理由）。
+///
+/// `where_op(Item::PRICE, ">", 100)` のように整数のリテラルも書けます
+/// （型が決まらないリテラルは `i32` になるため）。
+macro_rules! bind_float {
+    ($($from:ty),+) => {
+        $(
+            impl Bind<f64> for $from {
+                fn bind(self) -> Value {
+                    Value::Float(f64::from(self))
+                }
+            }
+            impl Bind<Option<f64>> for $from {
+                fn bind(self) -> Value {
+                    Value::Float(f64::from(self))
+                }
+            }
+            impl Bind<Option<f64>> for Option<$from> {
+                fn bind(self) -> Value {
+                    self.map_or(Value::Null, |v| Value::Float(f64::from(v)))
+                }
+            }
+        )+
+    };
+}
+
+bind_float!(i8, i16, i32, u8, u16, u32);
 bind_widen!('a, Vec<u8> => &'a [u8]);
 
 #[cfg(test)]

@@ -91,14 +91,16 @@ use bengara::prelude::*;
 
 pub fn config() -> MailConfig {
     MailConfig {
-        from: env("MAIL_FROM", "noreply@example.com"),
+        // 名前の既定（bengara）を、自分のアプリ名に変える。
         from_name: env("MAIL_FROM_NAME", "myapp"),
         ..MailConfig::default()
     }
 }
 ```
 
-- **`..MailConfig::default()` を忘れないでください。** 欄が多いので、2 つだけ書くとコンパイルが通りません。
+- **`..MailConfig::default()` を忘れないでください。** 欄が多いので、1 つだけ書くとコンパイルが通りません。
+- 差出人のアドレス（`from`）は既定に任せてください。`MAIL_FROM_ADDRESS` を見て、空なら `MAIL_FROM` を見ます。
+  `env("MAIL_FROM", ..)` と自分で書くと、`MAIL_FROM_ADDRESS` を見なくなります。
 - `driver` を自分で書くと、`MAIL_MAILER` を見なくなります。既定に任せてください。
 
 ## ログに出たもの

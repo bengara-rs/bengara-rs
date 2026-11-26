@@ -47,6 +47,36 @@ pub(crate) fn lifetime_secs_from_env() -> u64 {
 }
 
 impl SessionConfig {
+    /// `.env` を見て作る。読まない項目は [`Default`] と同じです。
+    ///
+    /// | 環境変数 | 項目 | 既定 |
+    /// |---|---|---|
+    /// | `SESSION_LIFETIME` | `lifetime_secs`（分で書く。60 秒より短くしない） | 120 分 |
+    /// | `SESSION_SECURE_COOKIE` | `secure` | `false` |
+    ///
+    /// [`StartSession::with_config`] で一部だけ変えるときは、残りを
+    /// **`..SessionConfig::from_env()`** で埋めてください。
+    /// `..SessionConfig::default()` で埋めると、`SESSION_LIFETIME` が読まれず、
+    /// 期限が黙って 120 分に戻ります。
+    ///
+    /// ```ignore
+    /// StartSession::from_env().with_config(SessionConfig {
+    ///     cookie: "myapp_session".to_string(),
+    ///     ..SessionConfig::from_env()
+    /// })
+    /// ```
+    ///
+    /// `SESSION_SECURE_COOKIE` は Laravel と同じ名前です。本番（`APP_ENV=production`）では
+    /// この値によらず `Secure` を付けます。本番以外でも HTTPS で動かすとき
+    /// （ステージングなど）に `true` にしてください。
+    pub fn from_env() -> Self {
+        Self {
+            lifetime_secs: lifetime_secs_from_env(),
+            secure: crate::env("SESSION_SECURE_COOKIE", false),
+            ..Self::default()
+        }
+    }
+
     /// 実際に使う設定にそろえる。
     ///
     /// `APP_ENV=production` のときは `Secure` を強制します。
@@ -103,7 +133,12 @@ impl SessionConfig {
 /// | ID の錠 | 読み込みから保存まで | 取らない（書き換えたときだけ、保存の瞬間に取る） |
 /// | 期限の延長 | する | しない |
 /// | 持ち越しの flash | 読めて、消費する | 読めるが、**消費しない** |
-/// | Cookie | 返す | 書き換えたときだけ返す |
+/// | Cookie | 保存したとき・置き場所の期限を延ばしたときだけ返す | 書き換えたときだけ返す |
+///
+/// ルートに当たっても、**読むだけで期限を延ばさなかった応答には `Set-Cookie` を付けません。**
+/// 置き場所は最後に書いてから `min(60 秒, 期限の 1/10)` 過ぎるまで期限を延ばさないので、
+/// Cookie も同じ時に送り直せば、ブラウザの `Max-Age` と置き場所の期限がそろいます。
+/// 毎回送ると、読むだけの応答もキャッシュしにくくなります。
 ///
 /// セッションそのものは載せるので、`req.session()` と `req.auth()` は使えます。
 /// ミドルウェアが書き換えたときは、**置き場所を読み直して、変えた鍵だけを
@@ -190,14 +225,15 @@ impl StartSession {
         Self::of(store, config, StoreKind::Memory)
     }
 
-    /// `.env` の `SESSION_DRIVER` と `SESSION_LIFETIME` を見て作る。
+    /// `.env` の `SESSION_DRIVER`・`SESSION_LIFETIME`・`SESSION_SECURE_COOKIE` を見て作る。
     ///
     /// | `SESSION_DRIVER` | 置き場所 |
     /// |---|---|
     /// | `file`（既定） | `storage/framework/sessions/` |
     /// | `memory` | プロセスのメモリ。**テストと手元の確認用** |
     ///
-    /// `SESSION_LIFETIME` は分で指定します（既定 120）。
+    /// `SESSION_LIFETIME` は分で指定します（既定 120）。`SESSION_SECURE_COOKIE` は
+    /// 真偽です（既定 `false`）。設定は [`SessionConfig::from_env`] と同じです。
     ///
     /// 前後の空白を落とし、大文字小文字を区別せずに比べます（`HASH_DRIVER` と同じ）。
     /// 知らない `SESSION_DRIVER`（`redis` や書き間違い）は、**警告を出してから**
@@ -205,10 +241,7 @@ impl StartSession {
     ///
     /// 本番（`APP_ENV=production`）で `memory` にすると、起動時に警告を 1 回出します。
     pub fn from_env() -> Self {
-        let config = SessionConfig {
-            lifetime_secs: lifetime_secs_from_env(),
-            ..SessionConfig::default()
-        };
+        let config = SessionConfig::from_env();
         let driver: String = crate::env("SESSION_DRIVER", "file");
         Self::from_driver(&driver, config)
     }
@@ -241,6 +274,10 @@ impl StartSession {
     ///
     /// [`new`](Self::new) で外から渡した置き場所は作り直せません。
     /// 食い違うときは警告を出します。
+    ///
+    /// **渡した設定で丸ごと置き換えます。** 一部だけ変えるときは、残りを
+    /// `..SessionConfig::from_env()` で埋めてください（[`SessionConfig::from_env`]）。
+    /// `..SessionConfig::default()` だと `SESSION_LIFETIME` が 120 分に戻ります。
     pub fn with_config(mut self, config: SessionConfig) -> Self {
         let config = config.resolved();
         if config.lifetime_secs != self.config.lifetime_secs {
@@ -303,6 +340,10 @@ async fn serve(
     // （期限切れ・ログアウト後）を持っている人に、保存していない新しい ID を
     // 毎リクエスト配り続けないための目印です。
     let mut loaded = false;
+    // 読んだついでに置き場所の期限を延ばしたか。延ばしたときだけ Cookie も送り直します。
+    let mut extended = false;
+    // 置き場所の読み書きがブロックするか（`MemoryStore` は裏のスレッドを経由しない）。
+    let blocking = store.blocking();
 
     // 1.5. 同じ ID のリクエストを直列にする錠を取る。
     //
@@ -339,19 +380,23 @@ async fn serve(
             let found = {
                 let store = store.clone();
                 let id = id.clone();
-                tokio::task::spawn_blocking(move || {
-                    if matched {
-                        store.read_and_touch(&id)
-                    } else {
-                        store.read(&id)
-                    }
-                })
-                .await
-                .map_err(|_| Error::msg("セッションの読み込みが中断されました"))??
+                on_store(
+                    blocking,
+                    move || {
+                        if matched {
+                            store.read_and_touch_with_status(&id)
+                        } else {
+                            Ok(store.read(&id)?.map(|data| (data, false)))
+                        }
+                    },
+                    "セッションの読み込みが中断されました",
+                )
+                .await?
             };
             match found {
-                Some(stored) => {
+                Some((stored, touched)) => {
                     loaded = true;
+                    extended = touched;
                     if !matched {
                         base = Some(stored.clone());
                     }
@@ -392,7 +437,7 @@ async fn serve(
     } else {
         session.is_dirty()
     };
-    let mut after = after_request(saved, loaded, matched);
+    let mut after = after_request(saved, extended, matched);
 
     if after == AfterRequest::Save {
         // ルートに当たらなかったときは、持ち越しの flash を残す形で写し取る。
@@ -425,11 +470,9 @@ async fn serve(
         let revoke_check = if loaded {
             session.get(crate::auth::AUTH_ID_KEY).map(|user| {
                 // 印より前にログインしたものだけが対象。時刻が無い古い
-                // セッションは 0 として、印があれば切る側に倒す。
-                let logged_in_at = session
-                    .get(crate::auth::AUTH_AT_KEY)
-                    .and_then(|v| v.parse::<i64>().ok())
-                    .unwrap_or(0);
+                // セッションは 0 として、印があれば切る側に倒す（置き場所と同じ読み方）。
+                let logged_in_at =
+                    crate::auth::logged_in_at(session.get(crate::auth::AUTH_AT_KEY).as_deref());
                 (user, logged_in_at)
             })
         } else {
@@ -459,15 +502,20 @@ async fn serve(
         let store = store.clone();
         let id = id_after.clone();
         let before = id_before.clone();
-        let outcome = tokio::task::spawn_blocking(move || {
-            let old = old.as_deref().map(|id| OldId::new(id, old_must_go));
-            match merge {
-                Some(base) => save_merged(&*store, &before, &base, &id, &data, revoke_check, old),
-                None => save_session(&*store, &id, &data, revoke_check, flushed, old),
-            }
-        })
-        .await
-        .map_err(|_| Error::msg("セッションの保存が中断されました"))??;
+        let outcome = on_store(
+            blocking,
+            move || {
+                let old = old.as_deref().map(|id| OldId::new(id, old_must_go));
+                match merge {
+                    Some(base) => {
+                        save_merged(&*store, &before, &base, &id, &data, revoke_check, old)
+                    }
+                    None => save_session(&*store, &id, &data, revoke_check, flushed, old),
+                }
+            },
+            "セッションの保存が中断されました",
+        )
+        .await?;
 
         match outcome {
             SaveOutcome::Done => {}
@@ -480,9 +528,16 @@ async fn serve(
                     AfterRequest::Nothing
                 };
             }
+            // 切られていた。置き場所から消したので、ブラウザに残った Cookie も
+            // 持っていたときだけ消す。残すと、次のリクエストのたびに錠と空振りの
+            // 読みが 1 回ずつ余計に走ります（ログアウトと同じ扱い）。
             SaveOutcome::Revoked => {
                 tracing::info!("切られたセッションなので保存しません");
-                after = AfterRequest::Nothing;
+                after = if had_cookie {
+                    AfterRequest::Forget
+                } else {
+                    AfterRequest::Nothing
+                };
             }
             SaveOutcome::Gone => {
                 tracing::debug!("処理中にセッションが消えたので、書き換えを保存しません");
@@ -497,8 +552,8 @@ async fn serve(
 
     // 5. Cookie を返す。
     //
-    // 保存したときと、**ルートに当たって置き場所から実際に読めたとき**
-    // （Cookie の期限を延ばす）だけです。
+    // 保存したときと、**ルートに当たって置き場所から実際に読み、期限も延ばしたとき**
+    // （Cookie の期限も同じだけ延ばす）だけです。
     // 「署名の合う Cookie を持っていた」だけで配ると、置き場所に中身が無い人に
     // 保存していない新しい ID を毎リクエスト配り続けます。
     match after {
@@ -528,6 +583,24 @@ async fn serve(
             Ok(response.with_cookie(&cookie))
         }
     }
+}
+
+/// 置き場所の読み書きを行う。ブロックする置き場所（`SessionStore::blocking`）だけ
+/// 裏のスレッド（`spawn_blocking`）に出します。
+///
+/// `MemoryStore` は錠を取って地図を引くだけなので、往復のほうが高くつきます。
+/// 1 リクエストで読みと保存の 2 回ぶん、スレッドプールを往復していました。
+async fn on_store<T, F>(blocking: bool, f: F, interrupted: &'static str) -> Result<T>
+where
+    F: FnOnce() -> Result<T> + Send + 'static,
+    T: Send + 'static,
+{
+    if !blocking {
+        return f();
+    }
+    tokio::task::spawn_blocking(f)
+        .await
+        .map_err(|_| Error::msg(interrupted))?
 }
 
 /// 保存の経路で何をしたか。
@@ -765,7 +838,8 @@ enum AfterRequest {
     Nothing,
     /// 保存はしないが、Cookie を返して期限を延ばす。
     ///
-    /// 置き場所の期限は、読んだときに延ばしてあります（`read_and_touch`）。
+    /// 置き場所の期限は、読んだときに延ばしてあります（`read_and_touch_with_status`）。
+    /// 置き場所が延ばしたときだけ、これになります。
     Touch,
     /// 保存して、Cookie を返す。
     Save,
@@ -775,24 +849,31 @@ enum AfterRequest {
     Forget,
 }
 
-/// 保存が要るか・置き場所から読めたか・ルートに当たったかで、終わりにすることを決める。
+/// 保存が要るか・置き場所が期限を延ばしたか・ルートに当たったかで、終わりにすることを決める。
 ///
-/// | 保存が要る | 読めた | ルート | すること |
+/// | 保存が要る | 延ばした | ルート | すること |
 /// |---|---|---|---|
 /// | はい | - | - | 保存して Cookie |
 /// | いいえ | はい | あり | Cookie を返す（期限を延ばす） |
-/// | いいえ | はい | なし | 何もしない |
-/// | いいえ | いいえ | - | 何もしない |
+/// | いいえ | いいえ | あり | 何もしない |
+/// | いいえ | - | なし | 何もしない |
+///
+/// 「延ばした」は、置き場所から実際に読めて、そのついでに期限も延ばしたことです
+/// （`read_and_touch_with_status`）。
 ///
 /// **「Cookie を持っていた」ではなく「置き場所から読めた」で決めます。**
 /// 署名は合うが中身が無い Cookie（期限切れ・ログアウト後）の人に Cookie を返すと、
 /// 保存していない新しい ID を毎リクエスト配り続けることになります。
 ///
+/// **読めても、置き場所が期限を延ばさなかったときは Cookie を返しません。**
+/// ブラウザの `Max-Age` は、置き場所が期限を延ばしたときにだけ同じだけ延ばせば
+/// そろいます。読んだだけの応答に毎回 `Set-Cookie` を付けると、キャッシュしにくくなります。
+///
 /// **ルートに当たらなかったときは、書き換えていなければ何もしません。**
 /// 静的ファイルの応答に `Set-Cookie` を付ける意味はありません
 /// （「保存が要る」の中身もルートの有無で違います。呼ぶ側を参照）。
-fn after_request(saved: bool, loaded: bool, matched: bool) -> AfterRequest {
-    match (saved, loaded && matched) {
+fn after_request(saved: bool, extended: bool, matched: bool) -> AfterRequest {
+    match (saved, extended && matched) {
         (true, _) => AfterRequest::Save,
         (false, true) => AfterRequest::Touch,
         (false, false) => AfterRequest::Nothing,
@@ -984,8 +1065,15 @@ impl Middleware for VerifyCsrfToken {
         // 共通のミドルウェアはルートに当たらなかったリクエストにも掛かるので、
         // ここで見分けないと、無いページへの POST が 404 ではなく 419 になります。
         let no_route = !req.route_matched();
+        // 本文を受け取れずに断った要求（413・400・408）も確かめない。中で返るのは
+        // そのエラーだけで、ハンドラは動きません。確かめると、本文の `_token` が
+        // 読めないので 413 が 419 に化けます。
+        let rejected = req.body_rejected();
 
         Box::pin(async move {
+            if rejected {
+                return next.run(req).await;
+            }
             let Some(session) = req.try_session() else {
                 return Err(Error::msg(
                     "CSRF の確認にはセッションが要ります。bootstrap/app.rs で \
@@ -1325,11 +1413,28 @@ mod tests {
     }
 
     #[test]
+    fn 設定をenvから読める() {
+        // `..SessionConfig::default()` で埋めると `SESSION_LIFETIME` が黙って
+        // 120 分に戻った。`from_env` は期限と Secure を `.env` から読む。
+        // 環境変数を書き換えると並んで走るテストに響くので、読み方だけを確かめる。
+        let config = SessionConfig::from_env();
+        assert_eq!(config.lifetime_secs, lifetime_secs_from_env());
+        assert_eq!(
+            config.secure,
+            crate::env::<bool>("SESSION_SECURE_COOKIE", false)
+        );
+        let defaults = SessionConfig::default();
+        assert_eq!(config.cookie, defaults.cookie);
+        assert_eq!(config.path, defaults.path);
+    }
+
+    #[test]
     fn 置き場所に無いcookieには何も返さない() {
         // 署名は合うが中身が無い Cookie（期限切れ・ログアウト後）の人に、
         // 保存していない新しい ID を毎リクエスト配らない。
+        // 読めても置き場所が期限を延ばさなかったときも、Cookie は返さない。
         assert_eq!(after_request(false, false, true), AfterRequest::Nothing);
-        // 読めたときは、読むだけのリクエストでも期限を延ばす。
+        // 置き場所が延ばしたときは、読むだけのリクエストでも Cookie の期限を延ばす。
         assert_eq!(after_request(false, true, true), AfterRequest::Touch);
         // 保存が要るときは保存する。
         assert_eq!(after_request(true, false, true), AfterRequest::Save);
@@ -1567,7 +1672,14 @@ mod tests {
         )
         .unwrap();
         assert_eq!(outcome, SaveOutcome::Done, "自分のセッションは残す");
-        assert!(store.read("new").unwrap().is_some());
+
+        // 置き場所は読むときにも印を見る。ログインの時刻が印より前のままだと、
+        // 新しい ID は除外に当たらないので読めない。`Auth::logout_other_devices()` が
+        // 本人のログインの時刻を印より後へ進めるのは、このためでもある。
+        assert!(store.read("new").unwrap().is_none());
+        let bumped = logged_in(crate::support::time::now_millis() + 1);
+        store.write("new", &bumped).unwrap();
+        assert_eq!(store.read("new").unwrap(), Some(bumped));
     }
 
     #[test]
@@ -1758,8 +1870,14 @@ mod tests {
 
     impl Counting {
         fn new() -> Arc<Self> {
+            Self::with_lifetime(60)
+        }
+
+        /// 期限を決めて作る。10 秒より短いと、読むたびに期限を延ばす
+        /// （間引く秒数が `期限 / 10` で 0 になる）。
+        fn with_lifetime(lifetime_secs: u64) -> Arc<Self> {
             Arc::new(Self {
-                inner: crate::session::MemoryStore::new(60),
+                inner: crate::session::MemoryStore::new(lifetime_secs),
                 reads: AtomicUsize::new(0),
                 reads_with_touch: AtomicUsize::new(0),
                 touches: AtomicUsize::new(0),
@@ -1807,6 +1925,13 @@ mod tests {
         fn read_and_touch(&self, id: &str) -> Result<Option<BTreeMap<String, String>>> {
             self.reads_with_touch.fetch_add(1, Ordering::Relaxed);
             self.inner.read_and_touch(id)
+        }
+        fn read_and_touch_with_status(
+            &self,
+            id: &str,
+        ) -> Result<Option<(BTreeMap<String, String>, bool)>> {
+            self.reads_with_touch.fetch_add(1, Ordering::Relaxed);
+            self.inner.read_and_touch_with_status(id)
         }
         fn destroy_for_user(&self, user_id: &str) -> Result<usize> {
             self.inner.destroy_for_user(user_id)
@@ -1988,8 +2113,60 @@ mod tests {
             (0, 1, 0, 0),
             "読みと期限の延長を 1 回で済ませる"
         );
-        // Cookie は返す（ブラウザ側の期限を延ばす）。ID は変わらない。
+        // 書いた直後なので置き場所は期限を延ばさない。Cookie も送り直さない。
+        assert!(
+            res.header("set-cookie").is_none(),
+            "延ばさなかった応答に Set-Cookie を付けない"
+        );
+    }
+
+    #[tokio::test]
+    async fn 置き場所が期限を延ばしたときだけcookieを送り直す() {
+        // 毎回 `Set-Cookie` を付けていたころは、読むだけの応答もキャッシュしにくかった。
+        // 置き場所が延ばしたときに送れば、ブラウザの `Max-Age` と置き場所の期限がそろう。
+        // 期限 5 秒の置き場所は、読むたびに延ばす（間引く秒数が 0）。
+        let store = Counting::with_lifetime(5);
+        store.seed("s1", &[("cart", "1")]);
+        let cookie = sign("s1", TEST_KEY);
+
+        let res = send(&store, Some(&cookie), true, idle()).await;
+        assert_eq!(store.counts(), (0, 1, 0, 0), "読みと延長は 1 回");
+        // ID は変わらない。
         assert_eq!(cookie_of(&res).as_deref(), Some(cookie.as_str()));
+
+        // ルートに当たらなければ、延ばさず Cookie も返さない（今までどおり）。
+        let res = send(&store, Some(&cookie), false, idle()).await;
+        assert!(res.header("set-cookie").is_none());
+    }
+
+    #[tokio::test]
+    async fn 切られていたらcookieも消す() {
+        // 保存の直前に切られていたと分かったとき、ブラウザに死んだ Cookie を
+        // 残していた。次のリクエストのたびに錠と空振りの読みが余計に走る。
+        let store = Counting::new();
+        store.seed(
+            "s1",
+            &[
+                (crate::auth::AUTH_ID_KEY, "7"),
+                (crate::auth::AUTH_AT_KEY, "1000"),
+            ],
+        );
+        let cookie = sign("s1", TEST_KEY);
+        let res = send(
+            &store,
+            Some(&cookie),
+            true,
+            handler(|req: Request| async move {
+                // 処理中に別の所からこの利用者が切られた。
+                req.session().store()?.mark_revoked("7", None);
+                req.session().put("cart", "2");
+                Ok(Response::text("ok"))
+            }),
+        )
+        .await;
+        let header = res.header("set-cookie").expect("消す Cookie を返す");
+        assert!(header.contains("Max-Age=0"), "{header}");
+        assert!(store.peek("s1").is_none(), "保存していない");
     }
 
     #[tokio::test]

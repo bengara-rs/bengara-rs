@@ -273,7 +273,7 @@ fn listener_failed(event: &str, error: Error) -> Error {
 /// 通さないので、テストが並んで走っても互いの登録を踏みません。
 pub(crate) async fn dispatch_in(events: &Events, event: &str, payload: &str) -> Result<()> {
     for listener in events.get(event) {
-        call_isolated(listener.as_ref(), payload)
+        call_isolated(listener, payload)
             .await
             .map_err(|e| listener_failed(event, e))?;
     }
@@ -287,7 +287,7 @@ pub(crate) async fn dispatch_in(events: &Events, event: &str, payload: &str) -> 
 /// 終わった後のリクエストが 500 になりました。
 pub(crate) async fn try_dispatch_in(events: &Events, event: &str, payload: &str) -> Result<()> {
     for listener in events.get(event) {
-        if let Err(e) = call_isolated(listener.as_ref(), payload).await {
+        if let Err(e) = call_isolated(listener, payload).await {
             tracing::error!("イベント `{event}` の処理に失敗しました: {e}");
         }
     }
@@ -306,8 +306,12 @@ pub(crate) async fn try_dispatch_in(events: &Events, event: &str, payload: &str)
 /// |---|---|
 /// | `Lang::with` の言語（タスクごとの値） | いまの言語を取り、新しいタスクでも `Lang::with` で包む |
 /// | 呼び出し元の取り消し | 待っている側が捨てられたら、タスクも止める（[`AbortOnDrop`]） |
-async fn call_isolated(listener: &dyn Listener, payload: &str) -> Result<()> {
-    let future = listener.call(payload.to_string());
+async fn call_isolated(listener: &Arc<dyn Listener>, payload: &str) -> Result<()> {
+    // `call` もタスクの中で呼ぶ。クロージャの同期の部分（最初の `.await` より前）で
+    // パニックしても、`Err` にできるように。
+    let listener = Arc::clone(listener);
+    let payload = payload.to_string();
+    let future = async move { listener.call(payload).await };
     let task = match crate::lang::Lang::request_locale() {
         Some(locale) => tokio::spawn(crate::lang::Lang::with(locale, future)),
         None => tokio::spawn(future),
@@ -586,6 +590,27 @@ mod tests {
             vec!["1:{}".to_string(), "3:{}".to_string()],
             "パニックの後も呼ぶ"
         );
+    }
+
+    #[tokio::test]
+    async fn 最初のawaitより前のパニックも次を呼ぶ() {
+        // クロージャの同期の部分で落ちる。以前は `call` をタスクの外で呼んでいたので、
+        // ここのパニックは `try_dispatch` を呼んだ側まで巻き戻っていた。
+        fn sync_boom(_payload: String) -> std::future::Ready<Result<()>> {
+            panic!("同期の部分で落ちる")
+        }
+        let log = Log::new();
+        let events = Events::new()
+            .listen("mixed", sync_boom)
+            .listen("mixed", log.recorder("2"));
+
+        try_dispatch_in(&events, "mixed", "{}").await.unwrap();
+        assert_eq!(log.taken(), vec!["2:{}".to_string()], "パニックの後も呼ぶ");
+
+        let events = Events::new().listen("only", sync_boom);
+        let error = dispatch_in(&events, "only", "{}").await.unwrap_err();
+        assert_eq!(error.status(), 500);
+        assert!(error.to_string().contains("同期の部分で落ちる"), "{error}");
     }
 
     #[tokio::test]

@@ -280,7 +280,10 @@ impl Message {
     /// ログに書き出すときの形。
     pub fn to_log(&self) -> String {
         let mut out = String::new();
-        out.push_str(&format!("---- {} ----\n", crate::database::now()));
+        out.push_str(&format!(
+            "---- {} ----\n",
+            crate::support::time::now_string()
+        ));
         out.push_str(&format!("From: {}\n", self.from));
         // 空白だけの宛先は書かない。`smtp` が飛ばすのと同じにして、
         // 送り先を切り替えても宛先の見え方が変わらないようにする。

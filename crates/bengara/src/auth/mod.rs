@@ -44,6 +44,15 @@ pub(crate) const AUTH_ID_KEY: &str = "bengara_auth_id";
 /// 捨てるために使います（`StartSession` が保存の直前に見ます）。
 pub(crate) const AUTH_AT_KEY: &str = "bengara_auth_at";
 
+/// [`AUTH_AT_KEY`] の値を、ログインした時刻（UNIX ミリ秒）として読む。
+///
+/// 無い・読めないときは 0 です。時刻を持たない古いセッションは、「切った」印が
+/// あれば切られる側に倒します。`StartSession`（保存の直前）と置き場所（読むとき・
+/// 延ばすとき）が同じ判定をするよう、読み方をここ 1 か所にまとめています。
+pub(crate) fn logged_in_at(raw: Option<&str>) -> i64 {
+    raw.and_then(|v| v.parse::<i64>().ok()).unwrap_or(0)
+}
+
 /// 表と結びついた「ログインできる人」。
 ///
 /// `Model` を継承しているので、主キーと表の名前は `#[derive(Model)]` から取れます。
@@ -97,7 +106,12 @@ pub trait Authenticatable: Model {
     /// }
     /// ```
     ///
-    /// 型ごとに違う名前になるので、`User` のトークンで `Admin` として通ることはありません。
+    /// **既定の名前は、型の名前の最後の部分だけで決まります**（モジュールのパスは見ません）。
+    /// `app::models::User` と `admin::User` のように、別のモジュールに同じ名前の型が
+    /// あると同じ名前になり、片方のトークンがもう片方の型として読めます。
+    /// そのときは、どちらかでこのメソッドを書き換えてください。
+    /// 名前が違う型どうし（`User` と `Admin`）なら、`User` のトークンが
+    /// `user::<Admin>()` で読めることはありません。
     fn morph_class() -> String {
         let full = std::any::type_name::<Self>();
         let base = full.split('<').next().unwrap_or(full);
@@ -180,7 +194,9 @@ impl<'a> Auth<'a> {
     /// 同じ判定です）。利用者を消したときは [`logout_user`](Self::logout_user) で
     /// セッションも切ってください。
     ///
-    /// トークンで認証した要求では、トークンがあれば真です（利用者の行は引きません）。
+    /// トークンで認証した要求では、トークンがあれば真です（利用者の行も、
+    /// 持ち主の種類も見ません）。毎回確かめるときは、ミドルウェアに
+    /// `Authenticate::provider::<U>()` を付けてください。
     pub fn check(&self) -> bool {
         self.id().is_some()
     }
@@ -193,8 +209,11 @@ impl<'a> Auth<'a> {
     /// ログイン中の主キーの値。
     ///
     /// トークンで認証した要求では、トークンの持ち主（`tokenable_id`）です。
-    /// 持ち主の種類（`tokenable_type`）は見ません。持ち主のモデルが何種類もあるときは
+    /// **持ち主の種類（`tokenable_type`）は見ません。** `Admin` のトークンの持ち主 ID も、
+    /// そのまま返します。持ち主のモデルが何種類もあるときは、ミドルウェアを
+    /// `Authenticate::token().provider::<User>()` にして別の種類を通さないか、
     /// [`user`](Self::user) を使うか、`current_access_token()` の `tokenable_type` を見てください。
+    /// 利用者がまだいるかも見ません（[`check`](Self::check) と同じ）。
     pub fn id(&self) -> Option<String> {
         if let Some(token) = self.token {
             return Some(token.tokenable_id.clone()).filter(|v| !v.is_empty());

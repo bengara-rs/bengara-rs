@@ -126,6 +126,9 @@ fn build_signed_with(
     // 末尾の `/` は、照合する側（`verify_signature`）と同じ規則で落とす。
     let path = super::routing::match_path(path);
     check_signable_path(path)?;
+    // `%xx` の16進は大文字にそろえてから署名する（照合する側も大文字にそろえる）。
+    let path = super::percent::upcase_hex(path);
+    let path = path.as_ref();
 
     let mut pairs: Vec<(String, String)> = params
         .iter()
@@ -193,8 +196,8 @@ fn verify_signature(key: &[u8], path: &str, pairs: &[(String, String)], given: &
     // 落とさないと、`/unsubscribe/` はルートに当たるのに署名の対象だけ 1 文字違いになり、
     // 必ず 403 になります。メールや転載でリンクの末尾に `/` が付くのはよくあります。
     //
-    // `%xx` の16進の大文字化（`percent::upcase_hex`）は**通しません**。署名は
-    // 符号化された文字列そのものに対して作るので、形を変えると必ず合わなくなります。
+    // `%xx` の16進は大文字にそろえてから確かめます（作る側も大文字にそろえて署名します）。
+    // 途中のプロキシが `%e3` を `%E3` に書き換えても、署名が合わなくならないためです。
     let path = super::routing::match_path(path);
     // `signature` は 1 つだけ。2 つ以上を後ろ勝ちにすると、前の値を無視したまま
     // 通ってしまう（`?signature=ごみ&signature=本物` が通る）。
@@ -215,13 +218,19 @@ fn verify_signature(key: &[u8], path: &str, pairs: &[(String, String)], given: &
         }
     }
 
-    let absolute = url(path);
-    let query = canonical_query(pairs);
-    let expected = crypto::hmac_sha256(key, payload(&absolute, &query).as_bytes());
     let Some(given) = crypto::from_hex(given) else {
         return false;
     };
-    crypto::constant_time_eq(&expected, &given)
+    let query = canonical_query(pairs);
+    let matches = |path: &str| {
+        let expected = crypto::hmac_sha256(key, payload(&url(path), &query).as_bytes());
+        crypto::constant_time_eq(&expected, &given)
+    };
+    let upper = super::percent::upcase_hex(path);
+    // 大文字にそろえる前に作った署名（小文字の16進のまま署名したリンク）も、
+    // 届いた形のままなら通します。16進の大文字小文字は同じ URL なので、広げても
+    // 通る URL は増えません。
+    matches(&upper) || (upper != path && matches(path))
 }
 
 /// 署名付き URL にできるパスか確かめる。
@@ -404,6 +413,32 @@ mod tests {
         assert!(verify_as("/unsubscribe/", "/unsubscribe/"));
         // `/` 単独は落とさない。
         assert!(verify_as("/", "/"));
+    }
+
+    #[test]
+    fn 十六進の大文字小文字が変わっても署名が通る() {
+        // 以前は届いたパスをそのまま署名の対象にしていたので、途中のプロキシが
+        // `%e3` と `%E3` を書き換えると 403 になった。
+        assert!(verify_as("/a/%E3%81%82", "/a/%e3%81%82"));
+        assert!(verify_as("/a/%e3%81%82", "/a/%E3%81%82"));
+        assert!(verify_as("/a/%e3%81%82", "/a/%e3%81%82"));
+        // 作る側は大文字にそろえた URL を返す。
+        let link = build_signed_with(KEY, "/a/%e3%81%82", &[], None).unwrap();
+        assert!(link.contains("/a/%E3%81%82?"), "{link}");
+        // 文字そのものが違えば通らない。
+        assert!(!verify_as("/a/%E3%81%82", "/a/%E3%81%83"));
+    }
+
+    #[test]
+    fn 小文字の16進のまま作った以前の署名も通る() {
+        // 大文字にそろえる前の作り方（届いた形のまま署名）を手で再現する。
+        let query = canonical_query(&[("user".to_string(), "12".to_string())]);
+        let old = crypto::to_hex(&crypto::hmac_sha256(
+            KEY,
+            payload(&url("/a/%e3%81%82"), &query).as_bytes(),
+        ));
+        let pairs = [("user".to_string(), "12".to_string())];
+        assert!(verify_signature(KEY, "/a/%e3%81%82", &pairs, &[old]));
     }
 
     #[test]

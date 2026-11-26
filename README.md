@@ -38,9 +38,9 @@ cargo new myapp && cd myapp
 bengara = { version = "0.1", features = ["sqlite"] }
 
 [patch.crates-io]
-bengara = { path = "../bengara/crates/bengara" }
-bengara-build = { path = "../bengara/crates/bengara-build" }
-bengara-macros = { path = "../bengara/crates/bengara-macros" }
+bengara = { path = "../bengara-rs/crates/bengara" }
+bengara-build = { path = "../bengara-rs/crates/bengara-build" }
+bengara-macros = { path = "../bengara-rs/crates/bengara-macros" }
 ```
 
 `src/main.rs` の中身を、次の 1 行だけにします。`init` を動かすための仮の入口です。

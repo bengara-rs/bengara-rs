@@ -68,6 +68,7 @@ pub async fn show(req: Request) -> Result<Response> {
 
 - 読み方は [requests-and-responses.md](requests-and-responses.md) にあります。
 - 日本語のパスも書けます（`/記事-{id}` は `/記事-12` に当たります）。
+- `%xx` の形で書いたパスは、16 進の大文字小文字を問わずに当たります（`/caf%c3%a9` も `/caf%C3%A9` も同じ）。
 
 ### 書けない形
 
@@ -128,6 +129,7 @@ pub async fn unsubscribe(req: Request) -> Result<Response> {
 - **`APP_KEY` が要ります（64 文字以上）。** くわしくは [configuration.md](configuration.md) にあります。
 - **署名が合わなくても自動では止まりません。** 何を返すかは自分で決めます。
 - クエリの並び順が変わっても、末尾に `/` が付いても通ります。
+- パスの `%xx` の 16 進の大文字小文字が変わっても通ります（途中のプロキシが書き換えることがあるため）。
 - `signature` と `expires` は引数の名前に使えません（仕組みが使います）。
 - 渡すのはパスだけです。完全な URL（`https://...`）と `//` で始まるものはエラーです。
 - 空白・`?`・`#`・日本語を含むパスもエラーです。先に `%xx` に符号化して渡します。

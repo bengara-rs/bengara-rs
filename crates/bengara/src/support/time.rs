@@ -241,6 +241,8 @@ pub(crate) fn format_date(days: i64) -> String {
 }
 
 /// `YYYY-MM-DD` を 1970-01-01 からの日数に戻す。桁がちょうどで、実在する日付だけを読みます。
+///
+/// 年は 1〜9999 です（`parse_timestamp` と同じ範囲）。`0000` は読みません。
 pub(crate) fn parse_date(text: &str) -> Option<i64> {
     let bytes = text.as_bytes();
     if bytes.len() != 10 || bytes[4] != b'-' || bytes[7] != b'-' {
@@ -249,7 +251,11 @@ pub(crate) fn parse_date(text: &str) -> Option<i64> {
     let year: i64 = fixed_digits(&text[..4], 4)?.parse().ok()?;
     let month: u32 = fixed_digits(&text[5..7], 2)?.parse().ok()?;
     let day: u32 = fixed_digits(&text[8..], 2)?.parse().ok()?;
-    if !(1..=12).contains(&month) || day == 0 || day > days_in_month(year, month) {
+    if !(1..=9999).contains(&year)
+        || !(1..=12).contains(&month)
+        || day == 0
+        || day > days_in_month(year, month)
+    {
         return None;
     }
     Some(days_from_civil(year, month, day))
@@ -530,8 +536,13 @@ mod tests {
             "2026-01-00",
             "+026-01-01",
             "2026-01-01x",
+            // 年 0 は `parse_timestamp` と同じく読まない。
+            "0000-01-01",
         ] {
             assert_eq!(parse_date(text), None, "{text}");
         }
+        // 範囲の端は読める。
+        assert!(parse_date("0001-01-01").is_some());
+        assert!(parse_date("9999-12-31").is_some());
     }
 }

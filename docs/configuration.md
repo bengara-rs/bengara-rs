@@ -236,8 +236,6 @@ MAIL_FROM_NAME="${APP_NAME}"
 | `APP_URL`   | `http://localhost:8000` | `url()` が作る URL の頭                 | `AppConfig`  |
 | `APP_KEY`   | （空）                  | 署名と暗号化の鍵（[APP_KEY](#app_key)） | `AppConfig`  |
 | `RUST_LOG`  | （なし）                | ログの細かさ（[ログ](#ログ)）           | —            |
-| `LOG_CHANNEL`    | `daily`            | ログの出し先（`daily` / `stdout`。[ログ](#ログ)） | —       |
-| `LOG_DAILY_DAYS` | `14`               | ログを残す日数。`0` は消さない（[ログ](#ログ)）   | —       |
 
 `APP_ENV=production` にすると、次の 2 つが変わります。
 

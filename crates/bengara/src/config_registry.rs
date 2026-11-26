@@ -22,8 +22,18 @@ impl Registry {
     }
 
     /// 設定を登録する。同じ型を2回登録すると、後のものが残る。
+    ///
+    /// 2 回目のときは警告のログを出します。`config/` の 2 つのファイルが同じ型を
+    /// 返すと、片方の中身が黙って捨てられ、どちらが効いているか分からないためです。
+    /// 呼ぶのは起動時の登録だけなので、リクエストの処理には響きません。
     pub fn set<T: Any + Send + Sync>(&mut self, value: T) {
-        self.values.insert(TypeId::of::<T>(), Box::new(value));
+        if self
+            .values
+            .insert(TypeId::of::<T>(), Box::new(value))
+            .is_some()
+        {
+            tracing::warn!("{}", duplicate_message(std::any::type_name::<T>()));
+        }
     }
 
     /// 登録済みの設定を借りる。
@@ -48,6 +58,14 @@ impl std::fmt::Debug for Registry {
             .field("len", &self.values.len())
             .finish()
     }
+}
+
+/// 同じ型の設定が 2 回登録されたときの警告の文。
+fn duplicate_message(type_name: &str) -> String {
+    format!(
+        "設定 {type_name} が 2 回登録されました。後に登録したものを使います。\
+         config/ の 2 つのファイルが同じ型を返していないか確かめてください"
+    )
 }
 
 static REGISTRY: OnceLock<Registry> = OnceLock::new();
@@ -108,6 +126,13 @@ pub struct AppConfig {
     pub key: String,
 }
 
+/// `config/app.rs` が無いときの `APP_URL` の既定。
+///
+/// `init` の雛形（`config/app.rs` と `.env`）と同じ値にします。`serve` の既定の
+/// ポートも 8000 です。以前は `http://localhost` で、`config/app.rs` を消すと
+/// `url()` が作る URL からポートが落ちていました。
+const DEFAULT_URL: &str = "http://localhost:8000";
+
 /// `APP_KEY` に求める最低の長さ（文字数）。
 ///
 /// `cargo artisan key:generate` は 32 バイトを16進にした 64 文字を作ります。
@@ -143,7 +168,7 @@ impl Default for AppConfig {
             name: env("APP_NAME", "bengara"),
             env: env("APP_ENV", "production"),
             debug: env("APP_DEBUG", false),
-            url: env("APP_URL", "http://localhost"),
+            url: env("APP_URL", DEFAULT_URL),
             key: env("APP_KEY", ""),
         }
     }
@@ -232,6 +257,29 @@ mod tests {
         r.set(Sample(2));
         assert_eq!(r.get::<Sample>(), Some(&Sample(2)));
         assert_eq!(r.len(), 1);
+    }
+
+    #[test]
+    fn 同じ型の2回目は警告の文で知らせる() {
+        // 以前は黙って後のものが残り、どちらのファイルが効いているか分からなかった。
+        let text = duplicate_message(std::any::type_name::<Sample>());
+        assert!(text.contains("Sample"), "{text}");
+        assert!(text.contains("2 回登録"), "{text}");
+        assert!(text.contains("後に登録したもの"), "{text}");
+    }
+
+    #[test]
+    fn app_urlの既定はinitの雛形とそろえる() {
+        // 以前は `http://localhost` で、雛形の `http://localhost:8000` と違っていた。
+        assert!(
+            include_str!("cli/stubs/config_app.stub")
+                .contains(&format!("env(\"APP_URL\", \"{DEFAULT_URL}\")")),
+            "config/app.rs の雛形"
+        );
+        assert!(
+            include_str!("cli/stubs/env.stub").contains(&format!("\nAPP_URL={DEFAULT_URL}\n")),
+            ".env の雛形"
+        );
     }
 
     #[test]

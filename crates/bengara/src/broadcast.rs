@@ -29,10 +29,10 @@
 // 中継（relay）はサーバーが `websocket` のフラグ付きで立てる。フラグが無いと使われない。
 #![cfg_attr(not(feature = "websocket"), allow(dead_code))]
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde::Serialize;
 
@@ -49,11 +49,15 @@ const MAX_CHANNEL_BYTES: usize = 255;
 /// 中継が 1 回に読む行の数。
 const BATCH: usize = 500;
 
-/// 中継が「ここまでは届けた」と決めてよい古さ。
+/// 中継が id の抜け（まだ見ていない若い id）を諦めるまでの時間。
 ///
-/// これより新しい行は、id の若い行が後からコミットされることがあるので、
-/// 何度でも読み直します（届けた id は覚えておき、二度は届けない）。
-const SETTLE_AFTER_SECS: i64 = 5;
+/// 抜けた id は、後からコミットされる行かもしれないので、この間は何度でも
+/// 読み直します（届けた id は覚えておき、二度は届けない）。
+///
+/// **測るのは中継のプロセスの時計（`Instant`）です。** 行の `created_at`
+/// （書いた側の時計）は使いません。書いた側の時計が 5 秒以上ずれていると、
+/// まだ抜けている id を飛ばして、届かない行が出ました。
+const SETTLE_AFTER: Duration = Duration::from_secs(5);
 
 /// 古い行を掃除する間隔。
 const SWEEP_EVERY: Duration = Duration::from_secs(60);
@@ -222,10 +226,19 @@ fn new_origin() -> String {
 /// `fake()` の間か。
 static FAKE: AtomicBool = AtomicBool::new(false);
 
-/// `fake()` の間に publish されたもの（チャンネル、中身）。
-static RECORDED: Mutex<Vec<(String, String)>> = Mutex::new(Vec::new());
+/// `fake()` の間に記録したもの 1 件。
+#[derive(Debug, Clone)]
+enum Recorded {
+    /// `publish` した（チャンネル、中身）。
+    Publish(String, String),
+    /// `disconnect` した（チャンネル、番号、理由）。番号と理由は直した後の値。
+    Disconnect(String, u16, String),
+}
 
-fn recorded() -> std::sync::MutexGuard<'static, Vec<(String, String)>> {
+/// `fake()` の間に publish / disconnect されたもの（送った順）。
+static RECORDED: Mutex<Vec<Recorded>> = Mutex::new(Vec::new());
+
+fn recorded() -> std::sync::MutexGuard<'static, Vec<Recorded>> {
     RECORDED.lock().unwrap_or_else(|e| e.into_inner())
 }
 
@@ -378,7 +391,7 @@ impl Broadcast {
         let text = text.into();
         if FAKE.load(Ordering::Acquire) {
             check_channel(channel)?;
-            recorded().push((channel.to_string(), text));
+            recorded().push(Recorded::Publish(channel.to_string(), text));
             return Ok(());
         }
         send(driver(), channel, Kind::Publish(&text)).await
@@ -395,14 +408,17 @@ impl Broadcast {
     /// 送れない番号（1004〜1006、1015、1016〜2999、5000 以上、1000 未満）は 1000 に直します。
     /// 理由は 123 バイトを超えたら文字の境目で切ります。
     ///
-    /// **[`fake`](Self::fake) の間は何もしません。** 名前を確かめるだけで、記録もしません
-    /// （`published` には出ません）。
+    /// **[`fake`](Self::fake) の間は閉じずに記録だけします。** 記録は
+    /// [`disconnected`](Self::disconnected) と [`assert_disconnected`](Self::assert_disconnected)
+    /// で確かめられます（`published` には出ません）。
     pub async fn disconnect(channel: &str, code: u16, reason: &str) -> Result<()> {
-        if FAKE.load(Ordering::Acquire) {
-            return check_channel(channel);
-        }
         let code = crate::websocket::close_code(code);
         let reason = crate::websocket::close_reason(reason);
+        if FAKE.load(Ordering::Acquire) {
+            check_channel(channel)?;
+            recorded().push(Recorded::Disconnect(channel.to_string(), code, reason));
+            return Ok(());
+        }
         send(
             driver(),
             channel,
@@ -442,9 +458,7 @@ impl Broadcast {
         });
     }
 
-    /// 以後の `publish` を記録だけして送らない（テスト用）。記録は空から始めます。
-    ///
-    /// `disconnect` は記録しません（名前を確かめるだけで、送りもしません）。
+    /// 以後の `publish` と `disconnect` を記録だけして送らない（テスト用）。記録は空から始めます。
     ///
     /// **記録はプロセスで共有です。** 使うテストは `testing::exclusive()` の札を取ってください
     /// （`Mail::sent()` と同じ）。札を手放すと fake は終わり、記録も空になります。
@@ -457,9 +471,37 @@ impl Broadcast {
     pub fn published(channel: &str) -> Vec<String> {
         recorded()
             .iter()
-            .filter(|(c, _)| c == channel)
-            .map(|(_, text)| text.clone())
+            .filter_map(|item| match item {
+                Recorded::Publish(c, text) if c == channel => Some(text.clone()),
+                _ => None,
+            })
             .collect()
+    }
+
+    /// fake の間に、そのチャンネルへ送った `disconnect` の（番号、理由）。送った順です。
+    ///
+    /// 番号と理由は、送るときと同じく直した後の値です（送れない番号は 1000 に、
+    /// 長い理由は 123 バイトに切ります）。
+    pub fn disconnected(channel: &str) -> Vec<(u16, String)> {
+        recorded()
+            .iter()
+            .filter_map(|item| match item {
+                Recorded::Disconnect(c, code, reason) if c == channel => {
+                    Some((*code, reason.clone()))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// そのチャンネルへ `disconnect` が送られたか確かめる。無ければパニック。
+    #[track_caller]
+    pub fn assert_disconnected(channel: &str) {
+        let disconnected = Self::disconnected(channel);
+        assert!(
+            !disconnected.is_empty(),
+            "チャンネル `{channel}` への disconnect がありません"
+        );
     }
 
     /// そのチャンネルへ、`contains` を含む中身が publish されたか確かめる。無ければパニック。
@@ -473,9 +515,15 @@ impl Broadcast {
     }
 
     /// 何も publish されていないことを確かめる。あればパニック。
+    ///
+    /// `disconnect` の記録は見ません（[`assert_disconnected`](Self::assert_disconnected) を使ってください）。
     #[track_caller]
     pub fn assert_nothing_published() {
-        let all = recorded().clone();
+        let all: Vec<Recorded> = recorded()
+            .iter()
+            .filter(|item| matches!(item, Recorded::Publish(..)))
+            .cloned()
+            .collect();
         assert!(all.is_empty(), "配信がありました: {all:?}");
     }
 }
@@ -511,11 +559,20 @@ pub(crate) fn start_relay() {
 ///
 /// - 起動時: いまの最大の id を `settled`（ここまでは届けない）とする
 /// - 毎回: `id > settled` の行を id の順に読む。届けた id は `delivered` に入れ、二度届けない
-/// - `settled` は「`created_at` が 5 秒より古い行の最大の id」まで進め、`delivered` からそれ以下を捨てる
+/// - 読んで見えた一番大きい id を、見た時刻（中継の `Instant`）と一緒に `horizons` に残す。
+///   その時点で、それより若くて届けていない id は「抜け」です
+/// - 見てから 5 秒たった id までは `settled` を進め、`delivered` からそれ以下を捨てる。
+///   その下の抜けは 5 秒以上埋まらなかったので、もう来ないと見なします
 /// - `delivered` のうち `settled + 1` から切れ目なく続く部分は、その場で `settled` に畳む
 ///   （その範囲の id はすべて届けたので、後から若い id が来る余地が無い）。
 ///   畳まないと、毎回 5 秒分の行を読み直していました
 /// - 500 行届けたら、待たずに続けて読む
+///
+/// 以前は「`created_at` が 5 秒より古い行の最大の id」を別の問い合わせで調べて
+/// `settled` を進めていました。`created_at` は書いた側の時計なので、時計が 5 秒以上
+/// 遅れたプロセスの行や、読んだ後にコミットされた古い時刻の行で、まだ抜けている
+/// id を飛ばしていました。いまは読んだ範囲の中だけで、中継の時計で決めます
+/// （表の形は変えていません）。何も無いときは、表を 1 回読むだけです。
 struct Relay {
     origin: String,
     retention_secs: i64,
@@ -523,8 +580,13 @@ struct Relay {
     settled: Option<i64>,
     /// `settled` より大きい id のうち、届けたもの。
     delivered: BTreeSet<i64>,
-    last_sweep: Option<std::time::Instant>,
-    last_warn: Option<std::time::Instant>,
+    /// 読んで見えた一番大きい id と、それを見た時刻。id も時刻も増える順に並ぶ。
+    ///
+    /// 見た時点でそれより若い抜けは、その時刻から開いています。5 秒たった
+    /// ものまで `settled` を進めます。
+    horizons: VecDeque<(i64, Instant)>,
+    last_sweep: Option<Instant>,
+    last_warn: Option<Instant>,
 }
 
 impl Relay {
@@ -534,6 +596,7 @@ impl Relay {
             retention_secs,
             settled: None,
             delivered: BTreeSet::new(),
+            horizons: VecDeque::new(),
             last_sweep: None,
             last_warn: None,
         }
@@ -555,7 +618,7 @@ impl Relay {
                 let quiet = self.last_warn.is_some_and(|at| at.elapsed() < WARN_EVERY);
                 if !quiet {
                     tracing::warn!("配信の中継が表 {TABLE} を読めません（やり直します）: {e}");
-                    self.last_warn = Some(std::time::Instant::now());
+                    self.last_warn = Some(Instant::now());
                 }
                 false
             }
@@ -570,10 +633,14 @@ impl Relay {
             return Ok(false);
         };
 
+        // この回の読み始めの時刻。抜けがここまで開いていたかを測る。
+        let scan_started = Instant::now();
         // 届けていない id を、最大 500 個まで集める。
         let mut fresh = Vec::new();
         // 集めきれずに止めたとき、`settled` を進めてよい上限。
         let mut frontier: Option<i64> = None;
+        // 読んで見えた一番大きい id（集めきれずに止めたら `frontier`）。
+        let mut highest: Option<i64> = None;
         let mut cursor = settled;
         'scan: loop {
             let ids: Vec<i64> = DB::table(TABLE)
@@ -584,13 +651,16 @@ impl Relay {
                 .await?;
             for id in &ids {
                 if self.delivered.contains(id) {
+                    highest = Some(*id);
                     continue;
                 }
                 if fresh.len() == BATCH {
                     frontier = Some(id - 1);
+                    highest = frontier;
                     break 'scan;
                 }
                 fresh.push(*id);
+                highest = Some(*id);
             }
             match ids.last() {
                 Some(last) if ids.len() == BATCH => cursor = *last,
@@ -636,33 +706,61 @@ impl Relay {
 
         // 届けた id が切れ目なく続く分は、5 秒を待たずに進める。
         self.compact();
-        let settled = self.settled.unwrap_or(settled);
-
-        // 5 秒より古い行までは、もう若い id が後から来ないと見なして進める。
-        let cutoff = crate::support::time::format_timestamp(
-            crate::support::time::now_seconds() - SETTLE_AFTER_SECS,
-        );
-        let old: Option<i64> = DB::table(TABLE)
-            .where_op("id", ">", settled)
-            .where_op("created_at", "<", cutoff)
-            .max("id")
-            .await?;
-        if let Some(old) = old {
-            let next = frontier.map_or(old, |frontier| old.min(frontier));
-            if next > settled {
-                self.settled = Some(next);
-                self.delivered = self.delivered.split_off(&(next + 1));
-            }
+        // 見えた一番大きい id を、読み終えた時刻と一緒に残す（遅いほうの時刻で測る）。
+        if let Some(highest) = highest {
+            self.observe(highest, Instant::now());
         }
+        // 見てから 5 秒たった id までは、下の抜けをもう来ないと見なして進める。
+        self.settle(scan_started);
 
         self.sweep().await?;
         Ok(frontier.is_some())
     }
 
+    /// 読んで見えた一番大きい id を覚える。前に覚えたものより大きいときだけ足す。
+    fn observe(&mut self, highest: i64, at: Instant) {
+        let known = self
+            .horizons
+            .back()
+            .map(|(id, _)| *id)
+            .into_iter()
+            .chain(self.settled)
+            .max();
+        if known.is_none_or(|known| highest > known) {
+            self.horizons.push_back((highest, at));
+        }
+    }
+
+    /// `scan_started` の時点で 5 秒以上前に見えた id まで `settled` を進める。
+    ///
+    /// その id より若い抜けは、見えたときから `scan_started` の読み直しまで
+    /// ずっと埋まらなかったものです。`delivered` からそれ以下を捨てます。
+    fn settle(&mut self, scan_started: Instant) {
+        let Some(mut settled) = self.settled else {
+            return;
+        };
+        while let Some(&(id, seen)) = self.horizons.front() {
+            if id <= settled {
+                // `compact` で先に追い越した。
+                self.horizons.pop_front();
+                continue;
+            }
+            if scan_started.saturating_duration_since(seen) < SETTLE_AFTER {
+                break;
+            }
+            self.horizons.pop_front();
+            settled = id;
+        }
+        if Some(settled) != self.settled {
+            self.settled = Some(settled);
+            self.delivered = self.delivered.split_off(&(settled + 1));
+        }
+    }
+
     /// `delivered` の先頭が `settled + 1` から切れ目なく続く分を `settled` に畳む。
     ///
     /// 間が空いていたら止めます。空いた id は、まだコミットされていない行かもしれません
-    /// （その分は 5 秒の規則で進めます）。
+    /// （その分は 5 秒の規則で進めます。[`Relay::settle`]）。
     fn compact(&mut self) {
         let Some(mut settled) = self.settled else {
             return;
@@ -680,7 +778,7 @@ impl Relay {
             return Ok(());
         }
         sweep_old_rows(self.retention_secs).await?;
-        self.last_sweep = Some(std::time::Instant::now());
+        self.last_sweep = Some(Instant::now());
         Ok(())
     }
 }
@@ -877,6 +975,7 @@ mod tests {
                 .unwrap();
             Broadcast::publish("other", "b").await.unwrap();
             Broadcast::disconnect(&channel, 4001, "bye").await.unwrap();
+            // disconnect は publish の記録に混ざらない（下の published で確かめる）。
 
             assert_eq!(
                 Broadcast::published(&channel),
@@ -892,14 +991,32 @@ mod tests {
             let some = std::panic::catch_unwind(Broadcast::assert_nothing_published);
             assert!(some.is_err());
 
+            // disconnect は記録だけする（閉じない）。番号と理由は直した後の値。
+            Broadcast::assert_disconnected(&channel);
+            Broadcast::disconnect(&channel, 1006, "x").await.unwrap();
+            assert_eq!(
+                Broadcast::disconnected(&channel),
+                vec![(4001, "bye".to_string()), (1000, "x".to_string())]
+            );
+            assert!(Broadcast::disconnected("other").is_empty());
+            let none = std::panic::catch_unwind(|| Broadcast::assert_disconnected("other"));
+            assert!(none.is_err());
+            assert!(
+                Broadcast::disconnect("", 4001, "x").await.is_err(),
+                "名前は確かめる"
+            );
+
             // もう一度 fake にすると記録は空から。
             Broadcast::fake();
             Broadcast::assert_nothing_published();
+            assert!(Broadcast::disconnected(&channel).is_empty());
             Broadcast::publish(&channel, "c").await.unwrap();
+            Broadcast::disconnect(&channel, 4001, "bye").await.unwrap();
         }
         // 札を手放すと fake は終わり、記録も空。
         assert!(!FAKE.load(Ordering::Acquire));
         assert!(Broadcast::published(&channel).is_empty());
+        assert!(Broadcast::disconnected(&channel).is_empty());
         registry::unregister(conn.id());
     }
 
@@ -1014,16 +1131,101 @@ mod tests {
             assert_eq!(relay.settled, Some(0));
             assert_eq!(relay.delivered.len(), 2);
 
-            // 古くなったら settled を進め、覚えた id を捨てる。
-            DB::table(TABLE)
-                .update(&[("created_at", Value::Text(ago(30)))])
-                .await
-                .unwrap();
+            // 見てから 5 秒たったら settled を進め、覚えた id を捨てる。
+            // 測るのは中継の時計。行の created_at は見ない。
+            age_horizons(&mut relay);
             relay.step().await;
             assert_eq!(relay.settled, Some(10));
             assert!(relay.delivered.is_empty());
+            assert!(relay.horizons.is_empty());
             assert!(texts(&mut rx).is_empty());
             registry::unregister(conn.id());
+        }
+
+        /// 覚えた id を「30 秒前に見た」ことにする（5 秒待たずに確かめるため）。
+        fn age_horizons(relay: &mut Relay) {
+            let past = Instant::now()
+                .checked_sub(Duration::from_secs(30))
+                .expect("起動から 30 秒はたっている");
+            for horizon in relay.horizons.iter_mut() {
+                horizon.1 = past;
+            }
+        }
+
+        #[tokio::test]
+        async fn 書いた側の時計が遅れていても抜けを飛ばさない() {
+            let _db = crate::testing::refresh_database().await;
+            表を作る().await;
+            let channel = unique("skew");
+            let (conn, mut rx) = member(&channel);
+            let mut relay = Relay::new(origin().to_string(), 60);
+            relay.step().await;
+            assert_eq!(relay.settled, Some(0));
+
+            // 時計が 1 時間遅れたプロセスが id 10 を書いた。以前は created_at が古いので
+            // その場で settled を 10 まで進め、1〜9 の抜けを諦めていた。
+            other(Some(10), &channel, "ten", &ago(3_600)).await;
+            relay.step().await;
+            assert_eq!(texts(&mut rx), vec!["ten"]);
+            assert_eq!(
+                relay.settled,
+                Some(0),
+                "抜けを見てから 5 秒たつまで進めない"
+            );
+
+            // 抜けていた id 5 が後からコミットされた（これも古い時刻）。取りこぼさない。
+            other(Some(5), &channel, "five", &ago(3_600)).await;
+            relay.step().await;
+            assert_eq!(texts(&mut rx), vec!["five"]);
+            assert_eq!(relay.settled, Some(0));
+
+            // 5 秒たったら、読んだ範囲（10）までだけ進める。
+            age_horizons(&mut relay);
+            relay.step().await;
+            assert_eq!(relay.settled, Some(10));
+            registry::unregister(conn.id());
+        }
+
+        #[tokio::test]
+        async fn 何も無いときは覚えるものを増やさない() {
+            let _db = crate::testing::refresh_database().await;
+            表を作る().await;
+            let mut relay = Relay::new(origin().to_string(), 60);
+            relay.step().await;
+            for _ in 0..3 {
+                assert!(!relay.step().await);
+            }
+            assert!(relay.horizons.is_empty());
+            assert!(relay.delivered.is_empty());
+            assert_eq!(relay.settled, Some(0));
+        }
+
+        #[test]
+        fn 進めるのは見てから五秒たったidまで() {
+            let mut relay = Relay::new("me".into(), 60);
+            relay.settled = Some(0);
+            let start = Instant::now();
+            relay.observe(3, start);
+            relay.observe(3, start + Duration::from_secs(1)); // 増えていなければ足さない
+            relay.observe(7, start + Duration::from_secs(2));
+            assert_eq!(relay.horizons.len(), 2);
+            relay.delivered.extend([2, 3, 6, 7, 9]);
+
+            // 4 秒後の読み直しでは、まだどれも 5 秒たっていない。
+            relay.settle(start + Duration::from_secs(4));
+            assert_eq!(relay.settled, Some(0));
+            // 5 秒後なら 3 まで。7 はまだ。
+            relay.settle(start + Duration::from_secs(5));
+            assert_eq!(relay.settled, Some(3));
+            assert_eq!(
+                relay.delivered.iter().copied().collect::<Vec<_>>(),
+                vec![6, 7, 9]
+            );
+            // 7 秒後なら 7 まで。見ていない 9 より先には進めない。
+            relay.settle(start + Duration::from_secs(7));
+            assert_eq!(relay.settled, Some(7));
+            assert_eq!(relay.delivered.iter().copied().collect::<Vec<_>>(), vec![9]);
+            assert!(relay.horizons.is_empty());
         }
 
         #[tokio::test]

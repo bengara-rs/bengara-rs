@@ -84,6 +84,11 @@ pub(crate) fn run(root: &Path) -> Result<()> {
     let name = manifest
         .package_name()
         .ok_or_else(|| Error::msg("Cargo.toml の [package] に name がありません"))?;
+    // 本体の bin はパッケージ名で作るので、`artisan` だと `artisan` の bin と重なる。
+    // cargo は同じ名前の bin を 2 つ持てないので、書き始める前に止める。
+    if let Some(message) = reserved_package_message(&name) {
+        return Err(Error::msg(message));
+    }
 
     // 中身を確かめるファイルを、書き始める前に全部読む。
     // 読めないものがあれば、ここで止まる（まだ何も書き換えていない）。
@@ -174,13 +179,18 @@ pub(crate) fn run(root: &Path) -> Result<()> {
     // `[[bin]]` がまだ `src/main.rs` を指しているかで決めるため。
     update_manifest(&mut manifest, &name);
 
-    // 入口（main.rs）を用意し、cargo new が作った src/ を片付ける。
+    // 入口（main.rs）を用意する。
     update_main(root, existing.main_rs.as_deref(), &mut report)?;
-    clean_src(root, manifest.has_path("src/main.rs"), &mut report)?;
 
+    // Cargo.toml は src/ を片付ける**前**に書き戻す。先に片付けると、書き戻しに
+    // 失敗したとき（読み取り専用・Windows で開かれている）に、`[[bin]]` の向き先が
+    // 無いプロジェクトが残る。`cargo build` も、もう一度の `init` も通らなくなる。
     if manifest.save(&manifest_path)? {
         report.updated.push("Cargo.toml".to_string());
     }
+
+    // cargo new が作った src/ を片付ける。
+    clean_src(root, manifest.has_path("src/main.rs"), &mut report)?;
 
     report.print();
     if new_env {
@@ -190,6 +200,18 @@ pub(crate) fn run(root: &Path) -> Result<()> {
         "\n次の一歩\n\n  cargo artisan serve     サーバーを起動して、変更を見張る\n  cargo test              テストを走らせる\n  cargo artisan list      コマンドの一覧\n"
     );
     Ok(())
+}
+
+/// パッケージ名として使えない名前なら、理由と直し方の文を返す。
+///
+/// `artisan` だけです。`init` は本体の bin をパッケージ名で、開発用の bin を
+/// `artisan` で作ります。同じ名前の bin が 2 つになると、cargo が Cargo.toml を読めません。
+fn reserved_package_message(name: &str) -> Option<String> {
+    (name == "artisan").then(|| {
+        "パッケージ名を `artisan` にはできません。init は開発用の bin を `artisan` という名前で作るので、\
+         本体の bin（パッケージ名）と重なります。Cargo.toml の [package] name を変えてから実行してください"
+            .to_string()
+    })
 }
 
 /// `.env` の雛形の空の `APP_KEY=` の行に、鍵を入れる。
@@ -892,6 +914,63 @@ mod tests {
 
             let _ = std::fs::remove_dir_all(&root);
         }
+    }
+
+    #[test]
+    fn パッケージ名がartisanなら何も書かずに止まる() {
+        // 以前は `[[bin]] name = "artisan"` が 2 つ書かれ、cargo が Cargo.toml を読めなくなった。
+        let root = temp_project("artisan-name");
+        let manifest = "[package]\nname = \"artisan\"\nversion = \"0.1.0\"\nedition = \"2021\"\n";
+        std::fs::write(root.join("Cargo.toml"), manifest).unwrap();
+
+        let error = run(&root).expect_err("artisan という名前で進みました");
+        assert!(error.to_string().contains("`artisan`"), "{error}");
+        assert!(error.to_string().contains("[package] name"), "{error}");
+
+        assert_eq!(
+            std::fs::read_to_string(root.join("Cargo.toml")).unwrap(),
+            manifest
+        );
+        for untouched in ["app", "storage", "artisan.rs", "main.rs", ".env"] {
+            assert!(!root.join(untouched).exists(), "{untouched} を作っています");
+        }
+        assert_eq!(reserved_package_message("myapp"), None);
+        assert_eq!(reserved_package_message("artisan-app"), None);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn cargo_tomlを書けないときはsrc_main_rsを消さない() {
+        // 以前は src/main.rs を消してから Cargo.toml を書いていた。書けないと
+        // `[[bin]]` の向き先が無いプロジェクトが残り、init もやり直せなかった。
+        let root = temp_project("readonly-manifest");
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        let hello = "fn main() {\n    println!(\"Hello, world!\");\n}\n";
+        std::fs::write(root.join("src/main.rs"), hello).unwrap();
+        let manifest_path = root.join("Cargo.toml");
+        let mut permissions = std::fs::metadata(&manifest_path).unwrap().permissions();
+        permissions.set_readonly(true);
+        std::fs::set_permissions(&manifest_path, permissions.clone()).unwrap();
+
+        let error = run(&root).expect_err("読み取り専用の Cargo.toml に書けました");
+        assert!(error.to_string().contains("Cargo.toml"), "{error}");
+        // 雛形の src/main.rs（消してよいもの）でも、まだ消さない。
+        assert_eq!(
+            std::fs::read_to_string(root.join("src/main.rs")).unwrap(),
+            hello
+        );
+
+        // 書けるようにすれば、もう一度の init で片付く。
+        #[allow(clippy::permissions_set_readonly_false)]
+        permissions.set_readonly(false);
+        std::fs::set_permissions(&manifest_path, permissions).unwrap();
+        run(&root).unwrap();
+        assert!(!root.join("src").exists());
+        let text = std::fs::read_to_string(&manifest_path).unwrap();
+        assert!(text.contains("path = \"main.rs\""), "{text}");
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

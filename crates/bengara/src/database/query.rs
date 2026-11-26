@@ -51,7 +51,10 @@ enum Where {
     In {
         boolean: Glue,
         column: String,
+        /// `NULL` を除いた値。
         values: Vec<Value>,
+        /// 一覧に `NULL` が入っていたか。`is null` / `is not null` に分けて書きます。
+        null: bool,
         not: bool,
     },
     Between {
@@ -239,7 +242,42 @@ impl QueryBuilder {
         if let Some(message) = &self.deferred_error {
             return Some(message.clone());
         }
-        self.dollar_error().or_else(|| self.dialect_error())
+        self.placeholder_error()
+            .or_else(|| self.dollar_error())
+            .or_else(|| self.dialect_error())
+    }
+
+    /// 値を渡す口の無い所（`select` / `add_select` / `order_by_raw`）に、
+    /// 引用の外の `?` を書いていたときの文。
+    ///
+    /// そこに書いた `?` には値が渡らず、PostgreSQL では番号にも振り直しません。
+    /// SQLite は黙って `NULL` を入れ、MySQL は値の数のエラーになり、PostgreSQL は
+    /// JSONB の演算子として読みます。`select` に書くと、後ろの `where` の値と
+    /// 位置もずれます（`select ?, .. where id = ?` の 1 つ目に `where` の値が入る）。
+    ///
+    /// `select` は後から置き換えられるので、書いたときではなく終端で、
+    /// いまの列と並びを見ます。
+    fn placeholder_error(&self) -> Option<String> {
+        let place =
+            if self
+                .columns
+                .iter()
+                .any(|column| grammar::count_placeholders(column) > 0)
+            {
+                "select / add_select"
+            } else if self.orders.iter().any(
+                |order| matches!(order, Order::Raw(sql) if grammar::count_placeholders(sql) > 0),
+            ) {
+                "order_by_raw"
+            } else {
+                return None;
+            };
+        Some(format!(
+            "{place} に `?` は書けません。ここには値を渡す口が無いためです。\
+             値で絞るときは where_raw / having_raw に書いてください。\
+             PostgreSQL の JSONB の演算子（`?` `?|` `?&`）は、\
+             jsonb_exists(列, 'キー') のような関数で書いてください"
+        ))
     }
 
     /// いまのドライバに無い演算子（`ilike` / `<=>`）を書いていたときの文。
@@ -410,12 +448,16 @@ impl QueryBuilder {
     ///
     /// **列名を検査しません。** 引用せずそのまま置く意図した逃げ道です
     /// （`*_raw` 系も同じ）。外から来た文字列をそのまま渡さないでください。
+    ///
+    /// **値は渡せません。** 引用の外に `?` を書くと、終端メソッドでエラーになります。
+    /// 渡す値が無いうえ、後ろの `where` の値と位置がずれるためです
+    /// （理由は [`order_by_raw`](Self::order_by_raw) と同じ）。
     pub fn select(mut self, columns: &[&str]) -> Self {
         self.columns = columns.iter().map(|c| (*c).to_string()).collect();
         self
     }
 
-    /// 取る列を足す。`select` と同じく**列名を検査しません。**
+    /// 取る列を足す。`select` と同じく**列名を検査しません。** `?` も書けません。
     pub fn add_select(mut self, column: &str) -> Self {
         self.columns.push(column.to_string());
         self
@@ -539,45 +581,43 @@ impl QueryBuilder {
         self
     }
 
-    /// 列が2つの値の間にある（両端を含む）。
+    /// 列が2つの値の間にある（両端を含む）。端に `NULL` を渡すとエラーになります。
     pub fn where_between<C: ColumnRef>(
-        mut self,
+        self,
         column: C,
         low: impl Bind<C::Accepts>,
         high: impl Bind<C::Accepts>,
     ) -> Self {
-        let column = column.column_name();
-        self.check_column("where_between", column);
-        self.wheres.push(Where::Between {
-            boolean: Glue::And,
-            column: column.to_string(),
-            low: low.bind(),
-            high: high.bind(),
-            not: false,
-        });
-        self
+        self.push_between(
+            "where_between",
+            column.column_name(),
+            low.bind(),
+            high.bind(),
+            false,
+        )
     }
 
-    /// 列が2つの値の間に無い。
+    /// 列が2つの値の間に無い。端に `NULL` を渡すとエラーになります。
     pub fn where_not_between<C: ColumnRef>(
-        mut self,
+        self,
         column: C,
         low: impl Bind<C::Accepts>,
         high: impl Bind<C::Accepts>,
     ) -> Self {
-        let column = column.column_name();
-        self.check_column("where_not_between", column);
-        self.wheres.push(Where::Between {
-            boolean: Glue::And,
-            column: column.to_string(),
-            low: low.bind(),
-            high: high.bind(),
-            not: true,
-        });
-        self
+        self.push_between(
+            "where_not_between",
+            column.column_name(),
+            low.bind(),
+            high.bind(),
+            true,
+        )
     }
 
     /// 列が形に当てはまる（`like`）。`%` は自分で書きます。
+    ///
+    /// `%` と `_` を文字そのものとして探すときは、`\` を前に付けます（`100\%`）。
+    /// どのドライバでも `\` が逃がしの文字です（SQLite には ` escape '\'` を足します。
+    /// `where_op` の `like` / `not like` も同じ）。
     pub fn where_like<C: ColumnRef>(self, column: C, pattern: impl Bind<C::Accepts>) -> Self {
         self.push_basic(
             "where_like",
@@ -602,7 +642,7 @@ impl QueryBuilder {
         self.wheres.push(Where::Column {
             boolean: Glue::And,
             left: left.to_string(),
-            operator: operator.to_string(),
+            operator: grammar::normalize_operator(operator),
             right: right.to_string(),
         });
         self
@@ -610,9 +650,14 @@ impl QueryBuilder {
 
     /// SQL を直接書く。値はプレースホルダ（`?`）で渡します。
     ///
-    /// **`?` は値の置き場所としてのみ使えます。** 文字列の中に書いた `?` も
-    /// 値の置き場所として数えるので、`'a?b'` のような書き方はできません。
+    /// **`?` は値の置き場所としてのみ使えます。** 文字列リテラル（`'a?b'`）と
+    /// 引用した名前（`"a?b"`）の中の `?` は数えません。引用の外の `?` は、
+    /// PostgreSQL の JSONB の演算子（`?` `?|` `?&`）も値の置き場所として数えます。
+    /// `jsonb_exists(列, 'キー')` のような関数で書いてください。
     /// `?` の数と値の数が合わないときは、終端メソッドでエラーになります。
+    ///
+    /// **書いた SQL は括弧でくくって置きます。** `where_raw("a = ? or b = ?", ..)` を
+    /// ほかの条件と `and` でつないでも、`or` が外へ漏れません。
     pub fn where_raw(mut self, sql: &str, bindings: &[Value]) -> Self {
         self.check_raw("where_raw", sql, bindings);
         self.wheres.push(Where::Raw {
@@ -658,18 +703,7 @@ impl QueryBuilder {
         build: impl FnOnce(QueryBuilder) -> QueryBuilder,
     ) -> Self {
         let nested = build(QueryBuilder::new(self.source.clone(), self.table.clone()));
-        // 中で見つけた間違いも引き継ぐ。捨てると気づけない。
-        if let Some(message) = nested.deferred_error {
-            self.defer(message);
-        }
-        // `$` の直書きも引き継ぐ。断るかどうかは、外側の終端が決める。
-        if self.raw_dollar.is_none() {
-            self.raw_dollar = nested.raw_dollar;
-        }
-        // ドライバだけの演算子も同じ。
-        if self.dialect_operator.is_none() {
-            self.dialect_operator = nested.dialect_operator;
-        }
+        self.absorb(&nested);
         if !nested.wheres.is_empty() {
             self.wheres.push(Where::Nested {
                 boolean,
@@ -695,11 +729,8 @@ impl QueryBuilder {
     ) -> Self {
         let then = then(QueryBuilder::new(self.source.clone(), self.table.clone()));
         let otherwise = otherwise(QueryBuilder::new(self.source.clone(), self.table.clone()));
-        for nested in [&then, &otherwise] {
-            if let Some(message) = &nested.deferred_error {
-                self.defer(message.clone());
-            }
-        }
+        self.absorb(&then);
+        self.absorb(&otherwise);
         match (
             <[Where; 1]>::try_from(then.wheres),
             <[Where; 1]>::try_from(otherwise.wheres),
@@ -715,6 +746,24 @@ impl QueryBuilder {
             _ => self.defer("ドライバで変わる条件の組み立てを誤りました（bengara の不具合です）"),
         }
         self
+    }
+
+    /// 中で組み立てたビルダー（`where_group` / `where_by_driver` のクロージャ）が
+    /// 覚えた印を引き継ぐ。
+    ///
+    /// 引き継ぐのは、組み立ての間違い・`$` の直書き・ドライバだけの演算子の 3 つです。
+    /// どれも、断るかどうかは外側の終端が決めます。捨てると気づけません。
+    /// 以前は `where_by_driver` が組み立ての間違いしか引き継いでいませんでした。
+    fn absorb(&mut self, nested: &QueryBuilder) {
+        if let Some(message) = &nested.deferred_error {
+            self.defer(message.clone());
+        }
+        if self.raw_dollar.is_none() {
+            self.raw_dollar.clone_from(&nested.raw_dollar);
+        }
+        if self.dialect_operator.is_none() {
+            self.dialect_operator.clone_from(&nested.dialect_operator);
+        }
     }
 
     fn push_basic(
@@ -775,11 +824,26 @@ impl QueryBuilder {
         Where::Basic {
             boolean,
             column: column.to_string(),
-            operator: operator.to_string(),
+            // 照合したのと同じ、そろえた形で書く（`grammar::normalize_operator`）。
+            operator: grammar::normalize_operator(operator),
             value,
         }
     }
 
+    /// `in` / `not in` の条件を足す。
+    ///
+    /// **一覧の `NULL` は `is null` / `is not null` に分けて書きます**
+    /// （`basic_condition` が `=` の `NULL` を `is null` にするのと同じ考え方）。
+    ///
+    /// | 書き方                       | SQL                                                |
+    /// |------------------------------|----------------------------------------------------|
+    /// | `where_in(c, [1, NULL])`     | `("c" in (?) or "c" is null)`                      |
+    /// | `where_not_in(c, [1, NULL])` | `("c" not in (?) and "c" is not null)`             |
+    /// | `where_in(c, [NULL])`        | `"c" is null`                                      |
+    /// | `where_not_in(c, [NULL])`    | `"c" is not null`                                  |
+    ///
+    /// `"c" in (?, NULL)` の `NULL` は何にも当たらず、`"c" not in (?, NULL)` は
+    /// どの行でも真にならないので、エラーも無く必ず 0 件になっていました。
     fn push_in<A, V: Bind<A> + Clone>(
         mut self,
         place: &str,
@@ -796,10 +860,52 @@ impl QueryBuilder {
                 values.len()
             ));
         }
+        let mut null = false;
+        let values: Vec<Value> = values
+            .iter()
+            .cloned()
+            .map(Bind::bind)
+            .filter(|value| {
+                let is_null = value.is_null();
+                null |= is_null;
+                !is_null
+            })
+            .collect();
         self.wheres.push(Where::In {
             boolean,
             column: column.to_string(),
-            values: values.iter().cloned().map(Bind::bind).collect(),
+            values,
+            null,
+            not,
+        });
+        self
+    }
+
+    /// `where_between` / `where_not_between` の条件を足す。
+    ///
+    /// **端に `NULL` を渡すと断ります。** `between ? and NULL` は真にも偽にも
+    /// ならないので、エラーも無く必ず 0 件（`not between` でも 0 件）になるためです。
+    fn push_between(
+        mut self,
+        place: &str,
+        column: &str,
+        low: Value,
+        high: Value,
+        not: bool,
+    ) -> Self {
+        self.check_column(place, column);
+        if low.is_null() || high.is_null() {
+            self.defer(format!(
+                "{place} の端に NULL は渡せません。NULL を挟んだ範囲は真にも偽にもならず、\
+                 必ず 0 件になるためです。片側だけで絞るときは where_op(列, \">=\", 値) などを、\
+                 NULL かどうかは where_null / where_not_null を使ってください"
+            ));
+        }
+        self.wheres.push(Where::Between {
+            boolean: Glue::And,
+            column: column.to_string(),
+            low,
+            high,
             not,
         });
         self
@@ -836,7 +942,7 @@ impl QueryBuilder {
             kind,
             table: table.to_string(),
             first: first.to_string(),
-            operator: operator.to_string(),
+            operator: grammar::normalize_operator(operator),
             second: second.to_string(),
         });
         self
@@ -893,6 +999,8 @@ impl QueryBuilder {
     }
 
     /// 束ねた結果を SQL で絞る。`?` は値の置き場所としてのみ使えます。
+    ///
+    /// `where_raw` と同じく、書いた SQL は括弧でくくって置きます。
     pub fn having_raw(mut self, sql: &str, bindings: &[Value]) -> Self {
         self.check_raw("having_raw", sql, bindings);
         self.havings.push(Where::Raw {
@@ -936,8 +1044,13 @@ impl QueryBuilder {
     ///
     /// **外から来た文字列をそのまま渡さないでください。** 引用も検査もしません。
     ///
-    /// PostgreSQL で `$1` と書いたときだけ、終端メソッドでエラーになります。
+    /// PostgreSQL で `$1` と書いたときは、終端メソッドでエラーになります。
     /// ビルダーが振る番号と重なるためです。
+    ///
+    /// **値は渡せません。** 引用の外に `?` を書くと、終端メソッドでエラーになります
+    /// （`select` / `add_select` も同じ）。渡す値の無い `?` は、SQLite では黙って
+    /// `NULL` になり、MySQL では値の数のエラー、PostgreSQL では JSONB の演算子として
+    /// 読まれます。JSONB のキーを見るときは `jsonb_exists(列, 'キー')` と書いてください。
     pub fn order_by_raw(mut self, sql: &str) -> Self {
         self.check_raw_dollar("order_by_raw", sql);
         self.orders.push(Order::Raw(sql.to_string()));
@@ -1158,6 +1271,8 @@ impl QueryBuilder {
                 c.sql.push_str(operator);
                 c.sql.push(' ');
                 c.push_value(value.clone());
+                // SQLite の `like` には逃がしの文字が無い。`\` にそろえる。
+                c.sql.push_str(grammar::like_escape(driver, operator));
             }
             Where::Null { column, not, .. } => {
                 c.sql.push_str(&grammar::quote(driver, column));
@@ -1167,15 +1282,28 @@ impl QueryBuilder {
             Where::In {
                 column,
                 values,
+                null,
                 not,
                 ..
             } => {
+                let quoted = grammar::quote(driver, column);
+                // 一覧の `NULL` は `is null` / `is not null` で書く（`push_in` を参照）。
+                let null_test = if *not { " is not null" } else { " is null" };
                 if values.is_empty() {
-                    // 空の一覧は「どれにも当てはまらない」。not なら必ず真。
-                    c.sql.push_str(if *not { "1 = 1" } else { "1 = 0" });
+                    if *null {
+                        // `NULL` だけの一覧。
+                        c.sql.push_str(&quoted);
+                        c.sql.push_str(null_test);
+                    } else {
+                        // 空の一覧は「どれにも当てはまらない」。not なら必ず真。
+                        c.sql.push_str(if *not { "1 = 1" } else { "1 = 0" });
+                    }
                     return;
                 }
-                c.sql.push_str(&grammar::quote(driver, column));
+                if *null {
+                    c.sql.push('(');
+                }
+                c.sql.push_str(&quoted);
                 c.sql.push_str(if *not { " not in (" } else { " in (" });
                 for (index, value) in values.iter().enumerate() {
                     if index > 0 {
@@ -1184,6 +1312,12 @@ impl QueryBuilder {
                     c.push_value(value.clone());
                 }
                 c.sql.push(')');
+                if *null {
+                    c.sql.push_str(if *not { " and " } else { " or " });
+                    c.sql.push_str(&quoted);
+                    c.sql.push_str(null_test);
+                    c.sql.push(')');
+                }
             }
             Where::Between {
                 column,
@@ -1210,9 +1344,15 @@ impl QueryBuilder {
                 c.sql.push_str(operator);
                 c.sql.push(' ');
                 c.sql.push_str(&grammar::quote(driver, right));
+                c.sql.push_str(grammar::like_escape(driver, operator));
             }
             Where::Raw { sql, bindings, .. } => {
+                // 括弧でくくる。`a = ? or b = ?` の `or` が、前後の `and` の外へ
+                // 漏れないようにするため（`tenant_id = ? and a = ? or b = ?` は
+                // 別の利用者の行まで当たる）。
+                c.sql.push('(');
                 c.push_raw(sql, bindings);
+                c.sql.push(')');
             }
             Where::Nested { wheres, .. } => {
                 c.sql.push('(');
@@ -1242,6 +1382,10 @@ impl QueryBuilder {
         self.source.driver()?;
         if let Some(message) = &self.deferred_error {
             return Err(Error::msg(message.clone()));
+        }
+        // 値を渡せない所の `?`。
+        if let Some(message) = self.placeholder_error() {
+            return Err(Error::msg(message));
         }
         // `$` の直書きは、ここで初めて、いまのドライバと照らす。
         if let Some(message) = self.dollar_error() {
@@ -1483,6 +1627,19 @@ impl QueryBuilder {
     /// `distinct` では重なりを除かない件数になります。
     fn count_sql(&self) -> Result<(String, Vec<Value>)> {
         if !self.groups.is_empty() {
+            if self.distinct {
+                // `group_by` と `distinct()` の両方。`get()` が返すのは、束ねた結果から
+                // 選んだ列の重なりを除いた行です。内側を `select distinct 列 … group by …`
+                // のまま副問い合わせにして、外から数えます。
+                //
+                // 以前は `distinct` を外して数えていたので、`get()` の行数より大きい数を
+                // 返していました。出力の名前が重なりうる形（`join` した `*`・式）は、
+                // `distinct()` だけのときと同じく断ります（MySQL のエラー 1060 を避ける）。
+                if self.distinct_rows_countable() {
+                    return Ok(self.distinct_sub_count_sql());
+                }
+                return Err(Error::msg(DISTINCT_COUNT_ERROR));
+            }
             // 束ねた結果の「行の数」を数えたいので、副問い合わせの外から数える。
             return Ok(self.sub_count_sql());
         }
@@ -1791,7 +1948,9 @@ impl QueryBuilder {
         }
         // 主キーは `returning` に置くだけなので、`t.id` のような表名付きも通す。
         ensure_column("insert_get_id_as の主キー", primary_key)?;
-        let returning = grammar::returning_id(self.driver, primary_key);
+        // ただし `returning` には列の名前だけを置く。PostgreSQL の `returning "t"."id"` は、
+        // `t` が入れる先の表の名前でないとエラーになるため（`posts.id` なら通っていた）。
+        let returning = grammar::returning_id(self.driver, output_name(primary_key));
         let (sql, bindings) = self.insert_sql(&[values], &returning)?;
 
         if self.driver == Driver::Postgres {
@@ -2229,8 +2388,8 @@ fn ensure_write_column(place: &str, column: &str) -> Result<()> {
 
 /// 列の名前として受け付けるか確かめる。その場でエラーを返せる所で使います。
 ///
-/// 通るのは `insert_get_id_as` の主キーだけです。`returning` に置く名前なので、
-/// 表名付き（`t.id`）も通します。書き込む列は [`ensure_write_column`] を見てください。
+/// 通るのは `insert_get_id_as` の主キーだけです。表名付き（`t.id`）も通します。
+/// `returning` には最後の部分（`id`）だけを置きます。書き込む列は [`ensure_write_column`] を見てください。
 fn ensure_column(place: &str, column: &str) -> Result<()> {
     if grammar::is_plain_identifier(column) {
         return Ok(());
@@ -2460,7 +2619,7 @@ mod tests {
             sql,
             "select \"posts\".\"id\", count(*) as total from \"posts\" \
              inner join \"comments\" on \"comments\".\"post_id\" = \"posts\".\"id\" \
-             group by \"posts\".\"id\" having count(*) > ?"
+             group by \"posts\".\"id\" having (count(*) > ?)"
         );
         assert_eq!(bindings, vec![Value::Int(2)]);
     }
@@ -2925,8 +3084,8 @@ mod tests {
             .to_sql();
         assert_eq!(
             sql,
-            "select * from \"posts\" where \"status\" = $1 and length(title) > $2 \
-             group by \"author_id\" having count(*) > $3 and sum(views) > $4"
+            "select * from \"posts\" where \"status\" = $1 and (length(title) > $2) \
+             group by \"author_id\" having (count(*) > $3 and sum(views) > $4)"
         );
         assert_eq!(bindings.len(), 4);
     }
@@ -2936,7 +3095,7 @@ mod tests {
         let (sql, bindings) = builder()
             .where_raw("length(title) > ?", &[Value::Int(3)])
             .to_sql();
-        assert_eq!(sql, "select * from \"posts\" where length(title) > ?");
+        assert_eq!(sql, "select * from \"posts\" where (length(title) > ?)");
         assert_eq!(bindings, vec![Value::Int(3)]);
     }
 
@@ -3306,7 +3465,7 @@ mod tests {
         query.check().expect("文字列と引用した名前の中は数えない");
         let (sql, bindings) = query.to_sql();
         assert!(
-            sql.contains("label = '$100' and note = '?' and id = $1"),
+            sql.contains("(label = '$100') and (note = '?' and id = $1)"),
             "{sql}"
         );
         assert_eq!(bindings, vec![Value::Int(1)]);
@@ -3814,6 +3973,217 @@ mod tests {
         assert_eq!(sql, expected);
     }
 
+    fn on(driver: Driver) -> QueryBuilder {
+        QueryBuilder {
+            driver,
+            ..builder()
+        }
+    }
+
+    #[test]
+    fn 一覧のnullは_is_null_に分けて書く() {
+        let none: Option<i64> = None;
+        let (sql, bindings) = builder().where_in("id", &[Some(1), none, Some(2)]).to_sql();
+        assert_eq!(
+            sql,
+            "select * from \"posts\" where (\"id\" in (?, ?) or \"id\" is null)"
+        );
+        assert_eq!(bindings, vec![Value::Int(1), Value::Int(2)]);
+
+        let (sql, bindings) = builder().where_not_in("id", &[Some(1), none]).to_sql();
+        assert_eq!(
+            sql,
+            "select * from \"posts\" where (\"id\" not in (?) and \"id\" is not null)"
+        );
+        assert_eq!(bindings, vec![Value::Int(1)]);
+
+        // `NULL` だけの一覧。
+        let (sql, bindings) = builder().where_in("id", &[none]).to_sql();
+        assert_eq!(sql, "select * from \"posts\" where \"id\" is null");
+        assert!(bindings.is_empty());
+        let (sql, _) = builder().where_not_in("id", &[none, none]).to_sql();
+        assert_eq!(sql, "select * from \"posts\" where \"id\" is not null");
+
+        // `or` でつないでも括弧で閉じる。PostgreSQL の番号も詰めて振る。
+        let (sql, _) = on(Driver::Postgres)
+            .where_("a", 1)
+            .or_where_in("id", &[none, Some(5)])
+            .to_sql();
+        assert_eq!(
+            sql,
+            "select * from \"posts\" where \"a\" = $1 or (\"id\" in ($2) or \"id\" is null)"
+        );
+        // `NULL` が無ければ今までと同じ。
+        let (sql, _) = builder().where_in("id", &[1, 2]).to_sql();
+        assert_eq!(sql, "select * from \"posts\" where \"id\" in (?, ?)");
+    }
+
+    #[test]
+    fn 範囲の端にnullを渡すと断る() {
+        let none: Option<i64> = None;
+        for query in [
+            builder().where_between("views", none, Some(10)),
+            builder().where_not_between("views", Some(0), none),
+        ] {
+            let message = query.check().expect_err("断られる").to_string();
+            assert!(message.contains("NULL"), "{message}");
+            assert!(message.contains("between"), "{message}");
+        }
+        builder()
+            .where_between("views", Some(0), Some(10))
+            .check()
+            .expect("NULL でなければ通る");
+    }
+
+    #[test]
+    fn 生のsqlの条件は括弧でくくる() {
+        // 以前は `"tenant_id" = ? and a = ? or b = ?` になり、別の利用者の行まで当たった。
+        let (sql, bindings) = builder()
+            .where_("tenant_id", 1)
+            .where_raw("a = ? or b = ?", &[2.into(), 3.into()])
+            .to_sql();
+        assert_eq!(
+            sql,
+            "select * from \"posts\" where \"tenant_id\" = ? and (a = ? or b = ?)"
+        );
+        assert_eq!(bindings.len(), 3);
+
+        let (sql, _) = on(Driver::Postgres)
+            .where_("tenant_id", 1)
+            .or_where_raw("x = ? or y = ?", &[2.into(), 3.into()])
+            .group_by(&["status"])
+            .having_raw("count(*) > ? or max(views) > ?", &[1.into(), 9.into()])
+            .to_sql();
+        assert_eq!(
+            sql,
+            "select * from \"posts\" where \"tenant_id\" = $1 or (x = $2 or y = $3) \
+             group by \"status\" having (count(*) > $4 or max(views) > $5)"
+        );
+    }
+
+    #[test]
+    fn 値を渡せない所の_question_は断る() {
+        for (query, place) in [
+            (builder().select(&["id", "data ? 'key' as has"]), "select"),
+            (builder().add_select("coalesce(?, 1)"), "select"),
+            (builder().order_by_raw("field(id, ?)"), "order_by_raw"),
+        ] {
+            let message = query.check().expect_err("断られる").to_string();
+            assert!(message.contains(place), "{message}");
+            assert!(message.contains("jsonb_exists"), "{message}");
+            // `Debug` にも同じ文が出る。
+            assert!(format!("{query:?}").contains("jsonb_exists"));
+        }
+        // 引用の中の `?` と、`select` を置き換えた後は通る。
+        builder()
+            .select(&["'?' as mark", "\"a?b\""])
+            .order_by_raw("case when title = '?' then 0 else 1 end")
+            .check()
+            .expect("引用の中は数えない");
+        builder()
+            .select(&["coalesce(?, 1)"])
+            .select(&["id"])
+            .check()
+            .expect("置き換えた後の列で見る");
+    }
+
+    #[test]
+    fn like_の逃がしの文字はsqliteだけ足す() {
+        let (sql, _) = builder()
+            .where_like("title", "100\\%")
+            .where_op("body", "NOT  LIKE", "a\\_b")
+            .having_op("status", "like", "x%")
+            .group_by(&["status"])
+            .to_sql();
+        assert_eq!(
+            sql,
+            "select * from \"posts\" where \"title\" like ? escape '\\' \
+             and \"body\" not like ? escape '\\' group by \"status\" \
+             having \"status\" like ? escape '\\'"
+        );
+        let (sql, _) = builder().where_column("title", "like", "pattern").to_sql();
+        assert_eq!(
+            sql,
+            "select * from \"posts\" where \"title\" like \"pattern\" escape '\\'"
+        );
+        // MySQL と PostgreSQL は既定の逃がしの文字が `\` なので足さない。
+        let (sql, _) = on(Driver::MySql).where_like("title", "100\\%").to_sql();
+        assert_eq!(sql, "select * from `posts` where `title` like ?");
+        let (sql, _) = on(Driver::Postgres)
+            .where_op("title", "not like", "x")
+            .to_sql();
+        assert_eq!(sql, "select * from \"posts\" where \"title\" not like $1");
+        // `=` などには足さない。
+        let (sql, _) = builder().where_("title", "x").to_sql();
+        assert_eq!(sql, "select * from \"posts\" where \"title\" = ?");
+    }
+
+    #[test]
+    fn 演算子はそろえた形で書く() {
+        // 以前は全角の空白入りが照合を通って、そのまま SQL に入っていた。
+        let (sql, _) = on(Driver::MySql)
+            .where_op("title", "not\u{3000}like", "x")
+            .where_column("a", " >= ", "b")
+            .join("users", "users.id", "  =  ", "posts.user_id")
+            .to_sql();
+        assert_eq!(
+            sql,
+            "select * from `posts` inner join `users` on `users`.`id` = `posts`.`user_id` \
+             where `title` not like ? and `a` >= `b`"
+        );
+    }
+
+    #[test]
+    fn 束ねて重なりも除いた件数は重なりを除いた行を数える() {
+        // 以前は `distinct` を外して数えていたので、`get()` の行数より多かった。
+        let query = builder()
+            .select(&["author_id"])
+            .distinct()
+            .group_by(&["author_id", "status"]);
+        let (sql, _) = query.count_sql().expect("組み立てられる");
+        assert_eq!(
+            sql,
+            "select count(*) as bengara_aggregate from (select distinct \"author_id\" \
+             from \"posts\" group by \"author_id\", \"status\") as bengara_sub"
+        );
+        assert_eq!(query.pagination_count_sql().unwrap().0, sql);
+        // 出力の名前が重なりうる形は、distinct だけのときと同じく断る。
+        let message = builder()
+            .join("users", "users.id", "=", "posts.user_id")
+            .distinct()
+            .group_by(&["status"])
+            .count_sql()
+            .expect_err("断る")
+            .to_string();
+        assert!(message.contains("distinct()"), "{message}");
+    }
+
+    #[test]
+    fn insert_get_id_as_の_returning_には列の名前だけを置く() {
+        let returning = grammar::returning_id(Driver::Postgres, output_name("t.id"));
+        assert_eq!(returning, " returning \"id\"");
+        assert_eq!(output_name("id"), "id");
+    }
+
+    #[test]
+    fn 中で組み立てた条件の印はどちらの口でも引き継ぐ() {
+        // `where_by_driver` は以前、組み立ての間違いしか引き継いでいなかった。
+        let query = on(Driver::Postgres).where_by_driver(
+            Driver::MySql,
+            |q| q.where_raw("a > $1", &[]),
+            |q| q.where_op("b", "ilike", "x"),
+        );
+        let message = query.check().expect_err("断る").to_string();
+        assert!(message.contains("$"), "{message}");
+        let query = on(Driver::Sqlite).where_by_driver(
+            Driver::MySql,
+            |q| q.where_("a", 1),
+            |q| q.where_op("b", "ilike", "x"),
+        );
+        let message = query.check().expect_err("断る").to_string();
+        assert!(message.contains("ilike"), "{message}");
+    }
+
     // ---- 実際の SQLite を使うテスト ----
 
     /// メモリ上の SQLite に `posts` を用意して、トランザクションから使う。
@@ -4026,6 +4396,89 @@ mod tests {
             .expect("読める");
         assert_eq!(bodies, vec![None, Some("x".to_string())]);
         assert!(tx.table("posts").pluck::<String>("body").await.is_err());
+
+        // 一覧の NULL も当たる。以前は `in (?, NULL)` / `not in (?, NULL)` で、
+        // NULL の行が当たらず、`not in` は必ず 0 件だった。
+        let with_null = [Some("x".to_string()), None];
+        let titles = tx
+            .table("posts")
+            .where_in("body", &with_null)
+            .order_by("id")
+            .pluck::<String>("title")
+            .await
+            .expect("読める");
+        assert_eq!(titles, vec!["本文なし".to_string(), "本文あり".to_string()]);
+        let titles = tx
+            .table("posts")
+            .where_not_in("body", &[Some("y".to_string()), None])
+            .pluck::<String>("title")
+            .await
+            .expect("読める");
+        assert_eq!(titles, vec!["本文あり".to_string()]);
+        let titles = tx
+            .table("posts")
+            .where_in("body", &[None::<String>])
+            .pluck::<String>("title")
+            .await
+            .expect("読める");
+        assert_eq!(titles, vec!["本文なし".to_string()]);
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn like_の逃がしの文字と生の条件の括弧は実際のsqliteでも効く() {
+        let tx = live().await;
+        let posts = tx.table("posts");
+        for (title, views) in [("100%", 1), ("1000", 2), ("a_b", 3), ("axb", 4)] {
+            posts
+                .insert(&[("title", title.into()), ("views", views.into())])
+                .await
+                .expect("入る");
+        }
+        // `\%` は `%` そのもの。以前は SQLite だけ `\` と `%` に分かれ、0 件だった。
+        let found = tx
+            .table("posts")
+            .where_like("title", "100\\%")
+            .pluck::<String>("title")
+            .await
+            .expect("読める");
+        assert_eq!(found, vec!["100%".to_string()]);
+        let found = tx
+            .table("posts")
+            .where_op("title", "not like", "a\\_b")
+            .where_like("title", "a%")
+            .pluck::<String>("title")
+            .await
+            .expect("読める");
+        assert_eq!(found, vec!["axb".to_string()]);
+
+        // 生の条件の `or` は、前の条件の外へ漏れない。
+        let found = tx
+            .table("posts")
+            .where_("views", 1)
+            .where_raw("title = ? or title = ?", &["axb".into(), "100%".into()])
+            .pluck::<String>("title")
+            .await
+            .expect("読める");
+        assert_eq!(found, vec!["100%".to_string()]);
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn 失敗した後に巻き戻すと元のエラーが残る() {
+        // `if let Err(e) = .. { tx.rollback().await?; return Err(e) }` の形。
+        let tx = live().await;
+        tx.table("posts")
+            .insert(&[("title", "x".into())])
+            .await
+            .expect("入る");
+        let original = tx
+            .table("posts")
+            .insert(&[("title", "x".into())])
+            .await
+            .expect_err("一意制約で失敗する");
+        assert!(super::super::is_unique_violation(&original), "{original}");
+        tx.rollback().await.expect("巻き戻しは成功を返す");
     }
 
     #[cfg(feature = "sqlite")]

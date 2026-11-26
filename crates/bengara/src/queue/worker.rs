@@ -6,10 +6,14 @@
 //! - 停止の合図（Ctrl+C）を受けたら、**いま処理中のジョブを終えてから**止まります。
 //! - ワーカーが強制終了しても、`retry_after` 秒たてば別のワーカーが取り直します
 //!   （Laravel の `retry_after` と同じ考え方）。
+//! - **予約の期限は行に書きます**（`reserved_at` に「この時刻まで予約」を書く。
+//!   [`reserved_until`]）。取り直すかは行の期限だけで決まるので、`--retry-after` が
+//!   違うワーカーが混ざっても、まだ動いているジョブを取り直しません。
 //! - 1 本のジョブは `timeout` 秒で打ち切ります（[`run_one`]）。ジョブごとの値は
 //!   `config/queue.rs`（[`QueueConfig`](super::QueueConfig)）で決められます。
 //! - 打ち切りの時間が `retry_after` より長いジョブは、予約もその分だけ延ばします
 //!   （[`reserved_until`]）。動いている途中に取り直されて二重に動くことはありません。
+//! - 失敗・諦め・成功は、画面の行に加えてログ（`tracing`）にも出します。
 //! - DB の一時的なエラーでは、すぐには終わりません。短い待ちを挟んで
 //!   数回やり直します（[`RESERVE_RETRIES`]、[`RECORD_RETRIES`]）。
 
@@ -36,8 +40,11 @@ pub(crate) struct Options {
     pub once: bool,
     /// 処理中のまま放置されたジョブを取り直すまでの秒数。
     ///
+    /// **このワーカーが予約するときに、期限として行に書きます**（[`reserved_until`]）。
+    /// 取り直す側は行の期限だけを見るので、この値は取り直す側の判定には使いません。
+    ///
     /// 打ち切りの時間（`timeout`）がこれより長いジョブは、予約をその分だけ
-    /// 延ばします（[`reserved_until`]）。打ち切らない（`0`）ジョブだけは延ばせないので、
+    /// 延ばします。打ち切らない（`0`）ジョブだけは延ばせないので、
     /// この秒数を過ぎると、まだ動いていても別のワーカーが取り直します。
     pub retry_after: i64,
     /// 1 本のジョブを待つ上限（秒）。**0 は無制限です。**
@@ -99,31 +106,32 @@ impl TimeoutSource {
 /// 予約が切れるのは「打ち切りの時間 + これ」と `retry_after` の遅いほうです。
 const RECLAIM_MARGIN_SECS: i64 = 30;
 
-/// 予約の目印（`reserved_at`）に書く時刻。
+/// 予約の目印（`reserved_at`）に書く時刻。**予約の期限です。**
 ///
-/// 取り直しの判定は `reserved_at <= now - retry_after` です（[`reclaim_cutoff`]）。
-/// 打ち切りの時間が `retry_after` より長いジョブにいまの時刻を書くと、動いている
-/// 途中で取り直されて二重に動きます。そこで、その分だけ**先の時刻**を書きます。
-/// 判定の式は変えないので、どのワーカーも同じ表で同じように見分けられます。
+/// 取り直しの判定は `reserved_at <= now` です（[`reclaimable`]）。期限を行に
+/// 書くので、取り直す側の `--retry-after` は判定に入りません。
 ///
-/// | 打ち切りの時間 | 書く時刻 | 取り直されるのは |
-/// |---|---|---|
-/// | `retry_after - 30` 秒以下 | いま | `retry_after` 秒後 |
-/// | それより長い | いま + (打ち切り + 30 - `retry_after`) | 打ち切り + 30 秒後 |
-/// | 0（打ち切らない） | いま | `retry_after` 秒後（延ばせない） |
+/// 以前は予約した時刻を書き、取り直す側が `reserved_at <= now - retry_after` と
+/// **自分の** `--retry-after` で判定していました。`--retry-after=600` のワーカーが
+/// 予約したジョブを、`--retry-after=90` のワーカーが 90 秒で取り直し、
+/// 同じジョブが二重に動きました。
+///
+/// | 打ち切りの時間 | 書く時刻（期限） |
+/// |---|---|
+/// | `retry_after - 30` 秒以下 | いま + `retry_after` |
+/// | それより長い | いま + 打ち切り + 30 |
+/// | 0（打ち切らない） | いま + `retry_after`（延ばせない） |
 ///
 /// 時刻は `9999-12-31 23:59:59` で止めます（文字の比較が逆転しないように）。
 pub(crate) fn reserved_until(now: i64, retry_after: i64, timeout_secs: u64) -> String {
     let timeout = i64::try_from(timeout_secs).unwrap_or(i64::MAX);
-    let extra = if timeout == 0 {
-        0
+    let retry_after = retry_after.max(1);
+    let hold = if timeout == 0 {
+        retry_after
     } else {
-        timeout
-            .saturating_add(RECLAIM_MARGIN_SECS)
-            .saturating_sub(retry_after.max(1))
-            .max(0)
+        timeout.saturating_add(RECLAIM_MARGIN_SECS).max(retry_after)
     };
-    super::available_at(now, extra.unsigned_abs())
+    super::available_at(now, hold.unsigned_abs())
 }
 
 /// 予約を取り直すまでの既定の秒数。Laravel の `retry_after` に当たります。
@@ -201,13 +209,6 @@ pub(crate) fn backoff_secs(attempts: i64) -> i64 {
     10 * (1_i64 << shift) / 2
 }
 
-/// 予約を取り直す境目の時刻。
-///
-/// これ以前に予約された（`reserved_at <= cutoff`）ものは、持ち主が死んだと見なします。
-pub(crate) fn reclaim_cutoff(now: i64, retry_after: i64) -> String {
-    time::format_timestamp(now - retry_after.max(1))
-}
-
 /// 取り直したあとの失敗回数。
 ///
 /// 目印が残っていた（`reserved_at` がある）ときだけ +1 します。同じジョブを
@@ -228,22 +229,25 @@ pub(crate) fn next_attempts(reserved_at: Option<&str>, attempts: i64) -> i64 {
 /// **`reserve` の 2 つの文が同じものを使います。** 片方だけ直すと、
 /// 候補の選び方と更新の条件がずれて、同じジョブを 2 つのワーカーが取ります。
 ///
+/// 予約が無いか、予約の期限（[`reserved_until`]）が `now` 以前の行です。
+/// 期限を過ぎた予約は、持ち主が死んだと見なします。
+///
 /// 時刻は `YYYY-MM-DD HH:MM:SS` なので、文字の大小が時刻の前後と一致します。
-fn reclaimable(query: QueryBuilder, cutoff: &str) -> QueryBuilder {
-    let cutoff = cutoff.to_string();
+fn reclaimable(query: QueryBuilder, now: &str) -> QueryBuilder {
+    let now = now.to_string();
     query.where_group(move |q| {
         q.where_null("reserved_at")
-            .or_where_op("reserved_at", "<=", cutoff)
+            .or_where_op("reserved_at", "<=", now)
     })
 }
 
 /// いま取れるジョブだけに絞る条件（`reserve` の 1 文目）。
-fn reservable(query: QueryBuilder, queue: &str, now: &str, cutoff: &str) -> QueryBuilder {
+fn reservable(query: QueryBuilder, queue: &str, now: &str) -> QueryBuilder {
     reclaimable(
         query
             .where_("queue", queue)
             .where_op("available_at", "<=", now.to_string()),
-        cutoff,
+        now,
     )
 }
 
@@ -309,6 +313,13 @@ enum Reservation {
     Empty,
     /// ほかのワーカーが先に取った。待たずに取り直してよい。
     Lost,
+    /// 期限切れの予約が `tries` に達していたので、予約せずに `failed_jobs` へ移した
+    /// （[`give_up_stale`]）。待たずに次の 1 件を見てよい。
+    ///
+    /// **[`Reservation::Lost`] とは分けます。** 同じにしていたころは、諦めた行が
+    /// 続くだけで「負け続け」と数えられ、[`MAX_CONSECUTIVE_LOST`] 回で `--sleep` の
+    /// 待ちに落ちていました。キューは進んでいるので、負けの数え直しにします。
+    GaveUp,
 }
 
 /// 1 件取り出して、処理中の目印を付ける。
@@ -325,7 +336,7 @@ enum Reservation {
 /// 持ったまま書き込みへ昇格します。これは `SQLITE_BUSY_SNAPSHOT` になり、
 /// `busy_timeout` の再試行対象ではないので、ワーカーが丸ごと終了しました。
 ///
-/// 目印（`reserved_at`）が `retry_after` 秒より古いものも取り直します。
+/// 目印（`reserved_at`。予約の期限）を過ぎたものも取り直します。
 /// ワーカーが強制終了・電源断で死ぬと目印が残ったままになるためです。
 /// 取り直したときは `attempts` を +1 して、同じジョブを永久に回し続けないようにします。
 ///
@@ -341,9 +352,8 @@ async fn reserve(options: &Options) -> Result<Reservation> {
     let (queue, retry_after, tries) = (options.queue.as_str(), options.retry_after, options.tries);
     let now_secs = time::now_seconds();
     let now = time::format_timestamp(now_secs);
-    let cutoff = reclaim_cutoff(now_secs, retry_after);
 
-    let row = reservable(DB::table(TABLE), queue, &now, &cutoff)
+    let row = reservable(DB::table(TABLE), queue, &now)
         .order_by("id")
         .limit(1)
         .get()
@@ -374,13 +384,13 @@ async fn reserve(options: &Options) -> Result<Reservation> {
     if let (true, Some(reserved_at)) = (attempts >= i64::from(tries), reserved_at.as_deref()) {
         give_up_stale(&row, id, reserved_at, attempts).await?;
         // 自分は予約していないので、待たずに次の 1 件を見る。
-        return Ok(Reservation::Lost);
+        return Ok(Reservation::GaveUp);
     }
 
     let job: String = row.get("job")?;
     let (timeout_secs, _) = options.timeout_for(&job);
     let marker = reserved_until(now_secs, retry_after, timeout_secs);
-    let affected = claim_row(queue, id, done, &now, &cutoff, attempts, &marker).await?;
+    let affected = claim_row(queue, id, done, &now, attempts, &marker).await?;
 
     if affected == 0 {
         // ほかのワーカーが先に取った。待たずに取り直す。
@@ -418,18 +428,16 @@ async fn reserve(options: &Options) -> Result<Reservation> {
 /// `seen_attempts` は**列から読んだ値そのまま**です。丸めた値を渡すと、
 /// 条件と実値がずれて永久に 0 件になります。
 ///
-/// `marker` は予約の目印に書く時刻です（[`reserved_until`]）。打ち切りの時間が
-/// 長いジョブでは、いまより先の時刻になります。
+/// `marker` は予約の目印に書く時刻（予約の期限）です（[`reserved_until`]）。
 async fn claim_row(
     queue: &str,
     id: i64,
     seen_attempts: i64,
     now: &str,
-    cutoff: &str,
     attempts: i64,
     marker: &str,
 ) -> Result<u64> {
-    reservable(DB::table(TABLE).where_("id", id), queue, now, cutoff)
+    reservable(DB::table(TABLE).where_("id", id), queue, now)
         .where_("attempts", seen_attempts)
         .update(&[
             ("reserved_at", Value::Text(marker.to_string())),
@@ -474,7 +482,8 @@ async fn give_up_stale(row: &Row, id: i64, reserved_at: &str, attempts: i64) -> 
         ])
         .await?;
     tx.commit().await?;
-    tracing::warn!(
+    // 諦めたので、ほかの諦めと同じく error で残す（ログのファイルと監視に届くように）。
+    tracing::error!(
         "ジョブ #{id} は {attempts} 回で諦めました（ワーカーが応答しなくなりました）。\
          queue:failed で見られます"
     );
@@ -731,16 +740,14 @@ fn retry_wait(failures: u32, unit: Duration) -> Duration {
 /// `finish` / `fail` / `give_up` はどれも**自分の予約のままの行だけ**を触るので、
 /// 2 回流しても害がありません（1 回目が実は通っていたら、2 回目は 0 件です）。
 ///
-/// 停止の合図が来ていたら待ちません。残りの回数をすぐ試して、駄目なら返します。
+/// **停止の合図が来ていても待ちます**（合わせて 1・2・4 秒の 7 秒まで）。
+/// 合図で待ちを切り上げていたころは、やり直しが間を置かずに続けて失敗し、
+/// 成功したジョブの行が消えずに残って、`retry_after` の後にもう 1 回動きました。
+/// 結果を残すほうが、止まるのが数秒遅れるより大事です。
 ///
 /// `operation` は「やり直しかどうか」を受け取ります（1 回目は `false`）。
 /// やり直しで 0 件だったときの警告を、1 回目と分けるためです。
-async fn with_retries<T, F, Fut>(
-    what: &str,
-    stop: &AtomicBool,
-    unit: Duration,
-    mut operation: F,
-) -> Result<T>
+async fn with_retries<T, F, Fut>(what: &str, unit: Duration, mut operation: F) -> Result<T>
 where
     F: FnMut(bool) -> Fut,
     Fut: Future<Output = Result<T>>,
@@ -758,7 +765,11 @@ where
         eprintln!(
             "  {what}を記録できませんでした（やり直します {failures}/{RECORD_RETRIES}）: {error}"
         );
-        pause(retry_wait(failures, unit), stop).await;
+        tracing::warn!(
+            "ジョブの{what}を記録できませんでした（やり直します {failures}/{RECORD_RETRIES}）: {error}"
+        );
+        // 停止の合図は見ない（上の説明）。回数で上限があるので待ちも有限。
+        tokio::time::sleep(retry_wait(failures, unit)).await;
     }
 }
 
@@ -810,6 +821,10 @@ async fn run_with(
                     "  ジョブを取り出せませんでした（{} 秒後にやり直します {reserve_failures}/{RESERVE_RETRIES}）: {error}",
                     wait.as_secs()
                 );
+                tracing::warn!(
+                    queue = %options.queue,
+                    "ジョブを取り出せませんでした（やり直します {reserve_failures}/{RESERVE_RETRIES}）: {error}"
+                );
                 pause(wait, &stop).await;
                 continue;
             }
@@ -828,6 +843,11 @@ async fn run_with(
                 }
                 continue;
             }
+            // 期限切れの行を諦めて片付けた。キューは進んでいるので、負けとは数えない。
+            Reservation::GaveUp => {
+                lost = 0;
+                continue;
+            }
             Reservation::Empty => {
                 lost = 0;
                 if options.once {
@@ -844,13 +864,18 @@ async fn run_with(
         // ファイルを置き忘れたまま `queue:retry` で戻せるよう、記録は残す。
         if !jobs.iter().any(|j| j.name == reserved.job) {
             let message = unknown_job_message(&reserved.job);
-            with_retries("失敗", &stop, retry_unit, |retried| {
+            with_retries("失敗", retry_unit, |retried| {
                 give_up(&reserved, &message, retried)
             })
             .await?;
             eprintln!(
                 "  {} #{} 失敗（諦めました）: {message}",
                 reserved.job, reserved.id
+            );
+            tracing::error!(
+                job = %reserved.job,
+                id = reserved.id,
+                "ジョブが失敗しました（諦めました）: {message}"
             );
             if options.once {
                 return Ok(());
@@ -865,58 +890,72 @@ async fn run_with(
         let started = std::time::Instant::now();
         match run_one(jobs, &reserved, timeout, source).await {
             Ok(()) => {
-                let finished = with_retries("成功", &stop, retry_unit, |retried| {
-                    finish(&reserved, retried)
-                })
-                .await;
+                let finished =
+                    with_retries("成功", retry_unit, |retried| finish(&reserved, retried)).await;
                 if let Err(error) = finished {
                     // ジョブは終わっているのに、行が残った。黙って終わると
                     // 「なぜ 2 回動いたか」が分からないので、ここで言っておく。
                     eprintln!(
                         "  {} #{} は成功しましたが、キューから消せませんでした。\
-                         --retry-after（{} 秒）の後にもう 1 回動きます",
-                        reserved.job, reserved.id, options.retry_after
+                         予約の期限（{}）の後にもう 1 回動きます",
+                        reserved.job, reserved.id, reserved.reserved_at
+                    );
+                    tracing::error!(
+                        job = %reserved.job,
+                        id = reserved.id,
+                        "ジョブは成功しましたが、キューから消せませんでした\
+                         （予約の期限 {} の後にもう 1 回動きます）: {error}",
+                        reserved.reserved_at
                     );
                     return Err(error);
                 }
                 processed += 1;
-                println!(
-                    "  {} #{} 成功（{} ms）",
-                    reserved.job,
-                    reserved.id,
-                    started.elapsed().as_millis()
+                let ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+                println!("  {} #{} 成功（{ms} ms）", reserved.job, reserved.id);
+                tracing::info!(
+                    job = %reserved.job,
+                    id = reserved.id,
+                    ms,
+                    "ジョブが成功しました"
                 );
             }
             Err(failure) => {
                 let message = failure.message;
-                let gave_up = with_retries("失敗", &stop, retry_unit, |retried| {
+                let gave_up = with_retries("失敗", retry_unit, |retried| {
                     fail(&reserved, options.tries, &message, retried)
                 })
                 .await?;
+                let attempt = reserved.attempts.saturating_add(1);
                 if gave_up {
                     eprintln!(
-                        "  {} #{} 失敗（{} 回目で諦めました）: {message}",
-                        reserved.job,
-                        reserved.id,
-                        reserved.attempts.saturating_add(1)
+                        "  {} #{} 失敗（{attempt} 回目で諦めました）: {message}",
+                        reserved.job, reserved.id
+                    );
+                    tracing::error!(
+                        job = %reserved.job,
+                        id = reserved.id,
+                        attempt,
+                        "ジョブが失敗しました（{attempt} 回目で諦めました）: {message}"
                     );
                 } else {
+                    let backoff = backoff_secs(attempt);
                     eprintln!(
-                        "  {} #{} 失敗（{} 回目、{} 秒後に再挑戦）: {message}",
-                        reserved.job,
-                        reserved.id,
-                        reserved.attempts.saturating_add(1),
-                        backoff_secs(reserved.attempts.saturating_add(1))
+                        "  {} #{} 失敗（{attempt} 回目、{backoff} 秒後に再挑戦）: {message}",
+                        reserved.job, reserved.id
+                    );
+                    tracing::error!(
+                        job = %reserved.job,
+                        id = reserved.id,
+                        attempt,
+                        "ジョブが失敗しました（{attempt} 回目、{backoff} 秒後に再挑戦）: {message}"
                     );
                 }
                 // 打ち切っても止まらなかった。動いたまま次へ進むと、再挑戦で
                 // 同じジョブが二重に動くので、ワーカーごと終える（[`run_one`]）。
                 if failure.stuck {
-                    return Err(crate::error::Error::msg(stuck_message(
-                        &reserved.job,
-                        reserved.id,
-                        timeout,
-                    )));
+                    let message = stuck_message(&reserved.job, reserved.id, timeout);
+                    tracing::error!(job = %reserved.job, id = reserved.id, "{message}");
+                    return Err(crate::error::Error::msg(message));
                 }
             }
         }
@@ -932,20 +971,55 @@ pub(crate) async fn failed_count() -> Result<i64> {
     DB::table(FAILED_TABLE).count().await
 }
 
+/// `queue:retry` が 1 回に読んで戻す行の数。
+const RETRY_CHUNK: u64 = 500;
+
 /// 諦めたジョブをキューへ戻す。
+///
+/// **`id` の順に [`RETRY_CHUNK`] 行ずつ戻します。** 全部を一度に読んで 1 つの
+/// トランザクションで戻していたころは、`failed_jobs` が大きいとメモリを食い、
+/// トランザクションも長く表を握りました。
+///
+/// 戻すのは**始めたときにあった行まで**です（最大の `id` を先に決める）。
+/// 戻したジョブがすぐ失敗して `failed_jobs` に入り直しても、同じ実行の中で
+/// 何度も戻し続けません。
 pub(crate) async fn retry_failed(id: Option<i64>) -> Result<u64> {
-    let query = match id {
-        Some(id) => DB::table(FAILED_TABLE).where_("id", id),
-        None => DB::table(FAILED_TABLE),
-    };
-    let rows = query.get().await?;
-    if rows.is_empty() {
-        return Ok(0);
+    if let Some(id) = id {
+        return retry_failed_chunk(id - 1, id).await.map(|(moved, _)| moved);
     }
+    let Some(last) = DB::table(FAILED_TABLE).max::<i64>("id").await? else {
+        return Ok(0);
+    };
+    let mut moved = 0;
+    let mut after = i64::MIN;
+    loop {
+        let (count, seen) = retry_failed_chunk(after, last).await?;
+        moved += count;
+        match seen {
+            Some(seen) if seen < last => after = seen,
+            _ => return Ok(moved),
+        }
+    }
+}
+
+/// `after < id <= last` の行を、`id` の順に [`RETRY_CHUNK`] 行まで戻す。
+///
+/// 返すのは（戻した件数、読んだ最後の `id`）です。読んだ行が無ければ `None`。
+async fn retry_failed_chunk(after: i64, last: i64) -> Result<(u64, Option<i64>)> {
+    let rows = DB::table(FAILED_TABLE)
+        .where_op("id", ">", after)
+        .where_op("id", "<=", last)
+        .order_by("id")
+        .limit(RETRY_CHUNK)
+        .get()
+        .await?;
+    let Some(seen) = rows.last().map(|row| row.get::<i64>("id")).transpose()? else {
+        return Ok((0, None));
+    };
 
     let now = crate::database::now();
     let mut moved = 0;
-    // 入れるのと消すのを 1 つのトランザクションにする。
+    // 入れるのと消すのを 1 つのトランザクションにする（1 回に読んだ分ごと）。
     // 分けると、間でプロセスが死んだときに二重投入になります。
     let tx = DB::begin().await?;
     for row in &rows {
@@ -976,7 +1050,7 @@ pub(crate) async fn retry_failed(id: Option<i64>) -> Result<u64> {
         moved += 1;
     }
     tx.commit().await?;
-    Ok(moved)
+    Ok((moved, Some(seen)))
 }
 
 /// 諦めたジョブの一覧（`queue:failed` が使う）。
@@ -1082,32 +1156,43 @@ mod tests {
     }
 
     #[test]
-    fn 打ち切りが長いジョブは予約の目印を先にずらす() {
+    fn 予約の目印には期限を書く() {
         let now = 1_000_000;
         let at = |secs| time::format_timestamp(now + secs);
-        // retry_after より 30 秒以上短ければ、いまの時刻のまま。
-        assert_eq!(reserved_until(now, 90, 60), at(0));
-        assert_eq!(reserved_until(now, 90, 1), at(0));
-        // 長ければ「打ち切り + 30 秒」で取り直されるようにずらす。
-        assert_eq!(reserved_until(now, 90, 61), at(1));
-        assert_eq!(reserved_until(now, 90, 1800), at(1800 + 30 - 90));
+        // retry_after より 30 秒以上短ければ、retry_after 秒後が期限。
+        assert_eq!(reserved_until(now, 90, 60), at(90));
+        assert_eq!(reserved_until(now, 90, 1), at(90));
+        // 長ければ「打ち切り + 30 秒」後が期限。
+        assert_eq!(reserved_until(now, 90, 61), at(91));
+        assert_eq!(reserved_until(now, 90, 1800), at(1800 + 30));
         // 打ち切らない（0）ジョブは延ばせない。
-        assert_eq!(reserved_until(now, 90, 0), at(0));
+        assert_eq!(reserved_until(now, 90, 0), at(90));
         // とても大きな値でも年が 5 桁にならない。
         assert_eq!(reserved_until(now, 90, u64::MAX), "9999-12-31 23:59:59");
-        // retry_after が 0 以下でも 1 秒として扱う（reclaim_cutoff と同じ）。
-        assert_eq!(reserved_until(now, 0, 10), at(10 + 30 - 1));
+        assert_eq!(reserved_until(now, i64::MAX, 0), "9999-12-31 23:59:59");
+        // retry_after が 0 以下でも 1 秒として扱う（いま予約したものを取り直さない）。
+        assert_eq!(reserved_until(now, 0, 0), at(1));
+        assert_eq!(reserved_until(now, -5, 0), at(1));
+        assert_eq!(reserved_until(now, 0, 10), at(10 + 30));
     }
 
     #[test]
-    fn ずらした目印は打ち切りの時間が過ぎるまで取り直されない() {
-        // 取り直しの判定は `reserved_at <= reclaim_cutoff(now, retry_after)`。
+    fn 期限を過ぎるまで取り直されない() {
+        // 取り直しの判定は `reserved_at <= now`。取り直す側の --retry-after は入らない。
         let reserved_at = 1_000_000;
         let marker = reserved_until(reserved_at, 90, 1800);
-        let reclaimable = |elapsed: i64| marker <= reclaim_cutoff(reserved_at + elapsed, 90);
+        let reclaimable = |elapsed: i64| marker <= time::format_timestamp(reserved_at + elapsed);
         assert!(!reclaimable(90), "retry_after では取り直さない");
         assert!(!reclaimable(1800), "打ち切りの時間ちょうどでもまだ");
         assert!(reclaimable(1800 + 30), "打ち切り + 30 秒で取り直す");
+
+        // --retry-after=600 のワーカーが予約した行は、--retry-after=90 のワーカーから見ても
+        // 600 秒たつまで取り直されない（以前は取り直す側の 90 秒で取り直していた）。
+        let marker = reserved_until(reserved_at, 600, 60);
+        let reclaimable = |elapsed: i64| marker <= time::format_timestamp(reserved_at + elapsed);
+        assert!(!reclaimable(120));
+        assert!(!reclaimable(599));
+        assert!(reclaimable(600));
     }
 
     #[test]
@@ -1301,12 +1386,11 @@ mod tests {
     async fn 記録の失敗は数回やり直す() {
         use std::sync::atomic::AtomicU32;
 
-        let stop = AtomicBool::new(false);
         let unit = Duration::from_millis(1);
 
         // 2 回失敗して 3 回目に通る。以前は 1 回目でワーカーが終わった。
         let calls = AtomicU32::new(0);
-        let value = with_retries("成功", &stop, unit, |_| async {
+        let value = with_retries("成功", unit, |_| async {
             if calls.fetch_add(1, Ordering::SeqCst) < 2 {
                 Err(crate::error::Error::msg("一時的な失敗"))
             } else {
@@ -1320,7 +1404,7 @@ mod tests {
 
         // 失敗し続けるなら、決めた回数で諦めて元のエラーを返す。
         let calls = AtomicU32::new(0);
-        let error = with_retries("成功", &stop, unit, |_| async {
+        let error = with_retries("成功", unit, |_| async {
             calls.fetch_add(1, Ordering::SeqCst);
             Err::<(), _>(crate::error::Error::msg("直らない失敗"))
         })
@@ -1334,10 +1418,9 @@ mod tests {
     async fn やり直しかどうかを操作に渡す() {
         use std::sync::atomic::AtomicU32;
 
-        let stop = AtomicBool::new(false);
         let calls = AtomicU32::new(0);
         let seen = std::sync::Mutex::new(Vec::new());
-        with_retries("成功", &stop, Duration::from_millis(1), |retried| {
+        with_retries("成功", Duration::from_millis(1), |retried| {
             seen.lock().unwrap().push(retried);
             let n = calls.fetch_add(1, Ordering::SeqCst);
             async move {
@@ -1371,11 +1454,6 @@ mod tests {
         let stop = AtomicBool::new(true);
         let started = std::time::Instant::now();
         pause(Duration::from_secs(30), &stop).await;
-        let result = with_retries("成功", &stop, Duration::from_secs(30), |_| async {
-            Err::<(), _>(crate::error::Error::msg("失敗"))
-        })
-        .await;
-        assert!(result.is_err());
         assert!(started.elapsed() < Duration::from_secs(5), "待たずに返る");
 
         // 合図が無ければ、決めた時間だけ待つ。
@@ -1383,6 +1461,37 @@ mod tests {
         let started = std::time::Instant::now();
         pause(Duration::from_millis(120), &stop).await;
         assert!(started.elapsed() >= Duration::from_millis(120));
+    }
+
+    #[tokio::test]
+    async fn 記録のやり直しは停止の合図があっても待つ() {
+        use std::sync::atomic::AtomicU32;
+
+        // 以前は合図で待ちを切り上げ、やり直しが間を置かずに続けて失敗した。
+        // 成功したジョブの行が消えずに残り、retry_after の後にもう 1 回動いた。
+        // いまは with_retries が合図を受け取らない（待ちは回数で上限がある）。
+        let unit = Duration::from_millis(20);
+        let calls = AtomicU32::new(0);
+        let started = std::time::Instant::now();
+        let value = with_retries("成功", unit, |_| async {
+            if calls.fetch_add(1, Ordering::SeqCst) < RECORD_RETRIES {
+                Err(crate::error::Error::msg("一時的な失敗"))
+            } else {
+                Ok(())
+            }
+        })
+        .await;
+        assert!(value.is_ok(), "最後のやり直しで通る");
+        // 1・2・4 倍の待ちを全部待った。
+        let waited: Duration = (1..=RECORD_RETRIES).map(|n| retry_wait(n, unit)).sum();
+        assert!(started.elapsed() >= waited, "{:?}", started.elapsed());
+        // 待ちの合計は 7 単位まで（本番は 7 秒）。
+        assert_eq!(
+            (1..=RECORD_RETRIES)
+                .map(|n| retry_wait(n, RETRY_UNIT))
+                .sum::<Duration>(),
+            Duration::from_secs(7)
+        );
     }
 
     #[cfg(feature = "sqlite")]
@@ -1477,8 +1586,8 @@ mod tests {
     ///
     /// **Rust 側に判定を写しません。** 本番で走るのは SQL なので、写しを
     /// 持つと 2 つがずれても気づけません。投げる文そのものを押さえます。
-    fn reserve_sql(now: &str, cutoff: &str) -> (String, Vec<Value>) {
-        reservable(DB::table(TABLE), "default", now, cutoff)
+    fn reserve_sql(now: &str) -> (String, Vec<Value>) {
+        reservable(DB::table(TABLE), "default", now)
             .order_by("id")
             .limit(1)
             .to_sql()
@@ -1487,11 +1596,10 @@ mod tests {
     #[test]
     fn 取り直しの条件はsqlに出る() {
         let now = time::format_timestamp(1_700_000_000);
-        let cutoff = reclaim_cutoff(1_700_000_000, 90);
-        let (sql, bindings) = reserve_sql(&now, &cutoff);
+        let (sql, bindings) = reserve_sql(&now);
 
-        // 予約が無いもの、または境目**以前**に予約されたもの。`<` では
-        // ちょうど境目のものを取り直せません。
+        // 予約が無いもの、または予約の期限が**いま以前**のもの。`<` では
+        // ちょうど期限のものを取り直せません。
         assert!(sql.contains("\"reserved_at\" is null"), "{sql}");
         assert!(sql.contains("or \"reserved_at\" <= ?"), "{sql}");
         assert!(!sql.contains("\"reserved_at\" < ?"), "{sql}");
@@ -1500,13 +1608,14 @@ mod tests {
         // 1 件ずつ、古いものから。
         assert!(sql.contains("order by \"id\" asc limit 1"), "{sql}");
 
-        // 渡す値は キュー → いまの時刻 → 境目 の順。
+        // 渡す値は キュー → いまの時刻 → いまの時刻（期限と比べる）の順。
+        // 取り直す側の --retry-after は入らない。
         assert_eq!(
             bindings,
             vec![
                 Value::Text("default".to_string()),
+                Value::Text(now.clone()),
                 Value::Text(now),
-                Value::Text(cutoff),
             ]
         );
     }
@@ -1515,11 +1624,9 @@ mod tests {
     fn 更新も同じ条件で絞る() {
         // 2 文目（update）の `where` は 1 文目と同じ条件に、見た `attempts` を足す。
         let now = time::format_timestamp(1_700_000_000);
-        let cutoff = reclaim_cutoff(1_700_000_000, 90);
-        let (sql, bindings) =
-            reservable(DB::table(TABLE).where_("id", 7), "default", &now, &cutoff)
-                .where_("attempts", 2_i64)
-                .to_sql();
+        let (sql, bindings) = reservable(DB::table(TABLE).where_("id", 7), "default", &now)
+            .where_("attempts", 2_i64)
+            .to_sql();
 
         assert!(sql.contains("\"id\" = ?"), "{sql}");
         assert!(sql.contains("\"queue\" = ?"), "{sql}");
@@ -1532,8 +1639,8 @@ mod tests {
             vec![
                 Value::Int(7),
                 Value::Text("default".to_string()),
+                Value::Text(now.clone()),
                 Value::Text(now),
-                Value::Text(cutoff),
                 Value::Int(2),
             ]
         );
@@ -1566,7 +1673,6 @@ mod tests {
         // 1 文目で見た状態（attempts = 0、available_at = 今）。
         let now_secs = time::now_seconds();
         let now = time::format_timestamp(now_secs);
-        let cutoff = reclaim_cutoff(now_secs, DEFAULT_RETRY_AFTER);
 
         // 2 文目を投げる前に、別のワーカーが同じ行を取って速く失敗した形。
         // `fail` と同じく、予約を外して回数を増やし、次の時刻を先へ送る。
@@ -1583,7 +1689,7 @@ mod tests {
 
         // 以前は `id` と取り直しの条件だけで更新が通り、待ち時間を無視して
         // 即再実行し、`attempts` を 0 に巻き戻していた。
-        let affected = claim_row(DEFAULT_QUEUE, id, 0, &now, &cutoff, 0, &now)
+        let affected = claim_row(DEFAULT_QUEUE, id, 0, &now, 0, &now)
             .await
             .unwrap();
         assert_eq!(affected, 0, "負けたと見なす");
@@ -1654,13 +1760,13 @@ mod tests {
     }
 
     #[test]
-    fn 境目の時刻は予約より前になる() {
+    fn 期限はいまと比べる() {
         let now = time::now_seconds();
-        let cutoff = reclaim_cutoff(now, 90);
-        // 100 秒前に予約されたまま（ワーカーが死んだ）＝境目より前なので取り直す。
-        assert!(time::format_timestamp(now - 100) < cutoff);
-        // 10 秒前に予約されたばかり（まだ処理中）＝境目より後なので取らない。
-        assert!(time::format_timestamp(now - 10) > cutoff);
+        let current = time::format_timestamp(now);
+        // 100 秒前に予約された（期限 10 秒前）＝ワーカーが死んだので取り直す。
+        assert!(reserved_until(now - 100, 90, 60) < current);
+        // 10 秒前に予約されたばかり（期限 80 秒後）＝まだ処理中なので取らない。
+        assert!(reserved_until(now - 10, 90, 60) > current);
     }
 
     #[test]
@@ -1674,11 +1780,11 @@ mod tests {
     }
 
     #[test]
-    fn 取り直しの境目は0秒にしない() {
+    fn 期限は0秒にしない() {
         let now = time::now_seconds();
         // 0 や負の値を渡しても、いま予約したものを取り直さない。
-        assert!(reclaim_cutoff(now, 0) < time::format_timestamp(now));
-        assert!(reclaim_cutoff(now, -5) < time::format_timestamp(now));
+        assert!(reserved_until(now, 0, 0) > time::format_timestamp(now));
+        assert!(reserved_until(now, -5, 0) > time::format_timestamp(now));
     }
 
     /// テスト用にキューの表を作る。`sqlite` が無いときは使いません。
@@ -1752,10 +1858,12 @@ mod tests {
         };
         assert_eq!(short.job, "Short");
 
-        // 長いほうは先の時刻、短いほう（`--timeout` 60 秒）はいまの時刻。
-        let now = time::format_timestamp(time::now_seconds());
-        assert!(long.reserved_at > now, "{} > {now}", long.reserved_at);
-        assert!(short.reserved_at <= now, "{} <= {now}", short.reserved_at);
+        // 期限は、長いほうが「打ち切り + 30 秒」後、短いほう（`--timeout` 60 秒）は
+        // retry_after（90 秒）後。
+        let soon = time::format_timestamp(time::now_seconds() + 120);
+        let far = time::format_timestamp(time::now_seconds() + 1_800);
+        assert!(long.reserved_at > far, "{} > {far}", long.reserved_at);
+        assert!(short.reserved_at <= soon, "{} <= {soon}", short.reserved_at);
 
         // 表の値も同じ（`finish` / `fail` は目印の一致で自分の予約か見分ける）。
         let stored: Option<String> = DB::table(TABLE)
@@ -1766,10 +1874,8 @@ mod tests {
         assert_eq!(stored.as_deref(), Some(long.reserved_at.as_str()));
 
         // retry_after（90 秒）を過ぎたころに別のワーカーが見ても、長いほうは取り直さない。
-        let later = time::now_seconds() + 120;
-        let cutoff = reclaim_cutoff(later, options.retry_after);
-        assert!(long.reserved_at > cutoff, "長いほうはまだ予約のまま");
-        assert!(short.reserved_at <= cutoff, "短いほうは取り直しの対象");
+        assert!(long.reserved_at > soon, "長いほうはまだ予約のまま");
+        assert!(short.reserved_at <= soon, "短いほうは取り直しの対象");
     }
 
     /// 処理中の目印が残ったままのジョブを 1 本入れて、その id を返す。
@@ -1804,7 +1910,7 @@ mod tests {
         // 続けました。`order_by("id") limit 1` なので、この 1 件で
         // キュー全体が止まりました。
         let taken = reserve(&Options::default()).await.unwrap();
-        assert!(matches!(taken, Reservation::Lost), "予約しない");
+        assert!(matches!(taken, Reservation::GaveUp), "予約しない");
         assert_eq!(
             DB::table(TABLE).count().await.unwrap(),
             0,
@@ -1840,7 +1946,7 @@ mod tests {
         // 列の値（2）で見ていたころは `2 >= 3` が偽で予約し直し、
         // `--tries 3` でも 4 回走っていた。数え直した値（3）で諦める。
         let taken = reserve(&Options::default()).await.unwrap();
-        assert!(matches!(taken, Reservation::Lost), "予約しない");
+        assert!(matches!(taken, Reservation::GaveUp), "予約しない");
         assert_eq!(
             DB::table(TABLE).count().await.unwrap(),
             0,
@@ -1912,5 +2018,115 @@ mod tests {
         }
         assert_eq!(DB::table(FAILED_TABLE).count().await.unwrap(), 0);
         assert_eq!(DB::table(TABLE).count().await.unwrap(), 1);
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn retry_afterが短いワーカーも動いているジョブを取り直さない() {
+        let _db = crate::testing::refresh_database().await;
+        表を作る().await;
+        let id = 待っているジョブを入れる("SendWelcome").await;
+
+        // `--retry-after=600` のワーカーが予約した。
+        let patient = Options {
+            retry_after: 600,
+            ..Options::default()
+        };
+        let Reservation::Taken(reserved) = reserve(&patient).await.unwrap() else {
+            panic!("取れる");
+        };
+        assert_eq!(reserved.id, id);
+
+        // 2 秒たってから `--retry-after=1` のワーカーが見る。以前は取り直す側の
+        // 1 秒で判定したので、ここで取り直して二重に動いた。
+        tokio::time::sleep(Duration::from_millis(2_100)).await;
+        let hasty = Options {
+            retry_after: 1,
+            ..Options::default()
+        };
+        assert!(
+            matches!(reserve(&hasty).await.unwrap(), Reservation::Empty),
+            "行の期限（600 秒後）までは取り直さない"
+        );
+
+        // 期限を過ぎた（ワーカーが死んだ）行は、どのワーカーでも取り直す。
+        DB::table(TABLE)
+            .where_("id", id)
+            .update(&[(
+                "reserved_at",
+                Value::Text(time::format_timestamp(time::now_seconds() - 1)),
+            )])
+            .await
+            .unwrap();
+        assert!(matches!(
+            reserve(&hasty).await.unwrap(),
+            Reservation::Taken(_)
+        ));
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn 諦めた行が続いても待ちに落ちない() {
+        let _db = crate::testing::refresh_database().await;
+        表を作る().await;
+        // `tries` を使い切ったまま落ちた行が、負けの上限より多く並んでいる。
+        let count = MAX_CONSECUTIVE_LOST + 2;
+        for _ in 0..count {
+            放置されたジョブを入れる(3).await;
+        }
+        let stop = Arc::new(AtomicBool::new(false));
+        let options = Options {
+            once: true,
+            sleep: 30,
+            ..Options::default()
+        };
+        // 以前は諦めた行を「負け」と数え、10 回で `--sleep`（ここでは 30 秒）待った。
+        let started = std::time::Instant::now();
+        run_with(&[], &options, stop, Duration::from_millis(1))
+            .await
+            .unwrap();
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "{:?}",
+            started.elapsed()
+        );
+        assert_eq!(
+            DB::table(FAILED_TABLE).count().await.unwrap(),
+            i64::from(count)
+        );
+        assert_eq!(DB::table(TABLE).count().await.unwrap(), 0);
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn 失敗ジョブは区切って全部戻す() {
+        let _db = crate::testing::refresh_database().await;
+        表を作る().await;
+        // 1 回に読む数（500）を 2 回またぐ数。
+        let total = RETRY_CHUNK * 2 + 3;
+        let now = crate::database::now();
+        let rows: Vec<Vec<(&str, Value)>> = (0..total)
+            .map(|_| {
+                vec![
+                    ("queue", Value::Text(DEFAULT_QUEUE.to_string())),
+                    ("job", Value::Text("SendWelcome".to_string())),
+                    ("payload", Value::Text("{}".to_string())),
+                    ("error", Value::Text("わざと失敗".to_string())),
+                    ("failed_at", Value::Text(now.clone())),
+                ]
+            })
+            .collect();
+        for chunk in rows.chunks(100) {
+            DB::table(FAILED_TABLE).insert_many(chunk).await.unwrap();
+        }
+
+        assert_eq!(retry_failed(None).await.unwrap(), total);
+        assert_eq!(
+            u64::try_from(DB::table(TABLE).count().await.unwrap()).unwrap(),
+            total
+        );
+        assert_eq!(DB::table(FAILED_TABLE).count().await.unwrap(), 0);
+        // 空なら 0 件。
+        assert_eq!(retry_failed(None).await.unwrap(), 0);
     }
 }

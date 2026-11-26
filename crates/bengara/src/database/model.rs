@@ -1656,7 +1656,7 @@ mod tests {
             .to_sql();
         assert_eq!(
             sql,
-            "select * from \"posts\" where \"id\" > ? and 1 = 0 or 1 = 1 and 1 = 1 or 1 = 0"
+            "select * from \"posts\" where \"id\" > ? and 1 = 0 or (1 = 1) and 1 = 1 or 1 = 0"
         );
         assert_eq!(bindings, vec![Value::Int(5)]);
 
@@ -2073,7 +2073,7 @@ mod tests {
             sql,
             "select \"posts\".* from \"posts\" inner join \"users\" on \"users\".\"id\" = \"posts\".\"user_id\" \
              left join \"tags\" on \"tags\".\"post_id\" = \"posts\".\"id\" \
-             where length(title) > ? or views > ?"
+             where (length(title) > ?) or (views > ?)"
         );
         assert_eq!(bindings, vec![Value::Int(3), Value::Int(10)]);
     }

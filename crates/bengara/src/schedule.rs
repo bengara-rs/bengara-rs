@@ -242,20 +242,39 @@ const DUE_SLACK_SECS: i64 = 30;
 /// [`DUE_SLACK_SECS`] だけ早くても動かします。60 秒未満の `Seconds(n)` は
 /// 秒のまま比べます（どのみち `schedule:run` の間隔でしか動きません）。
 ///
-/// **前回が未来なら動かします。** 時計が一時的に先へ飛ぶと（NTP の補正、
+/// **前回が間隔より先の未来なら動かします。** 時計が一時的に先へ飛ぶと（NTP の補正、
 /// スナップショットからの復元、RTC の狂ったコンテナ）未来の時刻が書かれます。
 /// 差だけを見ていたころは、時計が直った後に差が大きな負の値になり、
 /// そのタスクが二度と動きませんでした。ログも出ないので、`Every::Day` の
 /// 掃除が止まっても気づけませんでした。
+///
+/// **前回が少しだけ未来（間隔以内）なら、まだ動かしません。** 同じ `storage/` を
+/// 共有する 2 台の時計が 1 分以上ずれていると、遅れている側から見て、進んでいる側が
+/// 書いた前回は未来になります。「未来なら全部動かす」にしていたころは、遅れている側が
+/// 毎回動かし、それを進んでいる側がまた動かして、**毎回二重に動いていました。**
+/// どちらの場合も警告を出します（時計のずれを直すきっかけにするため）。
 pub(crate) fn is_due(last_run: Option<i64>, every: Every, now: i64) -> bool {
     match last_run {
         // 1 度も動いていなければ動かす。
         None => true,
         Some(last) if last > now => {
-            tracing::warn!(
-                "前回の時刻 {last} がいま {now} より後です（時計がずれています）。動かします"
-            );
-            true
+            let ahead = last.saturating_sub(now);
+            let seconds = i64::try_from(every.seconds()).unwrap_or(i64::MAX);
+            if ahead > seconds {
+                // 間隔より先＝時計がはっきり戻った。待つと長く止まるので動かす。
+                tracing::warn!(
+                    "前回の時刻 {last} がいま {now} より {ahead} 秒後です\
+                     （時計が戻りました）。動かします"
+                );
+                true
+            } else {
+                // 少しだけ先＝別のホストの時計が進んでいる。二重に動かさない。
+                tracing::warn!(
+                    "前回の時刻 {last} がいま {now} より {ahead} 秒後です\
+                     （ホストの時計がずれています）。まだ動かしません"
+                );
+                false
+            }
         }
         Some(last) => {
             // `as i64` だと `Every::Seconds(u64::MAX)` が `-1` になり、
@@ -363,12 +382,16 @@ static TEMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::ne
 /// ぶつかりません。
 const LOCK_DIR: &str = "+locks";
 
-/// 錠を待つ回数（1 回 10ms なので約 1 秒）。
+/// 錠を待つ時間の上限。
 ///
 /// 守るのは「読む → 判定 → 書く」だけで、1 秒も掛かりません。待ち続けずに
 /// 諦めます。取れなければ次の 1 分の `schedule:run` で動けます
 /// （落ちたプロセスの錠も、そのときには古い錠として外れます）。
-const CLAIM_LOCK_TRIES: u32 = 100;
+///
+/// 回数（以前は 100 回）ではなく時間で決めます。Windows はファイルの作成が遅く、
+/// 混んでいると 100 回で 10 秒を超え、待っている間に相手の生きている錠を
+/// 古い錠と見て奪っていました。
+const CLAIM_LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(1);
 
 /// そのタスクを守る錠ファイルの場所（テストから使います）。
 #[cfg(test)]
@@ -443,7 +466,7 @@ async fn claim(dir: &Path, task: &Task) -> Result<Claim> {
     crate::support::blocking(move || {
         let lock_path = lock_path_for(&dir, &state_file);
         let _lock =
-            match crate::support::lock::FileLock::acquire_tries(&lock_path, CLAIM_LOCK_TRIES) {
+            match crate::support::lock::FileLock::acquire_within(&lock_path, CLAIM_LOCK_WAIT) {
                 Ok(lock) => lock,
                 // 錠ファイルそのものを作れない（権限・容量・置き場所が無い）。
                 // 待っても直らないので、失敗として知らせる。
@@ -542,12 +565,13 @@ const TEMP_STALE_SECS: u64 = 300;
 ///
 /// 書いている途中にプロセスが落ちると、一時ファイルが残ります。
 /// 以前は誰も消さず、`storage/framework/schedule/` に溜まる一方でした。
-/// 錠のディレクトリ（`+locks/`）はディレクトリなので触りません。
+/// 錠のディレクトリ（`+locks/`）の中は、錠の作業の一時ファイル（下書き・退避先）
+/// だけを消します（`support::lock::sweep_temps`）。錠ファイル（`.lock`）は消しません。
 fn sweep_stale_temps(dir: &Path) -> usize {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return 0;
     };
-    let mut removed = 0;
+    let mut removed = crate::support::lock::sweep_temps(&dir.join(LOCK_DIR), TEMP_STALE_SECS);
     for entry in entries.flatten() {
         let path = entry.path();
         let is_temp = path
@@ -596,24 +620,26 @@ async fn run_in(dir: &Path, schedule: &Schedule) -> Outcome {
             // 錠の話と混ぜずに理由をそのまま出す。
             Err(e) => {
                 eprintln!("  {} 失敗（動かせませんでした）: {e}", task.name);
+                tracing::error!(task = %task.name, "定期処理を動かせませんでした: {e}");
                 outcome.failed.push(task.name.clone());
                 continue;
             }
         }
 
+        // 画面の行（println! / eprintln!）に加えて、ログ（tracing）にも残す。
+        // 画面だけだと、ログのファイルや監視には失敗が届かなかった。
         let started = std::time::Instant::now();
         match run_task(task).await {
             Ok(()) => {
-                println!(
-                    "  {} 成功（{} ms）",
-                    task.name,
-                    started.elapsed().as_millis()
-                );
+                let ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+                println!("  {} 成功（{ms} ms）", task.name);
+                tracing::info!(task = %task.name, ms, "定期処理が成功しました");
                 outcome.done.push(task.name.clone());
             }
             // 1つ失敗しても、ほかの処理は動かす。
             Err(e) => {
                 eprintln!("  {} 失敗: {e}", task.name);
+                tracing::error!(task = %task.name, "定期処理が失敗しました: {e}");
                 outcome.failed.push(task.name.clone());
             }
         }
@@ -785,15 +811,35 @@ mod tests {
     }
 
     #[test]
-    fn 前回が未来なら動かす() {
+    fn 前回が間隔より先の未来なら動かす() {
         let now = 100_000;
         // 時計が先に飛んで未来の時刻が書かれた形。差だけを見ていたころは、
         // 差が大きな負の値になってそのタスクが二度と動かなかった。
-        assert!(is_due(Some(now + 1), Every::Day, now));
+        assert!(is_due(Some(now + 86_400 + 1), Every::Day, now));
         assert!(is_due(Some(now + 86_400 * 365), Every::Hour, now));
         assert!(is_due(Some(i64::MAX), Every::Day, now));
         // 前回がちょうど今なら、間隔を守る。
         assert!(!is_due(Some(now), Every::Day, now));
+    }
+
+    #[test]
+    fn 前回が少しだけ未来ならまだ動かさない() {
+        let now = 100_000;
+        // 同じ storage/ を共有する 2 台で、時計が 90 秒ずれている形。
+        // 「未来なら動かす」だったころは、遅れている側が毎回動かして二重になった。
+        assert!(!is_due(Some(now + 90), Every::Minutes(5), now));
+        assert!(!is_due(Some(now + 1), Every::Day, now));
+        assert!(
+            !is_due(Some(now + 3_600), Every::Hour, now),
+            "間隔ちょうどまで"
+        );
+        assert!(
+            is_due(Some(now + 3_601), Every::Hour, now),
+            "間隔を超えたら動かす"
+        );
+        assert!(!is_due(Some(now + 30), Every::Seconds(30), now));
+        // 毎分は間隔が 0 なので、未来でも動かす（毎回動く約束のまま）。
+        assert!(is_due(Some(now + 90), Every::Minute, now));
     }
 
     #[test]
@@ -872,14 +918,18 @@ mod tests {
         let later = crate::support::time::now_seconds() + 5;
         write_last_run(&dir, task, later).unwrap();
 
-        // 時刻を取り直すので、5 秒後の前回は「まだ早い」ではなく未来と見る。
-        // ここで確かめたいのは、動かさないこと**ではなく**、前回の時刻が
-        // 判定の瞬間の `now` と比べられること。
+        // 前回が少しだけ未来（間隔以内）なら、二重に動かさない。
         assert_eq!(
             claim(&dir, task).await.unwrap(),
-            Claim::Due,
-            "未来の前回は動かす（時計ずれの扱い）"
+            Claim::NotYet,
+            "間隔以内の未来の前回では動かさない"
         );
+        assert_eq!(read_last_run(&dir, task), Some(later), "書き換えない");
+
+        // 時計がはっきり戻った（間隔より先の前回）なら動かし、いまの時刻を書く。
+        let far = crate::support::time::now_seconds() + 7_200;
+        write_last_run(&dir, task, far).unwrap();
+        assert_eq!(claim(&dir, task).await.unwrap(), Claim::Due);
         // 書くのは判定の瞬間の時刻を分の頭に丸めた値。未来の時刻は残らない。
         let written = read_last_run(&dir, task).unwrap();
         let now = crate::support::time::now_seconds();
@@ -1042,12 +1092,28 @@ mod tests {
             .set_modified(past)
             .unwrap();
 
+        // 錠の置き場所に、落ちたプロセスの退避先と、生きている錠が 1 つずつ。
+        let lock = dir.join(LOCK_DIR).join(format!("{state}.lock"));
+        let left = dir.join(LOCK_DIR).join(format!("{state}.stale.1.2"));
+        std::fs::write(&lock, "印").unwrap();
+        std::fs::write(&left, "印").unwrap();
+        for path in [&lock, &left] {
+            std::fs::File::options()
+                .write(true)
+                .open(path)
+                .unwrap()
+                .set_modified(past)
+                .unwrap();
+        }
+
         // 以前は誰も消さず、溜まる一方だった。
-        assert_eq!(sweep_stale_temps(&dir), 1);
+        assert_eq!(sweep_stale_temps(&dir), 2);
         assert!(!old.exists(), "古い書きかけは消す");
         assert!(fresh.exists(), "書いている途中かもしれないものは残す");
         assert!(dir.join(&state).exists(), "覚えるファイルは消さない");
         assert!(dir.join(LOCK_DIR).is_dir(), "錠の置き場所は消さない");
+        assert!(!left.exists(), "錠の古い退避先は消す");
+        assert!(lock.exists(), "錠ファイルは古くても消さない");
         // 置き場所が無くても落ちない。
         assert_eq!(sweep_stale_temps(&dir.join("none")), 0);
 
@@ -1120,9 +1186,8 @@ mod tests {
             claim(&dir, &schedule.tasks()[0]).await.unwrap(),
             Claim::Busy
         );
-        // 錠を置き直して、古い錠（10 秒）と見なされないようにする。`claim` は
-        // 100 回試すので、Windows ではファイルの作成が遅く 1 回で数秒かかる。
-        // 2 回分で 10 秒を超えると、下の `run_in` が錠を外して動かしていた。
+        // 錠を置き直して、古い錠（10 秒）と見なされないようにする。`claim` の待ちは
+        // 1 回 1 秒までだが、テストが混んでいると錠を取る処理そのものも遅れる。
         drop(held);
         let held = crate::support::lock::FileLock::acquire(&lock_path(&dir, &schedule.tasks()[0]))
             .unwrap();

@@ -32,6 +32,12 @@ pub(crate) fn is_command(name: &str) -> bool {
 /// コマンドを実行する。
 pub(crate) fn run(name: &str, args: &[String], hooks: Hooks) -> Result<()> {
     let options = Options::parse(name, args)?;
+    if name == "queue:work" {
+        // 動き続けるコマンドなので、`serve` と同じく標準出力のログを裏のスレッドで書く
+        // （ジョブを動かす tokio のスレッドを、端末やパイプへの書き込みで待たせない）。
+        // 終わるときは `kernel_impl::main` の `logging::shutdown` が書き切ります。
+        crate::logging::start_stdout_background();
+    }
     let runtime = runtime()?;
     let result = runtime.block_on(execute(name, &options, hooks));
     if name == "queue:work" {

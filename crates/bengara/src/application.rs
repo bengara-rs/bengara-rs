@@ -177,11 +177,16 @@ impl Application {
         });
 
         // 本文はルートが決まってから受け取る。上限と読み方（全部・少しずつ）がルートごとだからです。
-        // 受け取れなかったとき（413・400・408）は、ミドルウェアもハンドラも通さずに返します。
-        // `with_exceptions` と `APP_DEBUG` も使いません（中身の無いエラーなので、見せ方を変える理由が無い）。
+        // 受け取れなかったとき（413・400・408）は、ハンドラとルートのミドルウェアを通さず、
+        // **共通のミドルウェアだけ**を通してそのエラーを返します（`rejected_body`）。
+        // 以前は共通のミドルウェアも通さなかったので、CORS の見出しが付かず、
+        // ブラウザの JavaScript から「大きすぎる」が読めませんでした。
         // 後ろの HEAD の扱いと本文を持てない状態の扱いは、ほかの応答と同じく通します。
         let response = match req.receive_body(policy).await {
-            Err(error) => error_response(&error, RenderOptions::new(false, options.wants_json)),
+            Err(error) => {
+                req.mark_body_rejected();
+                self.run_stack(rejected_body(error), req, options).await
+            }
             Ok(()) => self.run_stack(inner, req, options).await,
         };
 
@@ -228,8 +233,11 @@ impl Application {
     ) -> Response {
         let id = req.request_id_arc();
         let future = Next::new(self.inner.global.clone(), inner, options.clone()).run(req);
+        // 停止のときに終わるのを待てるように数える（タスクが終わると数から引く）。
+        let task = crate::server::track_request();
         // spawn すると task-local が切れるので、同じ ID で包み直す。
         let future = async move {
+            let _task = task;
             match id {
                 Some(id) => crate::logging::request_id::scope(id, future).await,
                 None => future.await,
@@ -242,9 +250,10 @@ impl Application {
         // この形は意図したものです（決定記録 #008）。`catch_unwind` に替えると
         // `UnwindSafe` の扱いが広く波及するので、ここは変えません。
         //
-        // **制限**: クライアントが切断すると、axum 側の処理は落ちますが、ここで
-        // 切り出したタスクは走り続けます。そのタスクは停止処理の追跡から外れるので、
-        // 終了を待ってもらえません（停止の上限時間まで走り、そこで打ち切られます）。
+        // クライアントが切断すると、axum 側の処理は落ちますが、ここで切り出したタスクは
+        // 走り続けます（途中の `.await` で止めると、書きかけの処理が残るため）。
+        // 停止のときは、このタスクも終わるまで待ちます（`APP_SHUTDOWN_TIMEOUT` まで。
+        // `server::track_request`）。上限を過ぎたら、ランタイムごと打ち切られます。
         match tokio::spawn(future).await {
             // `Next::run` は必ず `Ok` を返します（エラーはその中でレスポンスに変わります）。
             // ここの `Err` には来ませんが、型を合わせるために同じ関数を通します。
@@ -370,7 +379,8 @@ impl Application {
             // 以前は生のパスで `/storage/` を判定していたので、`//storage/x.css` と
             // `/%73torage/x.css` が `public/` 側の枝に入っていました。
             let path = crate::http::statics::normalize_path(req.path());
-            let if_none_match = req.header("if-none-match").map(str::to_string);
+            // 条件つきの取得（`If-None-Match` など）と範囲（`Range`）の見出し。
+            let conditions = crate::http::statics::Conditions::from_request(req);
             // HEAD は本文を返さないので、ファイルを読まずに長さだけ知らせる。
             let want_body = req.method() != "HEAD";
 
@@ -383,7 +393,7 @@ impl Application {
                         &dir,
                         root.as_deref(),
                         &path,
-                        if_none_match.as_deref(),
+                        &conditions,
                         want_body,
                     )
                 })
@@ -398,7 +408,7 @@ impl Application {
                 if let Some(response) = crate::http::statics::serve_embedded(
                     crate::http::statics::embedded(),
                     &path,
-                    if_none_match.as_deref(),
+                    &conditions,
                 ) {
                     return Some(response);
                 }
@@ -411,7 +421,7 @@ impl Application {
                         &dir,
                         Some(&*root),
                         &path,
-                        if_none_match.as_deref(),
+                        &conditions,
                         want_body,
                     )
                 })
@@ -424,6 +434,32 @@ impl Application {
         }
         None
     }
+}
+
+/// 本文を受け取れなかった要求の、最内側のハンドラ。受け取りのエラーをそのまま返します。
+///
+/// 共通のミドルウェアの内側に置き、ハンドラとルートのミドルウェアの代わりにします。
+///
+/// | 通るもの | 決めたこと |
+/// |---|---|
+/// | CORS などの共通のミドルウェア | 通す。断った応答にも見出しが付く |
+/// | `VerifyCsrfToken` | 確かめずに通す（`Request::body_rejected`）。中で返るのはこのエラーだけ |
+/// | ルートのミドルウェア・ハンドラ | 通さない。本文の無い要求を渡さない |
+/// | `with_exceptions`・`APP_DEBUG` | ほかのエラーと同じく効く |
+fn rejected_body(error: Error) -> Arc<dyn ErasedHandler> {
+    // 受け取りのエラーは状態コードと短い文だけ（`Error::Http`）。写せる形にして持つ。
+    let status = error.status();
+    let message = match error {
+        Error::Http { message, .. } => message,
+        other => other.to_string(),
+    };
+    Arc::new(Erased::new(move |_req: Request| {
+        let error = Error::Http {
+            status,
+            message: message.clone(),
+        };
+        async move { Err::<Response, Error>(error) }
+    }))
 }
 
 /// クライアントが JSON を欲しがっているか。
@@ -1313,10 +1349,37 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn 本文を受け取る前にミドルウェアは通らない_受け取った後に通る() {
-        // 413 はミドルウェアを通さない（共通のヘッダーが付かない）。
+    async fn 本文のエラーは共通のミドルウェアだけを通る() {
+        // 以前は共通のミドルウェアも通さなかったので、CORS の見出しが付かなかった。
+        // ルートのミドルウェアとハンドラは、今も通さない。
         let app = Application::configure()
-            .with_middleware(|m| m.append(powered_by))
+            .with_middleware(|m| m.append(powered_by).alias("marked", marker))
+            .with_routing(|r| {
+                r.web(|| {
+                    Route::post("/small", body_length)
+                        .max_body(4)
+                        .middleware("marked");
+                })
+            })
+            .create();
+        let over = app.handle(post_body("/small", b"12345")).await;
+        assert_eq!(over.status(), 413);
+        assert_eq!(over.header("x-powered-by"), Some("bengara"));
+        assert_eq!(marks(&over), ["global"]);
+
+        let ok = app.handle(post_body("/small", b"1234")).await;
+        assert_eq!(ok.header("x-powered-by"), Some("bengara"));
+        assert_eq!(marks(&ok), ["route", "global"]);
+    }
+
+    #[tokio::test]
+    async fn 本文のエラーにもwith_exceptionsが効く() {
+        let app = Application::configure()
+            .with_exceptions(|e| {
+                e.render(|error| {
+                    (error.status() == 413).then(|| Response::text("大きすぎます").with_status(413))
+                })
+            })
             .with_routing(|r| {
                 r.web(|| {
                     Route::post("/small", body_length).max_body(4);
@@ -1325,9 +1388,63 @@ mod tests {
             .create();
         let over = app.handle(post_body("/small", b"12345")).await;
         assert_eq!(over.status(), 413);
-        assert_eq!(over.header("x-powered-by"), None);
+        assert_eq!(over.body_text(), "大きすぎます");
+    }
 
-        let ok = app.handle(post_body("/small", b"1234")).await;
-        assert_eq!(ok.header("x-powered-by"), Some("bengara"));
+    #[tokio::test]
+    async fn 無いパスへの壊れたmultipartは404() {
+        // 以前はルートに当たらなくても multipart を分けていたので、400 になっていた。
+        let req = post_body("/missing", b"broken").with_headers(vec![(
+            "content-type".to_string(),
+            "multipart/form-data; boundary=XyZ".to_string(),
+        )]);
+        assert_eq!(body_app().handle(req).await.status(), 404);
+        // ルートがあれば今までどおり 400。
+        let req = post_body("/default", b"broken").with_headers(vec![(
+            "content-type".to_string(),
+            "multipart/form-data; boundary=XyZ".to_string(),
+        )]);
+        assert_eq!(body_app().handle(req).await.status(), 400);
+    }
+
+    #[tokio::test]
+    async fn フォームとjsonの項目は1000まで() {
+        let limit = crate::http::multipart::MAX_PARTS;
+        let send = |content_type: &str, body: String| {
+            post_body("/default", body.as_bytes())
+                .with_headers(vec![("content-type".to_string(), content_type.to_string())])
+        };
+        let form = |count: usize| vec!["a=1"; count].join("&");
+        let json = |count: usize| {
+            let keys: Vec<String> = (0..count).map(|i| format!("\"k{i}\":1")).collect();
+            format!("{{{}}}", keys.join(","))
+        };
+        let app = body_app();
+        let urlencoded = "application/x-www-form-urlencoded";
+        // ちょうどは通る。空の組（`&&`）は数えない。
+        let at_limit = format!("{}&&&", form(limit));
+        assert_eq!(app.handle(send(urlencoded, at_limit)).await.status(), 200);
+        assert_eq!(
+            app.handle(send(urlencoded, form(limit + 1))).await.status(),
+            413
+        );
+        assert_eq!(
+            app.handle(send("application/json", json(limit)))
+                .await
+                .status(),
+            200
+        );
+        assert_eq!(
+            app.handle(send("application/json", json(limit + 1)))
+                .await
+                .status(),
+            413
+        );
+        // 入れ子の鍵は数えない。
+        let nested = format!("{{\"a\":{}}}", json(limit + 1));
+        assert_eq!(
+            app.handle(send("application/json", nested)).await.status(),
+            200
+        );
     }
 }

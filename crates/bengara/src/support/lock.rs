@@ -78,10 +78,38 @@ impl FileLock {
 
     /// 試す回数を決めて錠を取る（テストから使います）。
     pub(crate) fn acquire_tries(path: &Path, tries: u32) -> Result<Self> {
+        let mut left = tries;
+        Self::acquire_while(path, || {
+            let more = left > 0;
+            left = left.saturating_sub(1);
+            more
+        })
+    }
+
+    /// 待つ時間の上限を決めて錠を取る。
+    ///
+    /// 回数で決めると、1 回の試しにかかる時間で合計が大きく変わります。
+    /// Windows はファイルの作成が遅く、混んでいると 100 回で 10 秒を超えました。
+    /// 10 秒を超えると、待っている間に相手の錠が古い錠（[`LOCK_STALE_SECS`]）に見え、
+    /// 生きている錠を奪ってしまいます。上限が [`LOCK_STALE_SECS`] より十分短ければ、
+    /// そうなりません。
+    pub(crate) fn acquire_within(path: &Path, limit: std::time::Duration) -> Result<Self> {
+        let deadline = std::time::Instant::now() + limit;
+        // 最初の 1 回は必ず試す（上限が 0 でも、空いていれば取れる）。
+        let mut first = true;
+        Self::acquire_while(path, || {
+            let more = first || std::time::Instant::now() < deadline;
+            first = false;
+            more
+        })
+    }
+
+    /// `more` が真を返す間、錠を取ろうと試す。
+    fn acquire_while(path: &Path, mut more: impl FnMut() -> bool) -> Result<Self> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        for _ in 0..tries {
+        while more() {
             let stamp = new_stamp();
             match create_with_stamp(path, &stamp) {
                 Ok(()) => {
@@ -264,6 +292,57 @@ fn release(path: &Path, stamp: &str) -> bool {
     mine
 }
 
+/// 錠の作業で使う一時ファイルの印。どれも `with_extension` で `<名前>.<印><番号>` になります。
+///
+/// | 印 | 作る所 |
+/// |---|---|
+/// | `new.` | [`create_with_stamp`]（印を書いた下書き） |
+/// | `stale.` | [`remove_stale`]（奪った錠の退避先） |
+/// | `release.` | [`release`]（手放す錠の退避先） |
+const TEMP_MARKS: [&str; 3] = ["new.", "stale.", "release."];
+
+/// 錠の作業で使う一時ファイルの名前か。**錠ファイル（`.lock`）は含みません。**
+fn is_lock_temp(name: &str) -> bool {
+    !name.ends_with(".lock")
+        && TEMP_MARKS
+            .iter()
+            .any(|mark| name.contains(&format!(".{mark}")))
+}
+
+/// 錠の置き場所（`+locks/`）に残った古い一時ファイルを消し、消した件数を返す。
+///
+/// 上の 3 つの一時ファイルは、作ったプロセスがその場で消します。ですが
+/// 作ってから消すまでの間にプロセスが落ちると残ります。以前は誰も消さず、
+/// `+locks/` に溜まる一方でした。
+///
+/// **錠ファイル（`.lock`）は消しません。** 生きている錠を消すと排他が外れます。
+/// 古い錠は [`FileLock::acquire`] が印を確かめてから外します。
+///
+/// 一時ファイルは一瞬で消えるので、`secs` 秒（呼ぶ側は 300 秒）より古いものは
+/// 落ちたプロセスの残骸です。退避先（`stale.` / `release.`）は錠の更新時刻を
+/// 引き継ぎますが、錠は 10 秒で古い扱いになるので、300 秒より長く持たれることは
+/// ありません。
+pub(crate) fn sweep_temps(dir: &Path, secs: u64) -> usize {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return 0;
+    };
+    let mut removed = 0;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let is_temp = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(is_lock_temp);
+        if !is_temp || !path.is_file() {
+            continue;
+        }
+        if is_stale(&path, secs) && std::fs::remove_file(&path).is_ok() {
+            removed += 1;
+        }
+    }
+    removed
+}
+
 /// 最後に書かれてから `secs` 秒以上たっているか。読めないときは偽。
 ///
 /// # 更新時刻が未来のとき
@@ -320,6 +399,25 @@ mod tests {
         assert!(!path.exists(), "手放すと消える");
         // 空いたので取れる。
         let _again = FileLock::acquire(&path).unwrap();
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn 時間で決めた待ちは上限で諦める() {
+        let dir = temp_dir("within");
+        let path = dir.join("a.lock");
+
+        let held = FileLock::acquire(&path).unwrap();
+        let started = std::time::Instant::now();
+        assert!(FileLock::acquire_within(&path, std::time::Duration::from_millis(100)).is_err());
+        // 回数ではなく時間で止まる。古い錠（10 秒）と見るほどは待たない。
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+        assert!(path.exists(), "生きている錠は奪わない");
+
+        drop(held);
+        // 上限が 0 でも、空いていれば 1 回は試して取れる。
+        let _again = FileLock::acquire_within(&path, std::time::Duration::ZERO).unwrap();
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -585,6 +683,67 @@ mod tests {
         assert!(is_stale(&path, 3), "3 秒以上先なら古い扱い");
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn 錠の置き場所の古い一時ファイルだけを片付ける() {
+        let dir = temp_dir("sweep");
+        let lock = dir.join("abc.lock");
+        let old_lock = dir.join("old.lock");
+        let temps = ["abc.new.1.0", "abc.stale.1.1", "abc.release.1.2"];
+        let fresh = dir.join("abc.new.1.3");
+        let other = dir.join("abc.txt");
+        for path in [&lock, &old_lock, &fresh, &other] {
+            std::fs::write(path, "印").unwrap();
+        }
+        for name in temps {
+            std::fs::write(dir.join(name), "印").unwrap();
+        }
+        // 落ちたプロセスが 10 分前に残した形。錠そのものも古くしておく。
+        let past = std::time::SystemTime::now() - std::time::Duration::from_secs(600);
+        for path in temps
+            .iter()
+            .map(|name| dir.join(name))
+            .chain([old_lock.clone(), other.clone()])
+        {
+            std::fs::File::options()
+                .write(true)
+                .open(&path)
+                .unwrap()
+                .set_modified(past)
+                .unwrap();
+        }
+
+        // 以前は誰も消さず、`+locks/` に溜まる一方だった。
+        assert_eq!(sweep_temps(&dir, 300), 3);
+        for name in temps {
+            assert!(!dir.join(name).exists(), "{name} は消す");
+        }
+        assert!(lock.exists(), "錠は消さない");
+        assert!(
+            old_lock.exists(),
+            "古くても錠は消さない（外すのは acquire）"
+        );
+        assert!(fresh.exists(), "作っている途中かもしれないものは残す");
+        assert!(other.exists(), "知らない名前は触らない");
+        // 置き場所が無くても落ちない。
+        assert_eq!(sweep_temps(&dir.join("none"), 300), 0);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn 一時ファイルの名前は錠を作る所と合う() {
+        // `with_extension` の結果と、片付けの見分け方がずれていないこと。
+        let path = Path::new("x").join("0123abcd.lock");
+        for mark in TEMP_MARKS {
+            let temp = path.with_extension(format!("{mark}10.2"));
+            let name = temp.file_name().unwrap().to_str().unwrap();
+            assert!(is_lock_temp(name), "{name}");
+        }
+        assert!(!is_lock_temp("0123abcd.lock"));
+        // 鍵に `new.` が入っていても、錠ファイルなら消さない。
+        assert!(!is_lock_temp("a.new.b.lock"));
     }
 
     /// 更新時刻を「いまから `ahead` 先」にする。

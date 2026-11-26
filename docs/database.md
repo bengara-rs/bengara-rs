@@ -44,6 +44,7 @@ bengara = { version = "0.1", features = ["sqlite"] }
 - 値に `#` を含むときは引用符で囲みます（`DB_PASSWORD="p#ss"`）。
 - **MySQL と PostgreSQL は、データベースを先に作っておきます。** bengara は作りません。
 - SQLite のファイルは無ければ作ります。置くディレクトリは先に用意します。
+- SQLite の相対パスは、`DB_DATABASE` でも `DB_URL`（`sqlite:database/app.db`）でも、プロジェクトの基準ディレクトリから見ます。
 
 ## 読む
 
@@ -111,7 +112,12 @@ Laravel の `->where('views', '>', 100)` は `where_op("views", ">", 100)` で�
 - `None` と `=` で比べると `is null` になります。`!=` なら `is not null` です。
 - `>` などで NULL と比べると必ず 0 件です。`where_null` を使います。
 - `where_in` に空の一覧を渡すと 0 件です。渡せるのは 30,000 件までです。
+- `where_in` / `where_not_in` の一覧に `None` があると、`is null` / `is not null` に分けて書きます。
+  `where_in("c", &[Some(1), None])` は `("c" in (?) or "c" is null)` です。
+- `where_between` / `where_not_between` の端に `None` を渡すとエラーです（必ず 0 件になるため）。
+- `where_like` と `like` / `not like` の逃がしの文字は、どのドライバでも `\` です。`100\%` は `100%` という文字に当たります（SQLite には `escape '\'` を足します）。
 - `where_group` の中では、条件だけが使われます。
+- `where_raw` / `or_where_raw` / `having_raw` に書いた SQL は、括弧でくくって置きます。`a = ? or b = ?` の `or` が外へ漏れません。
 - `where_raw` の `?` は値の置き場所です。文字列（`'...'`）と引用した名前（`"..."`・`` `...` ``）の中の `?` は数えません。
 - PostgreSQL の JSONB の演算子 `?` `?|` `?&` も値の置き場所として数えます。`jsonb_exists(列, 'キー')` のような関数で書きます。
 - MySQL の `\'` の逃がしは見ません。文字列の中の `'` は `''` と重ねて書きます。
@@ -128,6 +134,9 @@ Laravel の `->where('views', '>', 100)` は `where_op("views", ">", 100)` で�
 | `latest_by(col)` / `oldest_by(col)`              | 列を指定して並べる         |
 | `limit(n)` / `offset(n)` / `take(n)` / `skip(n)` | 件数                       |
 | `for_page(page, per_page)`                       | ページから件数を決める     |
+
+- `order_by_raw` と `select` / `add_select` には値を渡せません。引用の外に `?` を書くとエラーです。
+  JSONB のキーは `jsonb_exists(列, 'キー')` と書きます。
 
 **並びは一意にします。** 同じ値の行があると、ページの境目で同じ行が 2 回出ます。
 `latest()` に `order_by_desc("id")` を足すのが簡単です。
@@ -166,6 +175,7 @@ let sum = DB::table("posts").sum::<i64>("views").await?;                // Optio
 ```
 
 - `group_by` を付けた `count()` は、グループの数を返します。
+- `group_by` と `distinct()` の両方を付けると、`get()` が返す行（束ねて重なりを除いた行）の数です。数えられない形（下の「それ以外」）はエラーです。
 - 行が無いとき、`sum` / `avg` / `min` / `max` は `None` です。
 - `sum` などは `group_by` と一緒に使えません。
 
@@ -187,6 +197,7 @@ DB::table("posts").truncate().await?;   // 全部消す。採番も 1 に戻る
 
 - 値は `.into()` で渡します。`Option<T>` の `None` は NULL です。
 - `insert_many` の行は、列の名前と並びを最初の行とそろえます。
+- `insert_many` の `last_insert_id` は、SQLite では最後の行、MySQL では最初の行の番号です。
 - 主キーが `id` でない表の採番は、`insert_get_id_as(値, 主キーの名前)` で受け取ります。
 - 自動採番の無い表には `insert()` を使います。`insert_get_id` は MySQL でエラーになりますが、**行は入っています。**
 - **条件の無い `update` / `delete` は全行が対象です。**
@@ -290,6 +301,14 @@ tx.commit().await?;
 - `commit()` を呼ばずに `tx` を捨てると、取り消します。明示するなら `tx.rollback().await?` です。
 - **1 本ずつ `await` します。** 同時に 2 本投げると、2 本目がエラーです。
 - **1 本でも失敗したら、そのトランザクションはもう使えません。** `DB::begin()` からやり直します。
+- 失敗した後の `rollback()` は `Ok(())` を返します（中身はもう取り消してあります）。`commit()` はエラーです。
+
+```rust
+if let Err(e) = tx.table("posts").insert(&[("title", "x".into())]).await {
+    tx.rollback().await?; // 元のエラー `e` が隠れない
+    return Err(e);
+}
+```
 - SQLite では、ほかのトランザクションの途中なら、始めるところで 5 秒まで待ちます。
 - モデルを中で使うときは `save_using(&tx)` などを使います（[models.md](models.md)）。
 
@@ -392,7 +411,7 @@ pub fn config() -> DatabaseConfig {
 | `ilike` / `not ilike`               | エラー               | エラー                      | 使える                                         |
 | `<=>`                               | エラー               | 使える                      | エラー                                         |
 | 1 つの文に渡せる値の数              | 32,766               | 65,535                      | 65,535                                         |
-| `Affected` の `last_insert_id`      | `insert` で入る      | `insert` で入る             | 常に `None`。`returning` を付けて `DB::select` |
+| `Affected` の `last_insert_id`      | `insert` で入る。`do update` を含む文は `None` | `insert` で入る | 常に `None`。`returning` を付けて `DB::select` |
 | 読めない型                          | —                    | —                           | `uuid` / `money` / `inet` / 配列 / `interval`  |
 | 生の `Value` の真偽                 | `Int`                | `Bool`                      | `Bool`                                         |
 | 生の `Value` の `decimal`           | `Float`              | `Text`（末尾の 0 を落とす） | `Text`（末尾の 0 を落とす）                    |

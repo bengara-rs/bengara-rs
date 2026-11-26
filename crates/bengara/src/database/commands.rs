@@ -137,32 +137,145 @@ fn guard_seed_connection(command: &str, options: &Options, default: &str) -> Res
     )))
 }
 
+/// コマンドを実行する手順の 1 つ。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Step {
+    /// シーダーを既定ではない接続に流そうとしていないか（[`guard_seed_connection`]）。
+    GuardSeedConnection,
+    /// 本番で消す系を止める（[`guard_destructive`]）。
+    GuardDestructive,
+    /// つなぐ。
+    Connect,
+    /// 札を取る。
+    Lock,
+    /// 本体を流す。
+    Run,
+    /// 札を返す。本体が失敗しても、パニックしても、Ctrl-C で止めても通ります。
+    Unlock,
+}
+
+/// コマンドを実行する手順。[`execute`] はこの順に進みます。
+///
+/// 本番の保護は、つなぐ前・札を取る前に見ます。以前は札を取った後に見ていたので、
+/// 断る `migrate:fresh` でも札の表を作って札を出し入れしていました。
+/// 他のプロセスが札を持っていると、本番の保護ではなく札のエラーが出ていました。
+///
+/// 札を取るのは表を変えるコマンドだけです（[`NEEDS_LOCK`]。決定記録 #067）。
+fn plan(command: &str) -> Vec<Step> {
+    let mut steps = vec![
+        Step::GuardSeedConnection,
+        Step::GuardDestructive,
+        Step::Connect,
+    ];
+    if NEEDS_LOCK.contains(&command) {
+        steps.extend([Step::Lock, Step::Run, Step::Unlock]);
+    } else {
+        steps.push(Step::Run);
+    }
+    steps
+}
+
 async fn execute(
     command: &str,
     options: &Options,
-    migrations: &[Migration],
-    seeders: &[Seeder],
+    migrations: &'static [Migration],
+    seeders: &'static [Seeder],
 ) -> Result<()> {
-    guard_seed_connection(command, options, &super::database_config().default)?;
-    // 本番の保護は、つなぐ前・札を取る前に見る。以前は札を取った後に見ていたので、
-    // 断る `migrate:fresh` でも札の表を作って札を出し入れしていた。
-    // 他のプロセスが札を持っていると、本番の保護ではなく札のエラーが出ていた。
-    guard_destructive(command, options)?;
-    let migrator = Migrator::connect(options.database.as_deref()).await?;
-
-    // 複数のプロセスから同時に流さない（決定記録 #067）。
-    let locked = NEEDS_LOCK.contains(&command);
-    if locked {
-        migrator.lock().await?;
-    }
-    let result = run_one(command, options, migrations, seeders, &migrator).await;
-    if locked {
-        // 失敗しても札は返す。返せなかったときは、外し方を伝える。
-        if let Err(e) = migrator.unlock().await {
-            eprintln!("警告: 札を外せませんでした（{e}）。`migrate:unlock` で外せます");
+    let mut migrator: Option<std::sync::Arc<Migrator>> = None;
+    let mut result = Ok(());
+    for step in plan(command) {
+        match step {
+            Step::GuardSeedConnection => {
+                guard_seed_connection(command, options, &super::database_config().default)?
+            }
+            Step::GuardDestructive => guard_destructive(command, options)?,
+            Step::Connect => {
+                migrator = Some(std::sync::Arc::new(
+                    Migrator::connect(options.database.as_deref()).await?,
+                ));
+            }
+            Step::Lock => connected(&migrator)?.lock().await?,
+            // 失敗しても `?` で抜けない。後ろの `Unlock` まで進む。
+            Step::Run => {
+                result = run_guarded(
+                    command,
+                    options,
+                    migrations,
+                    seeders,
+                    std::sync::Arc::clone(connected(&migrator)?),
+                )
+                .await;
+            }
+            Step::Unlock => unlock_or_warn(connected(&migrator)?).await,
         }
     }
     result
+}
+
+/// つないだ後の手順で、つないだものを取り出す。`plan` の順なら必ず入っています。
+fn connected(migrator: &Option<std::sync::Arc<Migrator>>) -> Result<&std::sync::Arc<Migrator>> {
+    migrator
+        .as_ref()
+        .ok_or_else(|| Error::msg("つなぐ前に札や本体の手順に進みました（bengara の不具合です）"))
+}
+
+/// 札を返す。返せなかったときは、外し方を伝える。
+///
+/// 返している間にもう一度 Ctrl-C を押されたら、待たずに抜けます。DB が応えないときに、
+/// 止められなくなるのを避けるためです（Ctrl-C を受け取る仕掛けを入れた後は、
+/// 押しても OS がプロセスを止めなくなります）。
+async fn unlock_or_warn(migrator: &Migrator) {
+    tokio::select! {
+        returned = migrator.unlock() => {
+            if let Err(e) = returned {
+                eprintln!("警告: 札を外せませんでした（{e}）。`migrate:unlock` で外せます");
+            }
+        }
+        _ = tokio::signal::ctrl_c() => {
+            eprintln!("警告: 札を外す前に止めました。`migrate:unlock` で外せます");
+        }
+    }
+}
+
+/// 本体を別のタスクで流す。パニックと Ctrl-C を受け止めて、エラーとして返します。
+///
+/// どちらのときも、呼んだ側（[`execute`]）が続けて札を返します。
+/// 以前は同じタスクで流していたので、マイグレーションの `up` がパニックしたときと、
+/// Ctrl-C で止めたときに、札を返す処理まで進まず、札が残っていました。
+///
+/// Ctrl-C のときは、本体のタスクを止めてから返します。止めた所が
+/// トランザクションの途中なら、下回りが巻き戻します（MySQL の DDL のように
+/// 暗黙に確定するものは戻りません。強制終了と同じです）。
+async fn run_guarded(
+    command: &str,
+    options: &Options,
+    migrations: &'static [Migration],
+    seeders: &'static [Seeder],
+    migrator: std::sync::Arc<Migrator>,
+) -> Result<()> {
+    let (command, options) = (command.to_string(), options.clone());
+    let mut task =
+        tokio::spawn(
+            async move { run_one(&command, &options, migrations, seeders, &migrator).await },
+        );
+    tokio::select! {
+        joined = &mut task => match joined {
+            Ok(result) => result,
+            Err(error) if error.is_panic() => Err(Error::msg(
+                "実行中にパニックしました（上に出た内容を確かめてください）。札は返します",
+            )),
+            Err(error) => Err(Error::msg(format!("実行が止まりました: {error}"))),
+        },
+        _ = tokio::signal::ctrl_c() => {
+            task.abort();
+            // 止まりきるのを待つ。途中のトランザクションは、ここで落ちて巻き戻る。
+            let _ = task.await;
+            Err(Error::msg(
+                "Ctrl-C で止めました。途中まで流れたものがあるかもしれません。\
+                 migrate:status で確かめてください。札は返します",
+            ))
+        }
+    }
 }
 
 async fn run_one(
@@ -360,7 +473,7 @@ fn status_lines(rows: &[migrator::Status]) -> Vec<String> {
 }
 
 /// コマンドに渡せる指定。
-#[derive(Debug, Default, PartialEq, Eq)]
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
 struct Options {
     /// 使う接続の名前（`--database=`）。
     database: Option<String>,
@@ -621,17 +734,74 @@ mod tests {
     #[test]
     fn 本番の保護は札より先に見る() {
         // 断るコマンドで札の表を作ったり、札のエラーで本番の保護を隠したりしない。
-        // `execute` の中で、つなぐ・札を取るより前に呼んでいることを確かめる。
-        let source = include_str!("commands.rs");
-        let body = source
-            .split("async fn execute(")
-            .nth(1)
-            .and_then(|rest| rest.split("async fn run_one(").next())
-            .expect("execute がある");
-        let guard = body.find("guard_destructive(").expect("保護を呼ぶ");
-        let connect = body.find("Migrator::connect(").expect("つなぐ");
-        let lock = body.find(".lock()").expect("札を取る");
-        assert!(guard < connect && guard < lock, "{body}");
+        // `execute` は `plan` の順に進むので、手順の並びを直接確かめる。
+        let at = |steps: &[Step], step: Step| steps.iter().position(|s| *s == step);
+        for (command, _) in COMMANDS {
+            let steps = plan(command);
+            let guard = at(&steps, Step::GuardDestructive).expect("保護を見る");
+            let seed = at(&steps, Step::GuardSeedConnection).expect("シーダーの接続を見る");
+            let connect = at(&steps, Step::Connect).expect("つなぐ");
+            assert!(guard < connect && seed < connect, "{command}: {steps:?}");
+            if let Some(lock) = at(&steps, Step::Lock) {
+                assert!(guard < lock && connect < lock, "{command}: {steps:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn 札を取ったら本体の後で必ず返す() {
+        for (command, _) in COMMANDS {
+            let steps = plan(command);
+            if NEEDS_LOCK.contains(command) {
+                // 本体の失敗・パニック・Ctrl-C は `Run` の中でエラーにまとめるので、
+                // 必ず `Unlock` まで進む。
+                assert_eq!(
+                    &steps[steps.len() - 3..],
+                    [Step::Lock, Step::Run, Step::Unlock],
+                    "{command}"
+                );
+            } else {
+                assert!(!steps.contains(&Step::Lock), "{command}");
+                assert!(!steps.contains(&Step::Unlock), "{command}");
+                assert_eq!(steps.last(), Some(&Step::Run), "{command}");
+            }
+        }
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn マイグレーションがパニックしてもエラーで返り札を返せる() {
+        fn panicking_up(_schema: &mut super::super::Schema) {
+            panic!("up の中で落ちた");
+        }
+        fn noop_down(_schema: &mut super::super::Schema) {}
+
+        static PANICKING: &[Migration] = &[Migration {
+            name: "2026_01_01_000000_panics",
+            up: panicking_up,
+            down: noop_down,
+        }];
+        let _db = crate::testing::refresh_database().await;
+        let migrator = std::sync::Arc::new(Migrator::connect(None).await.expect("つながる"));
+        // ほかのテストが残した札を外してから取る。
+        migrator.clear_lock().await.expect("外せる");
+        migrator.lock().await.expect("札が取れる");
+
+        // 以前は同じタスクで流していたので、パニックがそのまま抜けて札が残った。
+        let message = run_guarded(
+            "migrate",
+            &Options::default(),
+            PANICKING,
+            &[],
+            std::sync::Arc::clone(&migrator),
+        )
+        .await
+        .expect_err("パニックはエラーになる")
+        .to_string();
+        assert!(message.contains("パニック"), "{message}");
+
+        unlock_or_warn(&migrator).await;
+        assert_eq!(migrator.lock_holder().await.unwrap(), None, "札は返る");
     }
 
     #[test]

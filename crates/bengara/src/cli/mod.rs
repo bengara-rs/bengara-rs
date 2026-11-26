@@ -9,7 +9,7 @@ mod serve;
 
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
-use std::process::{ExitStatus, Stdio};
+use std::process::{Command, ExitStatus, Stdio};
 
 use self::cargo_toml::CargoToml;
 use crate::error::{Error, Result};
@@ -106,16 +106,25 @@ pub(crate) fn init_here() -> Result<()> {
 /// プロジェクトのルート。cargo が渡す `CARGO_MANIFEST_DIR` を使います。
 ///
 /// サブディレクトリから `cargo artisan` を実行しても、正しいルートになります。
+///
+/// 空の値は「無い」と見ます（`paths` の基準ディレクトリの決め方と同じ）。
 fn project_root() -> PathBuf {
-    if let Some(dir) = std::env::var_os("CARGO_MANIFEST_DIR") {
+    if let Some(dir) = crate::paths::set_var_os("CARGO_MANIFEST_DIR") {
         return PathBuf::from(dir);
     }
     std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
 }
 
+/// `cargo artisan list` から本体の `list` を呼ぶときに付ける環境変数。値は `1`。
+///
+/// 本体はこれを見て、`artisan` の一覧と重なるもの（`serve`・`init`・`version`・`help`）と、
+/// 「開発用のコマンドは `cargo artisan list` に出ます」の案内を出さないようにします。
+/// 引数ではなく環境変数で渡すのは、古い本体（これを知らない版）でも `list` がそのまま動くためです。
+pub(crate) const ARTISAN_LIST_ENV: &str = "BENGARA_ARTISAN_LIST";
+
 /// `migrate` などの実行時コマンドを本体に渡す。
 fn delegate(root: &Path, args: &[String]) -> Result<()> {
-    let status = spawn_app(root, args, false)?;
+    let status = spawn_app(root, args)?;
     if status.success() {
         Ok(())
     } else {
@@ -125,32 +134,60 @@ fn delegate(root: &Path, args: &[String]) -> Result<()> {
 
 /// `list` のときだけ使う、本体への受け渡し。
 ///
-/// アプリがビルドできないときは、何も言わずに諦めます。アプリが壊れていても
-/// `artisan` が動くことが、`artisan` を別のバイナリにしている理由だからです。
+/// アプリがビルドできないときは、ビルドのエラーを出さずに 1 行だけ知らせて終えます。
+/// アプリが壊れていても `artisan` が動くことが、`artisan` を別のバイナリにしている
+/// 理由だからです（終了コードも 0 のまま）。
+///
+/// ビルドの進み具合は出しません（エラーと同じ標準エラーに出るため）。代わりに、
+/// 待つ理由を先に 1 行出します。以前は何も出さず、初めてのビルドでは数分のあいだ
+/// 止まって見えました。
 fn delegate_list(root: &Path) {
-    let _ = spawn_app(root, &["list".to_string()], true);
+    eprintln!("{LIST_NOTICE}");
+    let succeeded = list_command(root)
+        .status()
+        .is_ok_and(|status| status.success());
+    if !succeeded {
+        eprintln!("{LIST_FAILED}");
+    }
+}
+
+/// 本体の一覧を待つ間に出す 1 行。
+const LIST_NOTICE: &str =
+    "（本体のコマンドを集めています。本体のビルドが要るときは、しばらくかかります）";
+
+/// 本体の一覧を出せなかったときの 1 行。
+const LIST_FAILED: &str = "本体をビルドできなかったので、本体のコマンドは出せませんでした。\
+                           理由は `cargo build` で確かめてください";
+
+/// `list` を本体に渡すコマンド。ビルドのエラーは出さず、本体に「artisan から呼んだ」と伝えます。
+fn list_command(root: &Path) -> Command {
+    let mut command = app_command(root, &["list".to_string()]);
+    command.env(ARTISAN_LIST_ENV, "1").stderr(Stdio::null());
+    command
 }
 
 /// 本体（`cargo run -- ...`）を動かして、終了の状態を返す。
-///
-/// `quiet` のときは、ビルドの失敗を画面に出しません。
-fn spawn_app(root: &Path, args: &[String], quiet: bool) -> Result<ExitStatus> {
-    let cargo = cargo_command();
+fn spawn_app(root: &Path, args: &[String]) -> Result<ExitStatus> {
+    app_command(root, args).status().map_err(|e| {
+        Error::msg(format!(
+            "{} を実行できません: {e}",
+            cargo_command().display()
+        ))
+    })
+}
+
+/// 本体（`cargo run -- ...`）を動かすコマンド。
+fn app_command(root: &Path, args: &[String]) -> Command {
     let manifest = root.join("Cargo.toml");
     // 読めないときは `--bin` を付けずに進む。cargo が同じファイルを読んで理由を出す。
     let bin = CargoToml::load(&manifest).ok().and_then(|m| main_bin(&m));
-    std::process::Command::new(&cargo)
+    let mut command = Command::new(cargo_command());
+    command
         // `serve` と同じく、プロジェクトのルートで動かす。`--manifest-path` だけだと
         // 呼び出し元のカレントディレクトリが本体に渡ってしまう。
         .current_dir(root)
-        .args(run_arguments(&manifest, bin.as_deref(), args))
-        .stderr(if quiet {
-            Stdio::null()
-        } else {
-            Stdio::inherit()
-        })
-        .status()
-        .map_err(|e| Error::msg(format!("{} を実行できません: {e}", cargo.display())))
+        .args(run_arguments(&manifest, bin.as_deref(), args));
+    command
 }
 
 /// 本体（`main.rs`）の bin の名前。`Cargo.toml` の `[[bin]]` から読みます。
@@ -294,6 +331,39 @@ mod tests {
                 "--force"
             ]
         );
+    }
+
+    #[test]
+    fn artisanの一覧から呼ぶ本体のlistには印を付ける() {
+        // 本体はこの印を見て、artisan の一覧と重なるもの（serve・init など）を出さない。
+        let root = std::env::temp_dir().join(format!("bengara-cli-list-{}", std::process::id()));
+        let command = list_command(&root);
+        let envs: Vec<_> = command.get_envs().collect();
+        assert_eq!(
+            envs,
+            [(
+                std::ffi::OsStr::new(ARTISAN_LIST_ENV),
+                Some(std::ffi::OsStr::new("1"))
+            )]
+        );
+        let args: Vec<String> = command
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(args.last().map(String::as_str), Some("list"));
+        assert_eq!(command.get_current_dir(), Some(root.as_path()));
+
+        // ほかのコマンドの受け渡しには付けない。
+        let command = app_command(&root, &["migrate".to_string()]);
+        assert_eq!(command.get_envs().count(), 0);
+    }
+
+    #[test]
+    fn 一覧を待つ間と失敗したときに1行ずつ知らせる() {
+        // 以前は何も出さず、初めてのビルドでは止まって見えた。
+        assert!(LIST_NOTICE.contains("しばらくかかります"));
+        assert!(LIST_FAILED.contains("cargo build"));
+        assert!(!LIST_FAILED.contains('\n'));
     }
 
     #[test]

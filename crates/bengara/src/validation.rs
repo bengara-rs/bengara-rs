@@ -1478,8 +1478,15 @@ fn looks_like_url(value: &str) -> bool {
 
 /// メールアドレスらしい形か。
 ///
-/// 完全な判定はしません（RFC どおりに書くと、実在しないものまで通ります）。
-/// `@` が1つあり、前後が空でなく、後ろに `.` があることだけを見ます。
+/// 完全な判定はしません（RFC どおりに書くと、実在しないものまで通ります）。見るのは次のことだけです。
+///
+/// | 場所 | 見ること |
+/// |---|---|
+/// | 全体 | `@` が 1 つ。空白を含まない |
+/// | `@` の前 | 空でない。`, ; < > ( ) [ ] \ "` を含まない。`.` で始まらず、終わらず、続かない |
+/// | `@` の後ろ | `.` で区切った各部分が空でない。英数字・`-`・ASCII 以外の文字（日本語のドメイン）だけ。`-` で始まらず、終わらない。最後の部分は 2 バイト以上 |
+///
+/// `a@x.com,b@y.com`（複数の宛先）や `a@b.c<x>` のような、ヘッダーに混ぜられる形を通さないためです。
 fn looks_like_email(value: &str) -> bool {
     if value.contains(char::is_whitespace) {
         return false;
@@ -1490,10 +1497,25 @@ fn looks_like_email(value: &str) -> bool {
     if local.is_empty() || domain.contains('@') {
         return false;
     }
-    let Some((host, tld)) = domain.rsplit_once('.') else {
+    let local_ok = !local.contains([',', ';', '<', '>', '(', ')', '[', ']', '\\', '"'])
+        && !local.starts_with('.')
+        && !local.ends_with('.')
+        && !local.contains("..");
+    if !local_ok {
         return false;
+    }
+    let labels: Vec<&str> = domain.split('.').collect();
+    let label_ok = |label: &&str| {
+        !label.is_empty()
+            && !label.starts_with('-')
+            && !label.ends_with('-')
+            && label
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '-' || !c.is_ascii())
     };
-    !host.is_empty() && tld.len() >= 2 && !domain.starts_with('.') && !domain.ends_with('.')
+    labels.len() >= 2
+        && labels.iter().all(label_ok)
+        && labels.last().is_some_and(|tld| tld.len() >= 2)
 }
 
 /// [`Validated::to_typed`] の読み手。検査を通った値（文字列の表）を serde で型に読みます。
@@ -2069,13 +2091,44 @@ mod tests {
 
     #[test]
     fn メールアドレスの形() {
-        for ok in ["a@example.com", "a.b+c@sub.example.co.jp"] {
+        for ok in [
+            "a@example.com",
+            "a.b+c@sub.example.co.jp",
+            "o'neil_x-y@my-host.example",
+            "ユーザー@例え.jp",
+            "a@xn--r8jz45g.jp",
+        ] {
             assert!(
                 errors_of(&input(&[("e", ok)]), &[("e", "email")]).is_empty(),
                 "{ok} は通るはず"
             );
         }
-        for ng in ["a", "a@", "@b.com", "a@b", "a b@c.com", "a@@b.com", "a@b."] {
+        for ng in [
+            "a",
+            "a@",
+            "@b.com",
+            "a@b",
+            "a b@c.com",
+            "a@@b.com",
+            "a@b.",
+            // 以前は通っていた形。
+            "a@b..cc",
+            "a@-x.com",
+            "a@x-.com",
+            "a@.x.com",
+            "a@x.com,b@y.com",
+            "a@b.c<x>",
+            "a<b>@x.com",
+            "\"a\"@x.com",
+            "a;b@x.com",
+            "a(b)@x.com",
+            "a[b]@x.com",
+            "a\\b@x.com",
+            ".a@x.com",
+            "a.@x.com",
+            "a..b@x.com",
+            "a@x_y.com",
+        ] {
             assert!(
                 !errors_of(&input(&[("e", ng)]), &[("e", "email")]).is_empty(),
                 "{ng} は弾くはず"

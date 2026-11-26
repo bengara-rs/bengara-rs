@@ -349,7 +349,7 @@ impl Blueprint {
     fn collect_errors(&mut self) -> Vec<String> {
         let table = self.table.clone();
         let alter = self.mode == Mode::Alter;
-        let mut errors = Vec::new();
+        let mut errors = self.name_errors();
 
         self.foreigns.retain(|foreign| {
             if !foreign.on.is_empty() {
@@ -427,6 +427,58 @@ impl Blueprint {
             column.default = None;
         }
 
+        errors
+    }
+
+    /// 表名・列名の検査。外れた名前を 1 つずつエラーにします。
+    ///
+    /// 名前は `grammar::quote` を通りますが、空白・`(`・`*` を含む名前は式として
+    /// そのまま置かれ、`.` で分けられます。`t.string("first name")` は
+    /// `first name varchar(255)` になり、壊れた DDL か別の意味の文になっていました。
+    /// 流す前に止めます。
+    ///
+    /// | 名前                                  | 使える文字                                     |
+    /// |---------------------------------------|------------------------------------------------|
+    /// | 表（`create` / `table` の名前・`on`） | 英数字（日本語も可）と `_` `-`。`.` で区切れる |
+    /// | 列（列・索引・主キー・外部キーの列）  | 英数字（日本語も可）と `_` `-`                 |
+    ///
+    /// `raw_column` の型・`default_raw` は SQL をそのまま置くので、ここでは見ません。
+    fn name_errors(&self) -> Vec<String> {
+        let mut errors = Vec::new();
+        if let Some(message) = table_name_error("create / table の表", &self.table) {
+            errors.push(message);
+        }
+        let table = &self.table;
+        let mut check_column = |place: &str, name: &str| {
+            if let Some(message) = column_name_error(&format!("{table} の {place}"), name) {
+                errors.push(message);
+            }
+        };
+        for column in &self.columns {
+            check_column("列", &column.name);
+        }
+        for index in &self.indexes {
+            for column in &index.columns {
+                check_column("index / unique の列", column);
+            }
+        }
+        for column in &self.primary {
+            check_column("primary の列", column);
+        }
+        for foreign in &self.foreigns {
+            check_column("foreign の列", &foreign.column);
+            check_column("references の列", &foreign.references);
+        }
+        for foreign in &self.foreigns {
+            // `.on(表名)` が空のときは、下の検査が別の文で知らせる。
+            if foreign.on.is_empty() {
+                continue;
+            }
+            if let Some(message) = table_name_error(&format!("{table} の on の表"), &foreign.on)
+            {
+                errors.push(message);
+            }
+        }
         errors
     }
 
@@ -945,13 +997,27 @@ impl Schema {
 
     /// 表を変える。足せるのは列と索引と外部キーだけです。
     ///
-    /// 外部キーは SQLite では足せません（`alter table` に `add constraint` がない）。
-    /// 主キーはどのデータベースでも足せません。どちらも組み立てのときに警告を出します。
+    /// 次のものは、ここでは**実行の前のエラー**になります（SQL を 1 本も流しません）。
     ///
-    /// `id()` と列の `.primary()` はここでは使えません。実行すれば失敗するので、
-    /// 警告ではなく**実行の前のエラー**にします。
+    /// - 外部キー（`foreign()`）を SQLite で足す。SQLite の `alter table` に `add constraint` がない。
+    /// - 主キー（表の `primary(&[..])`・列の `.primary()`・`id()`）を足す。どのデータベースでも、
+    ///   後から足す移植できる書き方がない。
     pub fn table(&mut self, table: &str, build: impl FnOnce(&mut Blueprint)) {
         self.run(table, Mode::Alter, build);
+    }
+
+    /// 表の名前を確かめる。外れていたら、流す前のエラーとして積みます。
+    fn check_table(&mut self, place: &str, name: &str) {
+        if let Some(message) = table_name_error(place, name) {
+            self.errors.push(message);
+        }
+    }
+
+    /// 列の名前を確かめる。外れていたら、流す前のエラーとして積みます。
+    fn check_column(&mut self, place: &str, name: &str) {
+        if let Some(message) = column_name_error(place, name) {
+            self.errors.push(message);
+        }
     }
 
     fn run(&mut self, table: &str, mode: Mode, build: impl FnOnce(&mut Blueprint)) {
@@ -964,12 +1030,14 @@ impl Schema {
 
     /// 表を消す。
     pub fn drop(&mut self, table: &str) {
+        self.check_table("drop の表", table);
         self.statements
             .push(format!("drop table {}", grammar::quote(self.driver, table)));
     }
 
     /// あれば表を消す。
     pub fn drop_if_exists(&mut self, table: &str) {
+        self.check_table("drop_if_exists の表", table);
         self.statements.push(format!(
             "drop table if exists {}",
             grammar::quote(self.driver, table)
@@ -978,6 +1046,8 @@ impl Schema {
 
     /// 表の名前を変える。
     pub fn rename(&mut self, from: &str, to: &str) {
+        self.check_table("rename の元の表", from);
+        self.check_table("rename の新しい表", to);
         self.statements.push(format!(
             "alter table {} rename to {}",
             grammar::quote(self.driver, from),
@@ -987,6 +1057,8 @@ impl Schema {
 
     /// 列を消す。
     pub fn drop_column(&mut self, table: &str, column: &str) {
+        self.check_table("drop_column の表", table);
+        self.check_column("drop_column の列", column);
         self.statements.push(format!(
             "alter table {} drop column {}",
             grammar::quote(self.driver, table),
@@ -1020,9 +1092,12 @@ impl Schema {
     ///   （`index(&["b_c"])` と `index(&["b", "c"])` など）。名前の後ろにハッシュが
     ///   付くので、落とすときだけでは同じ名前を作れません。
     pub fn drop_index(&mut self, table: &str, columns: &[&str]) {
+        for column in columns {
+            self.check_column("drop_index の列", column);
+        }
         let columns: Vec<String> = columns.iter().map(|c| (*c).to_string()).collect();
         let name = constraint_name_for(table, &columns, index_suffix(false), |_| false);
-        self.drop_index_named(table, &name);
+        self.push_drop_index(table, &name);
     }
 
     /// 一意索引を落とす（Laravel の `dropUnique`）。
@@ -1038,15 +1113,29 @@ impl Schema {
     /// その頃の名前はデータベースが決めています（PostgreSQL は `{表}_{列}_key`、
     /// MySQL は列の名前）。[`Schema::drop_index_named`] か [`Schema::raw`] で落としてください。
     pub fn drop_unique(&mut self, table: &str, columns: &[&str]) {
+        for column in columns {
+            self.check_column("drop_unique の列", column);
+        }
         let columns: Vec<String> = columns.iter().map(|c| (*c).to_string()).collect();
         let name = constraint_name_for(table, &columns, index_suffix(true), |_| false);
-        self.drop_index_named(table, &name);
+        self.push_drop_index(table, &name);
     }
 
     /// 名前を直に指定して索引を落とす。
     ///
     /// 出す SQL は [`Schema::drop_index`] と同じです。
     pub fn drop_index_named(&mut self, table: &str, name: &str) {
+        // 索引の名前は、PostgreSQL ではスキーマ名を付けて書けるので、表と同じ決まりにする。
+        self.check_table("drop_index の索引", name);
+        self.push_drop_index(table, name);
+    }
+
+    /// 索引を落とす文を足す。表の名前はここで確かめます。
+    ///
+    /// `drop_index` / `drop_unique` が列から組み立てた名前は、表と列を確かめてあるので
+    /// 名前としては見ません。同じ間違いを 2 回知らせないためです。
+    fn push_drop_index(&mut self, table: &str, name: &str) {
+        self.check_table("drop_index の表", table);
         let driver = self.driver;
         self.statements.push(match driver {
             // MySQL に `drop index if exists` はありません。
@@ -1081,6 +1170,44 @@ impl Schema {
     pub(crate) fn take_errors(&mut self) -> Vec<String> {
         std::mem::take(&mut self.errors)
     }
+}
+
+/// 移行で使える名前の 1 つぶん（`.` で区切った 1 つ）。空は通しません。
+///
+/// 英数字（日本語も可）と `_` に加えて、`-` も通します。クエリビルダの検査
+/// （`grammar::is_plain_identifier`）より 1 文字だけ広いのは、`-` を含む表名を
+/// 索引の名前づけ（`-` を `_` にする）で扱ってきたためです。`-` は引用符でくくれば
+/// 壊れません。空白・`(`・`*`・`;`・引用符などは通しません。
+fn is_schema_name_part(part: &str) -> bool {
+    !part.is_empty()
+        && part
+            .chars()
+            .all(|c| c.is_alphanumeric() || c == '_' || c == '-')
+}
+
+/// 表の名前として使えないときの文。使えるなら `None`。
+///
+/// `.` でデータベース名・スキーマ名を付けられます。
+fn table_name_error(place: &str, name: &str) -> Option<String> {
+    let usable = name.trim().split('.').all(is_schema_name_part);
+    (!usable).then(|| {
+        format!(
+            "{place}の名前 `{name}` は使えません。英数字と `_` `-` `.` だけが使えます\
+             （空白や記号を含む名前は、壊れた SQL になるため）"
+        )
+    })
+}
+
+/// 列の名前として使えないときの文。使えるなら `None`。
+///
+/// `.` は付けられません（`"a"."b"` になって壊れるため）。
+fn column_name_error(place: &str, name: &str) -> Option<String> {
+    (!is_schema_name_part(name.trim())).then(|| {
+        format!(
+            "{place}の名前 `{name}` は使えません。英数字と `_` `-` だけが使えます\
+             （空白や記号を含む名前は、壊れた SQL になるため）"
+        )
+    })
 }
 
 /// `on_delete` / `on_update` に書ける動き。
@@ -1603,6 +1730,53 @@ mod tests {
         assert!(errors[0].contains("comments.post_id"), "{}", errors[0]);
         assert!(errors[0].contains(".on(表名)"), "{}", errors[0]);
         // 取り出したら空になる。
+        assert!(schema.take_errors().is_empty());
+    }
+
+    #[test]
+    fn 使えない表名と列名は実行の前のエラーになる() {
+        // 以前は空白入りの名前が式として素通しされ、壊れた DDL になっていた。
+        let mut schema = sqlite();
+        schema.create("my posts", |t| {
+            t.id();
+            t.string("first name");
+            t.string("a.b");
+            t.index(&["x y"]);
+            t.foreign_id("user_id");
+            t.foreign("user_id").on("bad table");
+        });
+        let errors = schema.take_errors();
+        assert_eq!(errors.len(), 5, "{errors:?}");
+        assert!(errors[0].contains("`my posts`"), "{}", errors[0]);
+        assert!(errors[1].contains("`first name`"), "{}", errors[1]);
+        assert!(errors[2].contains("`a.b`"), "{}", errors[2]);
+        assert!(errors[3].contains("`x y`"), "{}", errors[3]);
+        assert!(errors[4].contains("`bad table`"), "{}", errors[4]);
+
+        // 表の外の操作も同じ。
+        let mut schema = sqlite();
+        schema.drop("a b");
+        schema.drop_if_exists("c(d");
+        schema.rename("posts", "new posts");
+        schema.drop_column("posts", "x y");
+        schema.drop_index("posts", &["x y"]);
+        schema.drop_index_named("posts", "idx; drop");
+        assert_eq!(schema.take_errors().len(), 6);
+
+        // 日本語、`_`、データベース名付きの表、`raw_column` の型は通る。
+        let mut schema = sqlite();
+        schema.create("main.記事", |t| {
+            t.id();
+            t.string("題名");
+            t.raw_column("geo_point", "point not null");
+            t.index(&["題名"]);
+        });
+        schema.drop_index_named("posts", "public.posts_title_index");
+        schema.drop_if_exists("main.記事");
+        // `-` は引用符でくくれば壊れないので通す（索引の名前では `_` に直す）。
+        schema.create("user-profiles", |t| {
+            t.string("display-name");
+        });
         assert!(schema.take_errors().is_empty());
     }
 

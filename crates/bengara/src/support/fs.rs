@@ -194,8 +194,11 @@ pub(crate) fn rename_with_retry(from: &Path, to: &Path) -> std::io::Result<()> {
 ///
 /// | 見るもの | 理由 |
 /// |---|---|
-/// | `PermissionDenied` | Windows は「別のプロセスが使用中」をこれで返すことがある |
-/// | OS の 32・33 番 | Windows の共有違反・錠違反。標準ライブラリが種類を付けない |
+/// | `PermissionDenied`（Windows だけ） | Windows は「別のプロセスが使用中」をこれで返すことがある |
+/// | OS の 32・33 番（Windows だけ） | Windows の共有違反・錠違反。標準ライブラリが種類を付けない |
+///
+/// **Unix の `PermissionDenied` はやり直しません。** Unix では権限不足そのもので、
+/// 待っても結果が変わらないためです。
 ///
 /// 「`NotFound` 以外は全部やり直す」にしていたころは、権限不足やディスク満杯の
 /// ような**待っても結果が変わらない失敗**でも 5 回 × 10ms 待ってから失敗して
@@ -204,7 +207,7 @@ pub(crate) fn rename_with_retry(from: &Path, to: &Path) -> std::io::Result<()> {
 /// 32・33 番を番号で見るのは、標準ライブラリの `ErrorKind::Uncategorized` が
 /// まだ名前で書けないためです。
 fn is_busy_error(e: &std::io::Error) -> bool {
-    e.kind() == std::io::ErrorKind::PermissionDenied || is_sharing_violation(e)
+    (cfg!(windows) && e.kind() == std::io::ErrorKind::PermissionDenied) || is_sharing_violation(e)
 }
 
 /// Windows の共有違反（32 番）・錠違反（33 番）か。
@@ -395,8 +398,11 @@ mod tests {
     fn やり直すのは使用中の失敗だけ() {
         use std::io::{Error as IoError, ErrorKind};
 
-        // 待てば変わるかもしれない失敗。
-        assert!(is_busy_error(&IoError::from(ErrorKind::PermissionDenied)));
+        // 待てば変わるかもしれない失敗（Windows の使用中）。Unix では権限不足そのもの。
+        assert_eq!(
+            is_busy_error(&IoError::from(ErrorKind::PermissionDenied)),
+            cfg!(windows)
+        );
         // 待っても変わらない失敗。やり直すと 5 回 × 10ms ぶん遅れるだけ。
         for kind in [
             ErrorKind::NotFound,

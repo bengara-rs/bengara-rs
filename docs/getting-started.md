@@ -18,9 +18,9 @@ bengara = { version = "0.1", features = ["sqlite"] }
 
 # 取得したソースの場所を書く（下は myapp の隣に置いた例）
 [patch.crates-io]
-bengara = { path = "../bengara/crates/bengara" }
-bengara-build = { path = "../bengara/crates/bengara-build" }
-bengara-macros = { path = "../bengara/crates/bengara-macros" }
+bengara = { path = "../bengara-rs/crates/bengara" }
+bengara-build = { path = "../bengara-rs/crates/bengara-build" }
+bengara-macros = { path = "../bengara-rs/crates/bengara-macros" }
 ```
 
 - `bengara-build` は、手順 3 の `init` が `[build-dependencies]` に足します。
@@ -152,13 +152,14 @@ cargo build --release --bin myapp
 
 ## つまずいたとき
 
-| 起きたこと                                 | 直し方                                                                  |
-|--------------------------------------------|-------------------------------------------------------------------------|
-| `cargo artisan` が「そんなコマンドはない」 | 下の「cargo artisan の別名」を見る                                      |
-| `src/main.rs` が消えない                   | 下の「src/main.rs が消えない」を見る                                    |
-| `src/` に置いたファイルが見つからない      | `src/` は読まない。入口は直下の `main.rs` と `artisan.rs`               |
-| ポートが使われている                       | ポートを空けてから、ファイルを 1 つ保存する。`serve` がもう一度起動する |
-| 実行ファイルを直接動かすと起動しない       | プロジェクトのルートで動かす（下）                                      |
+| 起きたこと                                           | 直し方                                                                  |
+|------------------------------------------------------|-------------------------------------------------------------------------|
+| `cargo artisan` が「そんなコマンドはない」           | 下の「cargo artisan の別名」を見る                                      |
+| `src/main.rs` が消えない                             | 下の「src/main.rs が消えない」を見る                                    |
+| `init` が「パッケージ名を `artisan` にはできません」 | `Cargo.toml` の `[package]` の `name` を別の名前にする                  |
+| `src/` に置いたファイルが見つからない                | `src/` は読まない。入口は直下の `main.rs` と `artisan.rs`               |
+| ポートが使われている                                 | ポートを空けてから、ファイルを 1 つ保存する。`serve` がもう一度起動する |
+| 実行ファイルを直接動かすと起動しない                 | プロジェクトのルートで動かす（下）                                      |
 
 ### cargo artisan の別名
 
@@ -179,6 +180,7 @@ artisan = ["run", "-q", "--bin", "artisan", "--"]
 
 - 自分のコードが入っているときは、`app/` などへ手で移してから `src/` を消します。
 - `Cargo.toml` の `[[bin]]` が `src/main.rs` を指しているときも消しません。その `[[bin]]` を直します。
+- `Cargo.toml` を書けなかったとき（読み取り専用など）も消しません。書けるようにしてから、もう一度 `init` を実行します。
 
 ### 実行ファイルを直接動かすとき
 

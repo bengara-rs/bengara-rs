@@ -37,6 +37,7 @@ fn build(config: CorsConfig) -> bengara::Application {
                 Route::get("/api/invalid", invalid);
                 Route::get("/api/broken", broken);
                 Route::get("/web", index);
+                Route::post("/api/small", index).max_body(4);
             })
         })
         .with_middleware(move |m| {
@@ -188,6 +189,35 @@ fn 資格情報を許すときは要求の値をそのまま返す() {
             .assert_header("access-control-allow-origin", ORIGIN)
             .assert_header("access-control-allow-credentials", "true")
             .assert_header("access-control-expose-headers", "X-Total");
+    });
+}
+
+#[test]
+fn 本文を受け取れなかった応答にも見出しが付く() {
+    // 以前は本文のエラーがミドルウェアを通らず、ブラウザの JavaScript から 413 が読めなかった。
+    // `VerifyCsrfToken` も通るが、トークンが無くても 419 にはしない（ハンドラは動かない）。
+    test(credentials_app, |client| async move {
+        let response = client
+            .send(
+                "POST",
+                "/api/small",
+                b"12345".to_vec(),
+                &[("origin", ORIGIN)],
+            )
+            .await;
+        assert_eq!(response.status(), 413);
+        assert_eq!(response.header("access-control-allow-origin"), Some(ORIGIN));
+        // 本文を受け取れたら、今までどおり CSRF の確認で 419。
+        let response = client
+            .send(
+                "POST",
+                "/api/small",
+                b"1234".to_vec(),
+                &[("origin", ORIGIN)],
+            )
+            .await;
+        assert_eq!(response.status(), 419);
+        assert_eq!(response.header("access-control-allow-origin"), Some(ORIGIN));
     });
 }
 

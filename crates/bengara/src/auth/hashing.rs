@@ -482,10 +482,20 @@ impl Hash {
     ///
     /// 同時に計算する数は `HASH_MAX_CONCURRENCY` までです。超えた分は空くまで待ちます。
     ///
-    /// **`Err` になるのは裏のスレッドが落ちたときだけです。** 長さは断りません。
-    /// [`make`](Hash::make) と同じで、**登録の検査に `max:1024` が必ず要ります。**
-    /// 超えた値で作ったハッシュは [`check`](Hash::check) が必ず偽を返します。
+    /// **4096 バイトを超える平文は、計算せずに `Err` を返します。**
+    /// その値で作ったハッシュは [`check`](Hash::check) が必ず偽を返すので、
+    /// 作っても二度とログインできません。`make` と違って `Result` を返せるので、ここで断ります。
+    /// それでも、利用者に分かる文で返せるよう、**登録の検査に `max:1024` を付けてください。**
+    ///
+    /// ほかに `Err` になるのは、裏のスレッドが落ちたときです。
     pub async fn make_async(password: &str) -> Result<String> {
+        if password.len() > MAX_PASSWORD_BYTES {
+            return Err(crate::Error::msg(format!(
+                "パスワードが長すぎます（{} バイト、上限は {MAX_PASSWORD_BYTES} バイト）。\
+                 登録の検査に `max:1024`（文字数）を足してください",
+                password.len()
+            )));
+        }
         let password = password.to_string();
         run_hashing(move || Self::make(&password))
             .await
@@ -657,6 +667,13 @@ fn check_pbkdf2(password: &str, hashed: &str, policy: Policy, seen: &AtomicU8) -
     // 空回しが同じだけ計算できるよう、方式の印と、保存されていた回数の最大を覚えておく。
     let marks = seen.fetch_or(SEEN_PBKDF2, Ordering::Relaxed) | SEEN_PBKDF2;
     MAX_SEEN_ITERATIONS.fetch_max(parsed.iterations, Ordering::Relaxed);
+    let configured = iterations();
+    if parsed.iterations > configured {
+        warn_heavier_than_config(
+            &format!("PBKDF2 {} 回", parsed.iterations),
+            &format!("{configured} 回"),
+        );
+    }
     // 少ない回数で保存された値も、空回しと同じ回数ぶんの時間をかける。
     let spend = parsed.iterations.max(dummy_iterations());
     let digest =
@@ -695,6 +712,12 @@ fn check_argon2id(password: &str, hashed: &str, policy: Policy, seen: &AtomicU8)
     let marks = seen.fetch_or(SEEN_ARGON2ID, Ordering::Relaxed) | SEEN_ARGON2ID;
     // 空回しが同じだけ計算できるよう、保存されていた m・t・p の最大を覚えておく。
     remember_argon(stored.memory, stored.time, stored.threads);
+    if stored.memory > policy.argon.memory || stored.time > policy.argon.time {
+        warn_heavier_than_config(
+            &format!("Argon2id m={}, t={}", stored.memory, stored.time),
+            &format!("m={}, t={}", policy.argon.memory, policy.argon.time),
+        );
+    }
     let ok = argon::verify(password, &stored);
     // 弱い値で保存されていても、空回しと同じだけの時間をかける。
     let target = argon_burn_config(policy.argon, seen_argon());
@@ -723,6 +746,29 @@ fn check_argon2id(password: &str, _hashed: &str, policy: Policy, seen: &AtomicU8
     }
     burn_unreadable(password, policy, seen);
     false
+}
+
+/// 設定より重い保存値を照合したことを知らせたか。プロセスで 1 回だけ知らせます。
+static HEAVIER_WARNED: AtomicBool = AtomicBool::new(false);
+
+/// 保存値が設定より重いことを、プロセスで 1 回だけ知らせる。
+///
+/// 時間をそろえるため、照合した値の重さの最大を覚えて、空回しと軽い値の照合を
+/// それに合わせています（[`MAX_SEEN_ITERATIONS`] など）。重い値を 1 件でも照合すると、
+/// プロセスを起動し直すまで、**すべてのログインがその重さぶん遅くなります。**
+/// 黙っていると原因に気づけないので知らせます。
+///
+/// PBKDF2 の方式では、設定より重い値を作り直しません（`needs_rehash` が偽）。
+/// 直すには、その利用者のパスワードを作り直すか、設定を上げてください。
+fn warn_heavier_than_config(stored: &str, configured: &str) {
+    if HEAVIER_WARNED.swap(true, Ordering::Relaxed) {
+        return;
+    }
+    tracing::warn!(
+        "保存されているパスワードが設定より重い値です（保存 {stored}・設定 {configured}）。\
+         時間をそろえるため、プロセスを起動し直すまで、すべての照合がこの重さぶんかかります。\
+         その値を作り直すか、設定を見直してください"
+    );
 }
 
 /// フラグなしで `$argon2id$` を照合したときにエラーを出した回数（テスト用）。
@@ -1875,6 +1921,33 @@ mod tests {
         let stored = Hash::make_async("ひみつの言葉").await.unwrap();
         assert!(Hash::check_async("ひみつの言葉", &stored).await.unwrap());
         assert!(!Hash::check_async("ちがう言葉", &stored).await.unwrap());
+    }
+
+    #[test]
+    fn 設定より重い値を照合したら知らせる() {
+        // 重い値を 1 件照合すると、起動し直すまで全部のログインが重くなる。
+        // 黙っていると原因に気づけない。
+        install_test_iterations();
+        assert!(iterations() < 2_000, "テストでは回数を下げている");
+        let stored = Hash::make_with("ひみつ", 2_000);
+        assert!(Hash::check("ひみつ", &stored));
+        assert!(HEAVIER_WARNED.load(Ordering::Relaxed), "1 回知らせる");
+        // 2 回目からは出さない（落ちない）。
+        warn_heavier_than_config("PBKDF2 2000 回", "1000 回");
+    }
+
+    #[tokio::test]
+    async fn 非同期版は上限を超える平文を断る() {
+        // `check` が必ず偽を返す値を、`Result` を返せる口で作っていた。
+        install_test_iterations();
+        let over = "a".repeat(MAX_PASSWORD_BYTES + 1);
+        let error = Hash::make_async(&over).await.unwrap_err().to_string();
+        assert!(error.contains("長すぎます"), "{error}");
+
+        // 上限ちょうどは作れて、照合もできる。
+        let limit = "a".repeat(MAX_PASSWORD_BYTES);
+        let stored = Hash::make_async(&limit).await.unwrap();
+        assert!(Hash::check_async(&limit, &stored).await.unwrap());
     }
 
     // ---- 方式（HASH_DRIVER）と Argon2id の設定 ----

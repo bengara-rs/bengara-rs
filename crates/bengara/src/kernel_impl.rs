@@ -2,6 +2,16 @@
 //!
 //! 本体のバイナリは、サーバーの起動と、実行時のコマンド（`route:list` など）を担います。
 //! `serve` の監視と再ビルドは `artisan` 側です（`crate::cli`）。
+//!
+//! | 置き場所 | 中身 |
+//! |---|---|
+//! | このファイル | コマンドの表（[`BUILTINS`]）・振り分け・`main` |
+//! | `kernel_impl/key_generate.rs` | `key:generate` |
+//! | `kernel_impl/about.rs` | `route:list`・`about`・`--help` の表示 |
+//! | `kernel_impl/test_boot.rs` | `#[bengara::test]` の初期化 |
+//!
+//! コマンドの表はこのファイルに置いたままにします（`bengara-build` のテストがここを読んで、
+//! 写しの名前とそろっているかを確かめるため）。
 
 use crate::application::Application;
 use crate::config_registry::{self, Registry};
@@ -9,6 +19,15 @@ use crate::console::Command;
 use crate::env_vars::{self, env};
 use crate::error::Result;
 use crate::{paths, server, Hooks};
+
+mod about;
+mod key_generate;
+mod test_boot;
+
+use about::{print_about, print_help, print_routes};
+pub(crate) use key_generate::replace_file;
+use key_generate::{generate_key, REAL_ENV};
+pub(crate) use test_boot::{boot_for_tests, test_hooks};
 
 /// 置き場所が無くても使えるコマンド。
 ///
@@ -222,6 +241,17 @@ pub fn main(hooks: Hooks, factory: fn() -> Application) {
         std::process::exit(1);
     };
 
+    // `init` / `--version` / `--help` は、`.env`・ログ・設定（`config/*.rs`）を使わない。
+    // 読む前に答えて終える。設定の中のパニック（環境変数が無いなど）や
+    // `.env` の誤りで、版番号やヘルプまで出せなくならないように。
+    if let Target::Standalone(standalone) = target {
+        if let Err(error) = run_standalone(standalone, hooks) {
+            eprintln!("エラー: {error}");
+            std::process::exit(1);
+        }
+        return;
+    }
+
     // 置き場所が決まらないまま動き出さない（決定記録 #064）。
     // **`.env` を読む前**に確かめる。読む場所そのものが決まっていないため。
     // つまり `APP_BASE_PATH` は `.env` に書いても効きません。
@@ -234,6 +264,15 @@ pub fn main(hooks: Hooks, factory: fn() -> Application) {
     }
 
     let base = paths::base_path().to_path_buf();
+    // `key:generate` は `.env` の `${VAR}` を読み込みと同じ規則で展開する。
+    // 読み込むと `.env` の値が環境変数に混ざるので、その前に写しておく（`app_key_is_set`）。
+    // UTF-8 でないものは `std::env::var` でも読めないので、写さない。
+    if target == Target::App(AppCommand::KeyGenerate) {
+        let real = std::env::vars_os()
+            .filter_map(|(key, value)| Some((key.into_string().ok()?, value.into_string().ok()?)))
+            .collect();
+        let _ = REAL_ENV.set(real);
+    }
     // `.env` の読み込みは、ログの購読より先に済ませる（`init_tracing` が
     // `APP_DEBUG` を見るため）。そのため警告はその場では出せないので、
     // 一覧で受け取って購読の**後**に流し直す。
@@ -395,6 +434,10 @@ fn run_standalone(command: Standalone, hooks: Hooks) -> Result<()> {
         }
         Standalone::Help => {
             print_help(hooks);
+            // ログを始める前に終えるので、同名の自作コマンドの警告は標準エラーへ直に出す。
+            for name in shadowed((hooks.commands)()) {
+                eprintln!("警告: {}", shadowed_message(name));
+            }
             Ok(())
         }
     }
@@ -481,218 +524,6 @@ fn next_value<'a>(iter: &mut impl Iterator<Item = &'a String>, name: &str) -> Re
         .ok_or_else(|| crate::Error::msg(format!("{name} の値がありません")))
 }
 
-/// `APP_KEY` を作って `.env` に書き込む。
-///
-/// すでにある場合は、`--force` が無いかぎり上書きしません。
-/// 鍵を変えると、いま動いているセッションと署名付き URL が全部無効になるためです。
-fn generate_key(rest: &[String]) -> Result<()> {
-    let force = parse_force(rest)?;
-    let path = paths::base_path().join(".env");
-
-    if !path.is_file() {
-        return Err(crate::Error::msg(format!(
-            "{} がありません。先に .env を作ってください",
-            path.display()
-        )));
-    }
-
-    let body = std::fs::read_to_string(&path)?;
-
-    if app_key_is_set(&body) && !force {
-        println!(
-            "APP_KEY はすでに設定されています。作り直すと、いまのセッションと\n\
-             署名付き URL がすべて無効になります。それでもよければ --force を付けてください。"
-        );
-        return Ok(());
-    }
-
-    // 書き換える**前**の `.env` で見分ける（書いた後だと、新しい鍵と比べてしまう）。
-    let real_key = real_app_key_present(&body);
-    let key = crate::support::crypto::random_token();
-    replace_file(&path, &write_app_key(&body, &key))?;
-    println!("APP_KEY を {} に書き込みました。", path.display());
-    if let Some(warning) = real_app_key_warning(real_key) {
-        eprintln!("{warning}");
-    }
-    Ok(())
-}
-
-/// 本物の環境変数に `APP_KEY` が入っているか（`.env` から入れたものを除く）。
-///
-/// 起動のときに `.env` を読み込んでいるので、`std::env::var` だけでは見分けられません。
-/// 書き換える前の `.env`（`body`）の値と同じなら、`.env` から来たものと見なします。
-fn real_app_key_present(body: &str) -> bool {
-    std::env::var("APP_KEY").is_ok_and(|value| is_real_app_key(&value, body))
-}
-
-/// 環境変数の値 `value` が、`.env`（`body`）から読み込んだものでないか。
-fn is_real_app_key(value: &str, body: &str) -> bool {
-    if value.trim().is_empty() {
-        return false;
-    }
-    let from_dotenv = body
-        .lines()
-        .find_map(app_key_value)
-        .map(env_vars::dotenv_value);
-    from_dotenv.as_deref() != Some(value)
-}
-
-/// `.env` に書いても、本物の環境変数の `APP_KEY` が勝つときの警告。
-///
-/// `.env` は設定済みの変数を上書きしません。書いた鍵が使われないまま
-/// 「書き込みました」で終わると、気づけないためです。
-fn real_app_key_warning(present: bool) -> Option<&'static str> {
-    present.then_some(
-        "警告: 環境変数 APP_KEY が設定されています。環境変数 APP_KEY が優先されます。\n\
-         .env に書いた鍵を使うには、環境変数 APP_KEY を外してください。",
-    )
-}
-
-/// `.env` の中身で、`APP_KEY` がすでに設定されているか。
-///
-/// **`.env` の読み込みと同じ規則で値を読みます**（`env_vars::dotenv_value`）。
-/// `=` の右側をそのまま見ていたころは、`APP_KEY=""` や `APP_KEY= # 後で` を
-/// 「設定済み」と見て書き込みませんでした。読み込みではどちらも空なので、
-/// 「設定されています」と言われたのに起動すると「設定されていません」になります。
-///
-/// 見るのは**最初の `APP_KEY` の行**です。読み込みは先に出てきた行を採るためです。
-fn app_key_is_set(body: &str) -> bool {
-    body.lines()
-        .find_map(app_key_value)
-        .is_some_and(|raw| !env_vars::dotenv_value(raw).trim().is_empty())
-}
-
-/// ファイルの中身を、一時ファイルに書いてから置き換える。
-///
-/// `std::fs::write` は切り詰めてから書くので、途中で落ちると `.env` が空か
-/// 途中までになります。`.env` が壊れると、次の起動で設定が全部既定値に戻ります。
-/// 同じディレクトリに書いてから `rename` で置き換えます
-/// （`support::fs::write_atomic`。`schedule.rs` の前回時刻と同じ作りです）。
-///
-/// - **リンクなら、指している先を置き換えます。** リンクそのものを置き換えると、
-///   共有の `.env` へのリンクが普通のファイルに変わってしまいます。
-/// - **権限は元のファイルから引き継ぎます。** 一時ファイルは、中身を書く前に
-///   所有者だけに絞ります（鍵が入るため）。
-/// - 読み取り専用のファイルは、これまでどおり書き込まずにエラーにします。
-///
-/// `init` が `Cargo.toml` に足りない行を足すときも使います（`cli::cargo_toml`）。
-/// 途中で落ちて `Cargo.toml` が壊れると、`cargo` 自体が動かなくなるためです。
-pub(crate) fn replace_file(path: &std::path::Path, body: &str) -> Result<()> {
-    let target = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
-    let permissions = std::fs::metadata(&target)?.permissions();
-    if permissions.readonly() {
-        return Err(crate::Error::msg(format!(
-            "{} は読み取り専用なので書き込めません",
-            path.display()
-        )));
-    }
-
-    let name = target
-        .file_name()
-        .map(|name| name.to_string_lossy().into_owned())
-        .unwrap_or_else(|| ".env".to_string());
-    let temp = target.with_file_name(format!("{name}.tmp.{}", std::process::id()));
-
-    // 所有者だけに絞って書き、元の権限を付け直してから置き換える。
-    // 失敗したときの書きかけは `write_atomic` が消します。
-    crate::support::fs::write_atomic(
-        &temp,
-        &target,
-        body.as_bytes(),
-        crate::support::fs::Access::Keep(permissions),
-    )?;
-    Ok(())
-}
-
-/// `.env` の中身に `APP_KEY` を入れた文字列を作る。
-///
-/// すでに行があれば差し替え、無ければ末尾に足します。改行は元のままです。
-fn write_app_key(body: &str, key: &str) -> String {
-    let newline = newline_of(body);
-    if body.lines().any(|line| app_key_value(line).is_some()) {
-        let mut out: Vec<String> = body
-            .lines()
-            .map(|line| replace_app_key(line, key))
-            .collect();
-        out.push(String::new());
-        return out.join(newline);
-    }
-    let mut out = body.to_string();
-    if !out.is_empty() && !out.ends_with('\n') {
-        out.push_str(newline);
-    }
-    out.push_str("APP_KEY=");
-    out.push_str(key);
-    out.push_str(newline);
-    out
-}
-
-/// `key:generate` の旗を読む。`--force` だけを受け付けます。
-///
-/// **受け取った引数だけを見ます。** `std::env::args()` を読み直すと、
-/// `--forse` のような打ち間違いが黙って「上書きしない」側に落ちます。
-fn parse_force(rest: &[String]) -> Result<bool> {
-    let mut force = false;
-    for arg in rest {
-        if arg == "--force" {
-            force = true;
-        } else {
-            return Err(crate::Error::msg(format!(
-                "key:generate は `{arg}` を受け付けません（使えるのは --force だけです）"
-            )));
-        }
-    }
-    Ok(force)
-}
-
-/// 書き戻すときの改行を決める。
-///
-/// 元の改行を保ちます。`.gitignore` と `Cargo.toml` の書き換えと同じ方針です。
-/// LF にそろえると、CRLF の `.env` が git の差分で全行変わって見えます。
-fn newline_of(body: &str) -> &'static str {
-    if body.contains("\r\n") {
-        "\r\n"
-    } else {
-        "\n"
-    }
-}
-
-/// `.env` の1行が `APP_KEY` の行なら、その値を返す。
-///
-/// `.env` の読み込みと**同じ前処理**をします（前後の空白と先頭の `export` を外す）。
-/// そろえないと `export APP_KEY=…` を見落とし、末尾に 2 行目を足してしまいます。
-/// 読み込みは先に出てくる値を採るので、鍵は変わらないのに「書き込みました」と出ます。
-///
-/// 先頭の BOM も外します（読み込みが外すため。Windows のメモ帳が付けます）。
-/// 残すと 1 行目の `APP_KEY=` を見落とし、同じく末尾に 2 行目を足します。
-///
-/// キーの切り出しも読み込みと同じです（**最初の `=` で分け、キーの前後の空白を外す**）。
-/// `APP_KEY=` で始まるかだけを見ていたころは、`APP_KEY = ` や `APP_KEY =値` を
-/// 見落としていました。読み込みはどちらも `APP_KEY` と読むので、末尾に足した
-/// 2 行目は使われず、空の鍵のまま「書き込みました」と出ていました。
-fn app_key_value(line: &str) -> Option<&str> {
-    let line = env_vars::strip_export(line.trim_start_matches('\u{feff}').trim());
-    if line.starts_with('#') {
-        return None;
-    }
-    let (key, rest) = line.split_once('=')?;
-    (key.trim() == "APP_KEY").then_some(rest)
-}
-
-/// `APP_KEY` の行なら値を差し替える。そうでなければそのまま返す。
-///
-/// 最初の `=` までは残します（`export `・行頭の空白・`=` の前の空白）。
-/// 利用者の書き方を変えないためです。
-fn replace_app_key(line: &str, key: &str) -> String {
-    if app_key_value(line).is_none() {
-        return line.to_string();
-    }
-    match line.find('=') {
-        Some(at) => format!("{}{key}", &line[..=at]),
-        None => line.to_string(),
-    }
-}
-
 fn sweep_sessions() -> Result<()> {
     let dir = paths::storage_path("framework/sessions");
     let removed = crate::session::sweep_expired(&dir)?;
@@ -701,241 +532,6 @@ fn sweep_sessions() -> Result<()> {
         dir.display()
     );
     Ok(())
-}
-
-/// 登録されているルートを表で出す。
-fn print_routes(app: &Application) {
-    let routes = app.routes();
-    if routes.is_empty() {
-        println!("ルートは1本も登録されていません。routes/web.rs を確かめてください。");
-        return;
-    }
-    // 桁は**端末での幅**でそろえる。文字数で数えると、日本語のルート名で崩れます
-    // （`about` や `schedule:list` と同じ数え方にそろえてあります）。
-    use crate::support::text;
-
-    let method_width = routes
-        .iter()
-        .map(|r| text::width(r.method))
-        .max()
-        .unwrap_or(6)
-        .max(6);
-    let path_width = routes
-        .iter()
-        .map(|r| text::width(&r.path))
-        .max()
-        .unwrap_or(4)
-        .max(4);
-    let name_width = routes
-        .iter()
-        .map(|r| text::width(r.name.as_deref().unwrap_or("")))
-        .max()
-        .unwrap_or(4)
-        .max(4);
-    // ミドルウェアが1本も無いなら、列ごと出さない。
-    let any_middleware = routes.iter().any(|r| !r.middleware.is_empty());
-    if any_middleware {
-        println!(
-            "{}  {}  {}  MIDDLEWARE",
-            text::pad("METHOD", method_width),
-            text::pad("URI", path_width),
-            text::pad("NAME", name_width)
-        );
-    } else {
-        println!(
-            "{}  {}  NAME",
-            text::pad("METHOD", method_width),
-            text::pad("URI", path_width)
-        );
-    }
-    for route in routes {
-        let name = route.name.as_deref().unwrap_or("");
-        if any_middleware {
-            println!(
-                "{}  {}  {}  {}",
-                text::pad(route.method, method_width),
-                text::pad(&route.path, path_width),
-                text::pad(name, name_width),
-                route.middleware.join(", ")
-            );
-        } else {
-            println!(
-                "{}  {}  {}",
-                text::pad(route.method, method_width),
-                text::pad(&route.path, path_width),
-                name
-            );
-        }
-    }
-    println!("\n{} 本", routes.len());
-}
-
-/// `about`：いまの設定と置き場所を1画面で出す。
-///
-/// 本番で「どこを見ているのか」を確かめるためのコマンドです。
-/// **秘密は出しません**（`APP_KEY` は設定の有無だけ）。
-fn print_about(hooks: &Hooks) {
-    use crate::support::text;
-
-    let app = crate::config_registry::app_config();
-    let storage = paths::storage_root();
-
-    let rows: Vec<(&str, String)> = vec![
-        ("bengara", env!("CARGO_PKG_VERSION").to_string()),
-        ("アプリ名", app.name.clone()),
-        ("環境", app.env.clone()),
-        ("デバッグ表示", yes_no(app.debug)),
-        ("URL", app.url.clone()),
-        // 鍵そのものは出さない。署名に使えるか（あり／なし／短すぎる）だけを出す。
-        ("APP_KEY", app_key_label(app)),
-        (
-            "基準ディレクトリ",
-            format!(
-                "{}（{}）",
-                paths::base_path().display(),
-                paths::base_source().label()
-            ),
-        ),
-        (
-            "storage",
-            format!(
-                "{}{}",
-                storage.display(),
-                if storage.is_dir() {
-                    ""
-                } else {
-                    "  ← ありません（storage:init）"
-                }
-            ),
-        ),
-        ("public", paths::app_path("public").display().to_string()),
-        (
-            "言語",
-            format!(
-                "{} / {:?}",
-                crate::Lang::current(),
-                crate::Lang::available()
-            ),
-        ),
-        // 書いた値ではなく、実際に使う方式を出す（知らない名前は file になる）。
-        ("セッション", session_driver_label()),
-        ("キャッシュ", cache_driver_label()),
-        // いま実際に使う方式と強さ（`HASH_DRIVER`）。
-        ("パスワード", crate::auth::hash_driver_label()),
-        // `MAIL_MAILER` → `MAIL_DRIVER` の順に見る（`config/mail.rs` があればそちら）。
-        ("メール", crate::mail::driver_label()),
-        ("停止の上限", crate::server::shutdown_timeout_label()),
-        // Laravel の `about` の「Logs」に当たる（`LOG_CHANNEL`・`LOG_DAILY_DAYS`）。
-        ("ログ", crate::logging::about_label()),
-        ("マイグレーション", (hooks.migrations)().len().to_string()),
-        ("シーダー", (hooks.seeders)().len().to_string()),
-        ("ジョブ", (hooks.jobs)().len().to_string()),
-        ("自作コマンド", (hooks.commands)().len().to_string()),
-    ];
-
-    let width = rows
-        .iter()
-        .map(|(label, _)| text::width(label))
-        .max()
-        .unwrap_or(4);
-    for (label, value) in &rows {
-        println!("{}  {value}", text::pad(label, width));
-    }
-}
-
-/// 真偽を日本語にする。
-fn yes_no(value: bool) -> String {
-    if value { "あり" } else { "なし" }.to_string()
-}
-
-/// `about` に出す `APP_KEY` の状態。署名に使うときと同じ判定（`signing_key`）を通す。
-///
-/// 以前は「空でなければあり」でした。短すぎる鍵も「あり」と出て、
-/// 起動するとセッションが 500 になるのに気づけませんでした。
-fn app_key_label(app: &crate::config_registry::AppConfig) -> String {
-    match app.signing_key() {
-        Ok(_) => "あり".to_string(),
-        Err(_) if app.key.is_empty() => "なし".to_string(),
-        Err(_) => format!("短すぎる（{} 文字）", app.key.chars().count()),
-    }
-}
-
-/// 方式の名前を、実際に使うものに直す。
-///
-/// セッションもキャッシュも `memory`（別名 `array`）と `file` だけを知っていて、
-/// 知らない名前は警告を出して `file` にします（`session/middleware.rs`・`cache/mod.rs`）。
-/// 読む側（`StartSession`・`Cache`）と同じく、前後の空白を落とし、大文字小文字を区別しない。
-fn driver_label(driver: &str) -> String {
-    let driver = driver.trim();
-    match driver.to_ascii_lowercase().as_str() {
-        "memory" | "array" => "memory".to_string(),
-        "file" => "file".to_string(),
-        other => format!("file（`{other}` は知らないため）"),
-    }
-}
-
-/// いま使うセッションの方式。`StartSession::from_env` と同じく `SESSION_DRIVER` を見る
-/// （前後の空白を落とし、大文字小文字を区別しない）。
-fn session_driver_label() -> String {
-    driver_label(&env::<String>("SESSION_DRIVER", "file").to_ascii_lowercase())
-}
-
-/// いま使うキャッシュの方式。`config/cache.rs` があればその値、無ければ `CACHE_DRIVER`。
-fn cache_driver_label() -> String {
-    let driver = crate::try_config::<crate::cache::CacheConfig>()
-        .map(|config| config.driver.clone())
-        .unwrap_or_else(|| crate::cache::CacheConfig::default().driver);
-    driver_label(&driver)
-}
-
-fn print_help(hooks: Hooks) {
-    let describe = |list: &[(&str, &str)]| {
-        list.iter()
-            .map(|(name, description)| format!("  {name:<20} {description}"))
-            .collect::<Vec<_>>()
-            .join("\n")
-    };
-    let kernel = kernel_help();
-    let database = describe(crate::database::commands::COMMANDS);
-    let extras = describe(crate::commands::COMMANDS);
-    println!(
-        "\
-本体のコマンド
-
-{kernel}
-データベースのコマンド
-{database}
-  どれにも --database=<接続の名前> を付けられます。
-
-周辺機能のコマンド
-{extras}
-
-開発用のコマンド（serve の自動再ビルドなど）は `cargo artisan list` に出ます。
-"
-    );
-    // アプリが app/Console/Commands/ に置いたものも出す。
-    crate::console::print_list((hooks.commands)());
-}
-
-/// このファイルが受け持つコマンドの説明（ヘルプの最初のかたまり）。
-///
-/// [`BUILTINS`] から作ります。名前を表とヘルプの 2 か所に書かないためです。
-/// 桁は端末での幅でそろえます（名前の欄に日本語が入るため）。
-fn kernel_help() -> String {
-    use crate::support::text;
-
-    let mut out = String::new();
-    for builtin in BUILTINS {
-        out.push_str(&format!(
-            "  {} {}\n",
-            text::pad(builtin.label, 20),
-            builtin.description
-        ));
-        for (flag, description) in builtin.flags {
-            out.push_str(&format!("      {} {description}\n", text::pad(flag, 16)));
-        }
-    }
-    out
 }
 
 /// `RUST_LOG` の値と既定から、ログの細かさを決める（`log-filter` を外したとき用）。
@@ -972,133 +568,9 @@ fn parse_level(raw: &str) -> Option<tracing::level_filters::LevelFilter> {
     }
 }
 
-/// テストから使う初期化。**何度呼んでも、中身が走るのは 1 回だけ**です。
-///
-/// `#[bengara::test]` が付いたテストは**1 件ごとに**ここを呼びます。`Once` で囲うのは
-/// `env_vars::load_dotenv` が `std::env::set_var` を呼ぶからです。テストは複数の
-/// スレッドで同時に走るので、別のテストが `env()` で `std::env::var` を読んでいる間に
-/// 書き込むと未定義動作になります（`setenv`/`getenv` はスレッド安全ではありません。
-/// Rust 2024 で `set_var` が unsafe になったのはこのためです）。
-/// 中で呼ぶ他の処理（`install_test_mailer` など）はそれぞれ二重呼び出しに備えていましたが、
-/// `load_dotenv` だけが無防備でした。
-///
-/// **この関数は `bengara` の単体テストから呼んではいけません。** 言語の表・埋め込んだ
-/// `public/`・設定の一覧を `OnceLock` でプロセス全体に固定するので、1 回呼ぶだけで
-/// 同じテストバイナリの他のテストを壊します（以前、ここを呼ぶテストを足したら
-/// `lang::tests` が 6 件落ちました。空の言語表が先に固定され、`lang` 側の
-/// `TABLE.set` が無視されたためです）。動きの確認はアプリ側の `#[bengara::test]`
-/// が全件この道を通ることで足ります。
-pub(crate) fn boot_for_tests(hooks: Hooks) {
-    static ONCE: std::sync::Once = std::sync::Once::new();
-    ONCE.call_once(|| {
-        // メールはテストでは送らず、溜めるだけにする（`.env` を読む前に決める）。
-        crate::mail::install_test_mailer();
-        // パスワードのハッシュの回数を下げるのは **`.env` を読む前**に決める。
-        // `.env` の値まで尊重すると、開発用に下げた値（や上げた値）でテストが走り、
-        // 1 件ごとに数秒かかってしまう。環境変数で明示したときだけ従う。
-        crate::auth::install_test_iterations();
-        // `APP_ENV`・セッション・キャッシュのテスト用の既定も **`.env` を読む前**に入れる。
-        // `.env` は設定済みの変数を上書きしないので、`.env` の `APP_ENV=local` に負けない。
-        install_test_env();
-
-        let base = paths::base_path().to_path_buf();
-        let (_, warnings) = env_vars::load_dotenv(&base);
-        // テストでは標準出力にだけ書く（`LOG_CHANNEL` を見ない）。
-        crate::logging::init_for_tests();
-        for warning in warnings {
-            tracing::warn!("{warning}");
-        }
-        // 設定を登録する**前**に入れる。`AppConfig` は登録のときに `APP_KEY` を読むため。
-        install_test_app_key();
-        if !config_registry::installed() {
-            let mut registry = Registry::new();
-            (hooks.configs)(&mut registry);
-            config_registry::install(registry);
-        }
-        // 言語の表を固定する。
-        crate::lang::install((hooks.lang)());
-        // 埋め込んだ public/ を固定する。以後は読むだけ。
-        crate::http::statics::install_embedded((hooks.public)());
-        // 埋め込んだ resources/views/ も固定する。
-        crate::view::install_embedded((hooks.views)());
-        // マイグレーションの一覧を、あとで `refresh_database()` から使えるようにしておく。
-        let _ = TEST_HOOKS.set(hooks);
-    });
-}
-
-/// テストで `APP_KEY` が無いときに使う鍵。64 文字（`MIN_KEY_CHARS`）です。
-///
-/// 秘密ではありません。テストはソケットを開かず、Cookie も外に出ないので、
-/// 固定の値で足ります。本物の環境変数や `.env` に値があればそちらを使います。
-const TEST_APP_KEY: &str = "bengara-test-key-0123456789abcdef0123456789abcdef0123456789abcdef";
-
-/// `.env` を読んだあとも `APP_KEY` が空なら、テスト用の鍵を入れる。
-///
-/// 取得したばかりのリポジトリには `.env` が無い。そのままだとセッションと署名付き URL を
-/// 使う全テストが「`APP_KEY` が設定されていません」の 500 で落ちる。
-/// メールの溜め込みやハッシュの回数と同じく、テストが自分で動ける状態にしておく。
-///
-/// `boot_for_tests` の `Once` の中（ほかのスレッドが環境変数を読む前）からだけ呼ぶ。
-fn install_test_app_key() {
-    let present = std::env::var("APP_KEY")
-        .map(|value| !value.trim().is_empty())
-        .unwrap_or(false);
-    if present {
-        return;
-    }
-    // edition 2021 では set_var は安全な関数（`load_dotenv` と同じ理由）。
-    std::env::set_var("APP_KEY", TEST_APP_KEY);
-    tracing::debug!("APP_KEY が無いので、テスト用の固定の鍵を使います");
-}
-
-/// テストで使う環境変数の既定。Laravel の `phpunit.xml` の `<env>` と同じ役目です。
-///
-/// | 変数 | 値 | 理由 |
-/// |---|---|---|
-/// | `APP_ENV` | `testing` | 本体の既定は `production`。本番だけの振る舞いで結果が変わらないように |
-/// | `SESSION_DRIVER` | `memory` | 開発用の `storage/framework/sessions/` にファイルを溜めない |
-/// | `CACHE_DRIVER` | `memory` | 開発用の `storage/framework/cache/` を汚さない |
-const TEST_ENV: &[(&str, &str)] = &[
-    ("APP_ENV", "testing"),
-    ("SESSION_DRIVER", "memory"),
-    ("CACHE_DRIVER", "memory"),
-];
-
-/// 本物の環境変数に無いものだけ、[`TEST_ENV`] の値を入れる。
-///
-/// **`.env` を読む前**に呼びます。`.env` は設定済みの変数を上書きしないので、
-/// 優先順位は「本物の環境変数 > テスト用の既定 > `.env`」になります
-/// （Laravel の `phpunit.xml` と同じ）。以前は `.env` の後に入れていたので、
-/// README どおり `APP_ENV=local` の `.env` を置くとテストが `local` で走りました。
-///
-/// 空の環境変数は「無い」と見なします（`.env` の読み込みと同じ規則）。
-///
-/// `boot_for_tests` の `Once` の中からだけ呼ぶ。
-fn install_test_env() {
-    for (key, value) in TEST_ENV {
-        if env_vars::is_unset(std::env::var_os(key).as_deref()) {
-            // edition 2021 では set_var は安全な関数（`load_dotenv` と同じ理由）。
-            std::env::set_var(key, value);
-        }
-    }
-}
-
-static TEST_HOOKS: std::sync::OnceLock<Hooks> = std::sync::OnceLock::new();
-
-/// テストのときに覚えておいた `Hooks`。
-pub(crate) fn test_hooks() -> Hooks {
-    TEST_HOOKS.get().copied().unwrap_or_default()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn テスト用の鍵は必要な長さを満たす() {
-        // 1 文字でも短いと、セッションを使う全テストが 500 で落ちる。
-        assert!(TEST_APP_KEY.chars().count() >= config_registry::MIN_KEY_CHARS);
-    }
 
     #[test]
     fn イベントの聞く側が要るコマンドは組み立てる() {
@@ -1342,126 +814,6 @@ mod tests {
     }
 
     #[test]
-    fn ヘルプは表から作る() {
-        let help = kernel_help();
-        // 表にあるものは、全部ヘルプに出る。
-        for builtin in BUILTINS {
-            assert!(help.contains(builtin.label), "{}", builtin.label);
-            assert!(help.contains(builtin.description), "{}", builtin.label);
-        }
-        // 桁は端末での幅でそろえる（名前の欄に日本語が入る）。
-        assert!(
-            help.contains("  (引数なし) / serve   HTTP サーバーを起動する（"),
-            "{help}"
-        );
-        assert!(
-            help.contains("      --host <ホスト>  待ち受けるホスト"),
-            "{help}"
-        );
-        assert!(
-            help.contains("  route:list           登録されているルートを一覧にする\n"),
-            "{help}"
-        );
-        assert!(
-            help.contains("  --help               このヘルプを出す\n"),
-            "{help}"
-        );
-    }
-
-    #[test]
-    fn 空の値やコメントだけの鍵は未設定と見る() {
-        // `.env` の読み込みでは、どれも空になる。以前は「設定済み」と見て書き込まなかった。
-        assert!(!app_key_is_set("APP_KEY=\n"));
-        assert!(!app_key_is_set("APP_KEY=\"\"\n"));
-        assert!(!app_key_is_set("APP_KEY=''\n"));
-        assert!(!app_key_is_set("APP_KEY= # 後で\n"));
-        assert!(!app_key_is_set("APP_KEY=#後で\n"));
-        assert!(!app_key_is_set("APP_KEY=\"   \"\n"));
-        assert!(!app_key_is_set("APP_NAME=myapp\n"), "行が無い");
-        assert!(!app_key_is_set(""));
-
-        assert!(app_key_is_set("APP_KEY=abc\n"));
-        assert!(app_key_is_set("APP_KEY=\"abc\"\n"));
-        assert!(app_key_is_set("export APP_KEY=abc # 本番用\n"));
-        assert!(app_key_is_set("APP_NAME=myapp\r\nAPP_KEY=abc\r\n"));
-
-        // 読み込みは先に出てきた行を採る。判定も同じ行を見る。
-        assert!(!app_key_is_set("APP_KEY=\nAPP_KEY=abc\n"));
-        assert!(app_key_is_set("APP_KEY=abc\nAPP_KEY=\n"));
-    }
-
-    #[test]
-    fn bomつきの1行目の鍵も見つける() {
-        // メモ帳が付ける BOM。見落とすと末尾に 2 行目を足し、空の 1 行目が勝つ。
-        let body = "\u{feff}APP_KEY=\nAPP_NAME=myapp\n";
-        assert_eq!(app_key_value("\u{feff}APP_KEY=abc"), Some("abc"));
-        let updated = write_app_key(body, "new");
-        assert_eq!(updated, "\u{feff}APP_KEY=new\nAPP_NAME=myapp\n");
-        assert_eq!(updated.matches("APP_KEY=").count(), 1);
-    }
-
-    /// テスト用の空ディレクトリ。
-    fn temp_dir(label: &str) -> std::path::PathBuf {
-        let dir =
-            std::env::temp_dir().join(format!("bengara-kernel-{label}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        dir
-    }
-
-    #[test]
-    fn envは一時ファイル経由で置き換える() {
-        let dir = temp_dir("replace");
-        let path = dir.join(".env");
-        std::fs::write(&path, "APP_NAME=myapp\nAPP_KEY=old\n").unwrap();
-
-        replace_file(&path, "APP_NAME=myapp\nAPP_KEY=new\n").unwrap();
-        assert_eq!(
-            std::fs::read_to_string(&path).unwrap(),
-            "APP_NAME=myapp\nAPP_KEY=new\n"
-        );
-
-        // 書きかけ（`.env.tmp.*`）が残らない。
-        let left: Vec<_> = std::fs::read_dir(&dir)
-            .unwrap()
-            .flatten()
-            .map(|e| e.file_name().to_string_lossy().into_owned())
-            .collect();
-        assert_eq!(left, [".env"], "残っている: {left:?}");
-
-        // 無いファイルは作らない（`key:generate` は先に `.env` の有無を確かめる）。
-        assert!(replace_file(&dir.join("無い"), "x").is_err());
-        assert!(!dir.join("無い").exists());
-
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn 読み取り専用のenvには書かない() {
-        let dir = temp_dir("readonly");
-        let path = dir.join(".env");
-        std::fs::write(&path, "APP_KEY=old\n").unwrap();
-        let mut permissions = std::fs::metadata(&path).unwrap().permissions();
-        permissions.set_readonly(true);
-        std::fs::set_permissions(&path, permissions).unwrap();
-
-        // 置き換え（rename）は、読み取り専用でも通ってしまう OS がある。
-        // 直接書いていたころと同じく、書かずにエラーにする。
-        let error = replace_file(&path, "APP_KEY=new\n")
-            .unwrap_err()
-            .to_string();
-        assert!(error.contains("読み取り専用"), "{error}");
-        assert_eq!(std::fs::read_to_string(&path).unwrap(), "APP_KEY=old\n");
-
-        // 後片付けのために書ける状態へ戻す。
-        let mut permissions = std::fs::metadata(&path).unwrap().permissions();
-        #[allow(clippy::permissions_set_readonly_false)]
-        permissions.set_readonly(false);
-        let _ = std::fs::set_permissions(&path, permissions);
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
     fn offはログを止める指定として読む() {
         use tracing::level_filters::LevelFilter;
 
@@ -1479,138 +831,5 @@ mod tests {
         assert_eq!(max_level(Some("myapp=debug"), "debug"), LevelFilter::DEBUG);
         assert_eq!(max_level(Some(""), "info"), LevelFilter::INFO);
         assert_eq!(max_level(None, "debug"), LevelFilter::DEBUG);
-    }
-
-    #[test]
-    fn exportつきの鍵の行も見つける() {
-        assert_eq!(app_key_value("APP_KEY=abc"), Some("abc"));
-        assert_eq!(app_key_value("export APP_KEY=abc"), Some("abc"));
-        assert_eq!(app_key_value("export\tAPP_KEY=abc"), Some("abc"));
-        assert_eq!(app_key_value("  APP_KEY=abc"), Some("abc"));
-        assert_eq!(app_key_value("APP_KEY="), Some(""));
-        // コメントと別のキーは触らない。
-        assert_eq!(app_key_value("# APP_KEY=abc"), None);
-        assert_eq!(app_key_value("APP_KEY_OLD=abc"), None);
-    }
-
-    #[test]
-    fn exportつきの行が置き換わる() {
-        // 以前は見落として末尾に2行目を足し、先に出てくる古い値が勝っていた。
-        let body = "APP_NAME=myapp\nexport APP_KEY=old\n";
-        let updated = write_app_key(body, "new");
-        assert_eq!(updated, "APP_NAME=myapp\nexport APP_KEY=new\n");
-        // `APP_KEY` の行は1本だけ。
-        assert_eq!(updated.matches("APP_KEY=").count(), 1);
-    }
-
-    #[test]
-    fn イコールの前後に空白がある行も読み込みと同じに見つける() {
-        // 読み込みは最初の `=` で分けてキーの空白を外す。判定と置き換えもそろえる。
-        // 以前は見落として末尾に 2 行目を足し、空の 1 行目が勝っていた。
-        assert_eq!(app_key_value("APP_KEY = "), Some(""));
-        assert_eq!(app_key_value("APP_KEY =abc"), Some("abc"));
-        assert_eq!(app_key_value("  export  APP_KEY\t= abc"), Some(" abc"));
-        assert_eq!(app_key_value("APP_KEYS=abc"), None);
-        assert_eq!(app_key_value("#APP_KEY=abc"), None);
-        assert!(!app_key_is_set("APP_KEY = \n"));
-        assert!(app_key_is_set("APP_KEY = abc\n"));
-
-        // `=` までの書き方は残し、`APP_KEY` の行は 1 本のまま。
-        let updated = write_app_key("APP_NAME=myapp\nAPP_KEY = \n", "new");
-        assert_eq!(updated, "APP_NAME=myapp\nAPP_KEY =new\n");
-        assert_eq!(updated.matches("APP_KEY").count(), 1);
-        assert_eq!(
-            write_app_key("export APP_KEY =old\n", "new"),
-            "export APP_KEY =new\n"
-        );
-        // 値に `=` が入っていても、最初の `=` の後ろを差し替える。
-        assert_eq!(write_app_key("APP_KEY=a=b\n", "new"), "APP_KEY=new\n");
-    }
-
-    #[test]
-    fn 行が無ければ末尾に足す() {
-        assert_eq!(write_app_key("A=1\n", "new"), "A=1\nAPP_KEY=new\n");
-        // 改行で終わっていない中身にも足せる。
-        assert_eq!(write_app_key("A=1", "new"), "A=1\nAPP_KEY=new\n");
-    }
-
-    #[test]
-    fn crlfのenvはcrlfのまま保つ() {
-        assert_eq!(newline_of("A=1\r\n"), "\r\n");
-        assert_eq!(newline_of("A=1\n"), "\n");
-        let body = "APP_NAME=myapp\r\nAPP_KEY=old\r\n";
-        assert_eq!(
-            write_app_key(body, "new"),
-            "APP_NAME=myapp\r\nAPP_KEY=new\r\n"
-        );
-        // 足すときも元の改行にそろえる。
-        assert_eq!(write_app_key("A=1\r\n", "new"), "A=1\r\nAPP_KEY=new\r\n");
-    }
-
-    #[test]
-    fn テスト用の既定はenvより先に入れる値() {
-        // Laravel の phpunit.xml と同じ 3 つ。セッションとキャッシュは開発用の
-        // storage/ に書かない方式にする。
-        let get = |key: &str| TEST_ENV.iter().find(|(k, _)| *k == key).map(|(_, v)| *v);
-        assert_eq!(get("APP_ENV"), Some("testing"));
-        assert_eq!(get("SESSION_DRIVER"), Some("memory"));
-        assert_eq!(get("CACHE_DRIVER"), Some("memory"));
-    }
-
-    #[test]
-    fn aboutの方式は実際に使うものを出す() {
-        assert_eq!(driver_label("memory"), "memory");
-        assert_eq!(driver_label("array"), "memory");
-        assert_eq!(driver_label("file"), "file");
-        // 読む側と同じく、空白と大文字小文字は気にしない。
-        assert_eq!(driver_label(" Memory "), "memory");
-        // 知らない名前は file で動くので、書いた名前のまま出さない。
-        let label = driver_label("redis");
-        assert!(
-            label.starts_with("file") && label.contains("redis"),
-            "{label}"
-        );
-    }
-
-    #[test]
-    fn aboutのapp_keyは署名に使えるかで出す() {
-        let with_key = |key: &str| crate::config_registry::AppConfig {
-            name: String::new(),
-            env: String::new(),
-            debug: false,
-            url: String::new(),
-            key: key.to_string(),
-        };
-        assert_eq!(app_key_label(&with_key("")), "なし");
-        assert_eq!(app_key_label(&with_key("short")), "短すぎる（5 文字）");
-        assert_eq!(app_key_label(&with_key(TEST_APP_KEY)), "あり");
-    }
-
-    #[test]
-    fn 本物の環境変数のapp_keyを見分ける() {
-        // `.env` から読み込んだ値と同じなら、本物の環境変数ではない。
-        assert!(!is_real_app_key("abc", "APP_KEY=abc\n"));
-        assert!(!is_real_app_key("abc", "APP_KEY=\"abc\" # コメント\n"));
-        // 違う値・`.env` に無い値は本物の環境変数。
-        assert!(is_real_app_key("abc", "APP_KEY=xyz\n"));
-        assert!(is_real_app_key("abc", "APP_NAME=x\n"));
-        // 空は「無い」。
-        assert!(!is_real_app_key("  ", "APP_NAME=x\n"));
-        // 警告の文。
-        assert!(real_app_key_warning(false).is_none());
-        let warning = real_app_key_warning(true).unwrap();
-        assert!(
-            warning.contains("環境変数 APP_KEY が優先されます"),
-            "{warning}"
-        );
-    }
-
-    #[test]
-    fn 知らない旗はエラーにする() {
-        assert!(!parse_force(&[]).unwrap());
-        assert!(parse_force(&["--force".to_string()]).unwrap());
-        // 打ち間違いが黙って通らないこと。
-        let error = parse_force(&["--forse".to_string()]).unwrap_err();
-        assert!(error.to_string().contains("--forse"), "{error}");
     }
 }

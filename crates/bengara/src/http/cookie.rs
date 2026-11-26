@@ -112,7 +112,7 @@ impl Cookie {
 
     /// `Set-Cookie` ヘッダーの中身にする。
     pub fn to_header_value(&self) -> String {
-        let mut out = format!("{}={}", encode(&self.name), encode(&self.value));
+        let mut out = format!("{}={}", encode_name(&self.name), encode(&self.value));
         let path = sanitize_attribute("Path", &self.path);
         let _ = write!(
             out,
@@ -182,6 +182,16 @@ fn ascii_domain(domain: &str) -> Option<&str> {
 }
 
 /// `Cookie` ヘッダーを名前と値に分ける。
+///
+/// | 部分 | 読み方 |
+/// |---|---|
+/// | 名前 | **届いたまま**。`%xx` を戻さない |
+/// | 値 | 前後の `"` を 1 組だけ外し（RFC 6265 の quoted の形）、`%xx` を戻す |
+///
+/// 名前を戻さないのは、`__Host-` と `__Secure-` の決まりを守るためです。
+/// ブラウザがこの決まりを確かめるのは**届いた名前の文字のまま**です。名前を戻すと、
+/// 隣のサブドメインが付けた `%5F%5FHost-sid` が `__Host-sid` として読まれ、
+/// 決まりの意味が無くなります（PHP の CVE-2022-31629 と同じ形）。
 pub(crate) fn parse_cookie_header(raw: &str) -> Vec<(String, String)> {
     let mut out = Vec::new();
     for part in raw.split(';') {
@@ -197,9 +207,30 @@ pub(crate) fn parse_cookie_header(raw: &str) -> Vec<(String, String)> {
         if name.is_empty() {
             continue;
         }
-        out.push((decode(name), decode(value)));
+        let value = value
+            .strip_prefix('"')
+            .and_then(|inner| inner.strip_suffix('"'))
+            .unwrap_or(value);
+        out.push((name.to_string(), decode(value)));
     }
     out
+}
+
+/// 名前を `Set-Cookie` に書く形にする。
+///
+/// 読む側（[`parse_cookie_header`]）は名前の `%xx` を戻しません。逃がすと、
+/// 書いた名前と読める名前が食い違います（`req.cookie("a b")` では引けません）。
+/// それでも生のまま書くとヘッダーが壊れるので、逃がしたうえで 1 行だけ残します。
+/// 名前は英数字と `-` `_` `.` などの記号だけにしてください。
+fn encode_name(name: &str) -> Cow<'_, str> {
+    if name.bytes().all(super::percent::cookie_safe) {
+        return Cow::Borrowed(name);
+    }
+    tracing::warn!(
+        "Cookie の名前に使えない文字があったので %xx に逃がしました。\
+         読むときは逃がした形の名前になります（名前は英数字と - _ . にしてください）"
+    );
+    Cow::Owned(encode(name))
 }
 
 /// Cookie に入れられない文字を `%xx` にする。
@@ -343,6 +374,39 @@ mod tests {
                 ("a".to_string(), "1".to_string()),
                 ("b".to_string(), "2".to_string()),
                 ("c".to_string(), "hello world".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn 名前のパーセントは戻さない() {
+        // 戻すと、隣のサブドメインが付けた `%5F%5FHost-sid` が `__Host-sid` に化ける。
+        let parsed = parse_cookie_header("%5F%5FHost-sid=evil; __Host-sid=good");
+        assert_eq!(
+            parsed,
+            vec![
+                ("%5F%5FHost-sid".to_string(), "evil".to_string()),
+                ("__Host-sid".to_string(), "good".to_string()),
+            ]
+        );
+        // 書く側：使える文字だけの名前はそのまま、それ以外は逃がす（警告を 1 行残す）。
+        assert!(Cookie::new("__Host-sid", "v")
+            .to_header_value()
+            .starts_with("__Host-sid=v;"));
+        assert!(Cookie::new("a b", "v")
+            .to_header_value()
+            .starts_with("a%20b=v;"));
+    }
+
+    #[test]
+    fn 値を囲む引用符は1組だけ外す() {
+        assert_eq!(
+            parse_cookie_header(r#"a="x%20y"; b=""; c="q; d=""z"""#),
+            vec![
+                ("a".to_string(), "x y".to_string()),
+                ("b".to_string(), String::new()),
+                ("c".to_string(), "\"q".to_string()),
+                ("d".to_string(), "\"z\"".to_string()),
             ]
         );
     }

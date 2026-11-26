@@ -351,14 +351,32 @@ pub(crate) fn database_config() -> &'static DatabaseConfig {
 static DEFAULT_BACKEND: OnceLock<Arc<dyn Backend>> = OnceLock::new();
 /// 名前で指した接続の置き場所。
 ///
-/// 読むほうが圧倒的に多いので `RwLock` にします。2回目以降は読みのロックだけで
+/// 読むほうが圧倒的に多いので `RwLock` にします。つないだ後は読みのロックだけで
 /// 済み、書き込みのロックを取りません。
-static NAMED_BACKENDS: OnceLock<RwLock<HashMap<String, Arc<dyn Backend>>>> = OnceLock::new();
+///
+/// 書くのは、接続ごとに「つなぎ始め」と「つなぎ終わり（成功なら置く・失敗なら外す）」です。
+/// **ロックを `await` の向こうへ持ち越しません。**
+static NAMED_BACKENDS: OnceLock<RwLock<HashMap<String, Slot>>> = OnceLock::new();
 static TEST_BACKEND: OnceLock<Arc<dyn Backend>> = OnceLock::new();
+
+/// つないだ結果を、待っている側へ配る入れ物。失敗は文にして配ります（`Error` は複製できないため）。
+type Outcome = Option<std::result::Result<Arc<dyn Backend>, String>>;
+
+/// 名前ごとの接続の状態。
+enum Slot {
+    /// つながっている。
+    Ready(Arc<dyn Backend>),
+    /// 誰かがつないでいる最中。終わったら結果がここに届く。
+    Connecting(tokio::sync::watch::Receiver<Outcome>),
+}
 
 /// 接続を取り出す。初回だけ実際につなぎます。
 ///
-/// 既定の接続は `OnceLock` に入るので、2回目以降はロックを取りません。
+/// 既定の接続は、つないだ後は `OnceLock` から取るので、ロックを取りません。
+///
+/// **同じ名前の初回が同時に来ても、つなぐのは 1 回です**（[`connect_once`]）。
+/// 以前は同時に来た数だけプールを作り、1 つを残して捨てていました。DB が落ちているときは、
+/// 来たリクエストごとにプールを作ってつなぎに行っていました。
 pub(crate) async fn backend(name: Option<&str>) -> Result<Arc<dyn Backend>> {
     // テスト用の接続が入っているときは、必ずそちらを使う。
     if let Some(found) = TEST_BACKEND.get() {
@@ -373,8 +391,6 @@ pub(crate) async fn backend(name: Option<&str>) -> Result<Arc<dyn Backend>> {
         if let Some(found) = DEFAULT_BACKEND.get() {
             return Ok(Arc::clone(found));
         }
-    } else if let Some(found) = named_backend(target) {
-        return Ok(found);
     }
 
     let settings = config.get(target).ok_or_else(|| {
@@ -383,30 +399,113 @@ pub(crate) async fn backend(name: Option<&str>) -> Result<Arc<dyn Backend>> {
             config.names().join(", ")
         ))
     })?;
-    let created = connect(settings).await?;
+    let created = connect_once(named_lock(), target, || connect(settings)).await?;
 
     if is_default {
-        // 同時に2つ作られたときは、先に入ったほうを使う。
+        // 次からはロックを取らずに返す。
         let _ = DEFAULT_BACKEND.set(Arc::clone(&created));
         return Ok(DEFAULT_BACKEND.get().map(Arc::clone).unwrap_or(created));
     }
-    // 書き込みのロックを取るのは、初回だけです。
-    let mut map = named_lock().write().unwrap_or_else(|e| e.into_inner());
-    let stored = map.entry(target.to_string()).or_insert(created).clone();
-    Ok(stored)
+    Ok(created)
 }
 
-fn named_lock() -> &'static RwLock<HashMap<String, Arc<dyn Backend>>> {
+fn named_lock() -> &'static RwLock<HashMap<String, Slot>> {
     NAMED_BACKENDS.get_or_init(|| RwLock::new(HashMap::new()))
 }
 
-/// 名前で指した接続を、読みのロックだけで探す。
-fn named_backend(name: &str) -> Option<Arc<dyn Backend>> {
-    named_lock()
-        .read()
-        .unwrap_or_else(|e| e.into_inner())
-        .get(name)
-        .map(Arc::clone)
+/// 名前の接続を取り出す。無ければ `open` でつなぐ。**同じ名前でつなぐのは同時に 1 本だけです。**
+///
+/// | いまの状態       | すること                                                         |
+/// |------------------|------------------------------------------------------------------|
+/// | つながっている   | 読みのロックだけで返す                                           |
+/// | 誰かがつないでいる | その結果を待って、同じ結果を返す（失敗なら同じ文のエラー）     |
+/// | 何も無い         | 自分がつなぐ。成功なら置き、失敗なら外す（次に来た人がつなぎ直す） |
+///
+/// **失敗は覚えません。** 同時に待っていた人には同じ失敗を返しますが、その後に来た人は
+/// またつなぎに行きます。DB が戻ったらすぐ使えるようにするためです。
+///
+/// つないでいる途中で落とされた（呼んだ側の future が捨てられた）ときは、待っている人が
+/// 置き場所を外して、つなぎ直します。
+async fn connect_once<F, Fut>(
+    table: &RwLock<HashMap<String, Slot>>,
+    name: &str,
+    open: F,
+) -> Result<Arc<dyn Backend>>
+where
+    F: Fn() -> Fut,
+    Fut: std::future::Future<Output = Result<Arc<dyn Backend>>>,
+{
+    loop {
+        // つながっていれば、読みのロックだけで返す。
+        if let Some(Slot::Ready(found)) = table.read().unwrap_or_else(|e| e.into_inner()).get(name)
+        {
+            return Ok(Arc::clone(found));
+        }
+
+        // 自分がつなぐか、誰かを待つかを決める。ロックはこの塊の中だけで持つ。
+        let decided = {
+            let mut map = table.write().unwrap_or_else(|e| e.into_inner());
+            match map.get(name) {
+                Some(Slot::Ready(found)) => return Ok(Arc::clone(found)),
+                Some(Slot::Connecting(receiver)) => Err(receiver.clone()),
+                None => {
+                    let (sender, receiver) = tokio::sync::watch::channel(None);
+                    map.insert(name.to_string(), Slot::Connecting(receiver));
+                    Ok(sender)
+                }
+            }
+        };
+        let mut receiver = match decided {
+            // 自分がつなぐ。ロックは上の塊で放してある。
+            Ok(sender) => return lead(table, name, sender, open().await),
+            Err(receiver) => receiver,
+        };
+        // 中身は複製して、受け口の借用をすぐ放す。
+        let waited = receiver
+            .wait_for(Option::is_some)
+            .await
+            .map(|outcome| outcome.clone());
+        match waited {
+            Ok(Some(Ok(found))) => return Ok(found),
+            Ok(Some(Err(message))) => return Err(Error::msg(message)),
+            // `wait_for` は `Some` になるまで待つので、ここには来ない。
+            Ok(None) => continue,
+            // つないでいた側が途中で落とされた。置き場所が同じ相手のままなら外して、やり直す。
+            Err(_) => {
+                let mut map = table.write().unwrap_or_else(|e| e.into_inner());
+                if matches!(map.get(name), Some(Slot::Connecting(stale)) if stale.same_channel(&receiver))
+                {
+                    map.remove(name);
+                }
+            }
+        }
+    }
+}
+
+/// [`connect_once`] でつないだ側の後始末。結果を置き場所に反映して、待っている人へ配る。
+fn lead(
+    table: &RwLock<HashMap<String, Slot>>,
+    name: &str,
+    sender: tokio::sync::watch::Sender<Outcome>,
+    opened: Result<Arc<dyn Backend>>,
+) -> Result<Arc<dyn Backend>> {
+    {
+        let mut map = table.write().unwrap_or_else(|e| e.into_inner());
+        match &opened {
+            Ok(found) => {
+                map.insert(name.to_string(), Slot::Ready(Arc::clone(found)));
+            }
+            // 失敗は覚えない。次に来た人がつなぎ直す。
+            Err(_) => {
+                map.remove(name);
+            }
+        }
+    }
+    let _ = sender.send(Some(match &opened {
+        Ok(found) => Ok(Arc::clone(found)),
+        Err(error) => Err(error.to_string()),
+    }));
+    opened
 }
 
 /// 設定に従って実際につなぐ。
@@ -1066,5 +1165,136 @@ mod tests {
         let grouped = group_by(vec![(1, "a"), (1, "b"), (2, "c")], |item| item.0);
         assert_eq!(grouped[&1].len(), 2);
         assert_eq!(grouped[&2].len(), 1);
+    }
+
+    /// つなぐだけの接続。`connect_once` を試すために使います。
+    struct Dummy;
+
+    impl Backend for Dummy {
+        fn driver(&self) -> Driver {
+            Driver::Sqlite
+        }
+
+        fn fetch_all<'a>(
+            &'a self,
+            _sql: &'a str,
+            _bindings: &'a [Value],
+        ) -> backend::DbFuture<'a, Vec<Row>> {
+            Box::pin(async { Ok(Vec::new()) })
+        }
+
+        fn execute<'a>(
+            &'a self,
+            _sql: &'a str,
+            _bindings: &'a [Value],
+        ) -> backend::DbFuture<'a, Affected> {
+            Box::pin(async { Ok(Affected::default()) })
+        }
+
+        fn begin(&self) -> backend::DbFuture<'_, Box<dyn backend::RawTx>> {
+            Box::pin(async { Err(Error::msg("使わない")) })
+        }
+
+        fn table_names(&self) -> backend::DbFuture<'_, Vec<String>> {
+            Box::pin(async { Ok(Vec::new()) })
+        }
+    }
+
+    type Table = Arc<RwLock<HashMap<String, Slot>>>;
+
+    /// 同時に `count` 本、同じ名前でつなぎに行く。つないだ回数は `opened` に数える。
+    async fn race(
+        table: &Table,
+        opened: &Arc<std::sync::atomic::AtomicUsize>,
+        count: usize,
+        fail: bool,
+    ) -> Vec<Result<Arc<dyn Backend>>> {
+        let barrier = Arc::new(tokio::sync::Barrier::new(count));
+        let mut tasks = Vec::new();
+        for _ in 0..count {
+            let (table, opened, barrier) =
+                (Arc::clone(table), Arc::clone(opened), Arc::clone(&barrier));
+            tasks.push(tokio::spawn(async move {
+                barrier.wait().await;
+                connect_once(&table, "other", || {
+                    let opened = Arc::clone(&opened);
+                    async move {
+                        opened.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        // つないでいる間に、ほかの人が来る。
+                        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                        if fail {
+                            Err(Error::msg("つなげません（DB が落ちています）"))
+                        } else {
+                            Ok(Arc::new(Dummy) as Arc<dyn Backend>)
+                        }
+                    }
+                })
+                .await
+            }));
+        }
+        let mut results = Vec::new();
+        for task in tasks {
+            results.push(task.await.expect("走り切る"));
+        }
+        results
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn 同じ名前の初回が同時に来てもつなぐのは1回() {
+        let table: Table = Arc::default();
+        let opened = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let results = race(&table, &opened, 8, false).await;
+        assert_eq!(opened.load(std::sync::atomic::Ordering::SeqCst), 1);
+        let first = results[0].as_ref().expect("つながる");
+        for result in &results {
+            assert!(Arc::ptr_eq(first, result.as_ref().expect("つながる")));
+        }
+        // 2 回目からは、つながっているものを返す。
+        let again = race(&table, &opened, 2, false).await;
+        assert_eq!(opened.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert!(Arc::ptr_eq(first, again[0].as_ref().unwrap()));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn 同時に来た初回の失敗は1回だけで_その後はつなぎ直す() {
+        let table: Table = Arc::default();
+        let opened = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let results = race(&table, &opened, 6, true).await;
+        // DB が落ちていても、同時に来た分のプールは作らない。
+        assert_eq!(opened.load(std::sync::atomic::Ordering::SeqCst), 1);
+        for result in &results {
+            let message = result.as_ref().err().expect("失敗する").to_string();
+            assert!(message.contains("DB が落ちています"), "{message}");
+        }
+        // 失敗は覚えない。次に来た人はつなぎ直す。
+        let results = race(&table, &opened, 1, false).await;
+        assert_eq!(opened.load(std::sync::atomic::Ordering::SeqCst), 2);
+        assert!(results[0].is_ok());
+    }
+
+    #[tokio::test]
+    async fn つないでいる途中で落とされても次の人がつなぎ直す() {
+        use std::future::Future;
+        let table: Table = Arc::default();
+        // 返ってこないつなぎ方を 1 回だけ進めて、途中で落とす。
+        {
+            let pending = connect_once(&table, "other", || async {
+                std::future::pending::<()>().await;
+                Ok(Arc::new(Dummy) as Arc<dyn Backend>)
+            });
+            let mut pending = Box::pin(pending);
+            let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+            assert!(pending.as_mut().poll(&mut cx).is_pending());
+        }
+        // 置き場所は「つないでいる最中」のまま残っているが、待たずにつなぎ直す。
+        let found = connect_once(&table, "other", || async {
+            Ok(Arc::new(Dummy) as Arc<dyn Backend>)
+        })
+        .await;
+        assert!(found.is_ok());
+        assert!(matches!(
+            table.read().unwrap().get("other"),
+            Some(Slot::Ready(_))
+        ));
     }
 }

@@ -111,6 +111,7 @@ pub(super) async fn serve<S>(
         shutdown: seat.server().subscribe_shutdown(),
         shutdown_seen: false,
         closing: None,
+        deferred_close: None,
         code: None,
     };
     let (code, app) = io.run(app).await;
@@ -118,7 +119,6 @@ pub(super) async fn serve<S>(
     // 後始末。表から外してから「終わった」を知らせる（`close` が返った時点で表に残らない）。
     registry::unregister(id);
     conn.finish();
-    drop(seat);
     tracing::debug!(
         "WebSocket {id} が閉じました（{:.1} 秒、番号 {}）",
         started.elapsed().as_secs_f32(),
@@ -131,6 +131,9 @@ pub(super) async fn serve<S>(
     if let Some(app) = app {
         finish_app(id, app, APP_GRACE).await;
     }
+    // 席はアプリの後始末が終わってから返す。先に返すと、停止の待ち（`websocket::shutdown`）が
+    // 0 本と見て先へ進み、後始末の途中でランタイムごと止まる。
+    drop(seat);
 }
 
 /// ソケットを閉じた後、アプリのタスクを `grace` まで待つ。過ぎたら警告して止める。
@@ -178,6 +181,8 @@ struct Io<S> {
     shutdown_seen: bool,
     /// こちらから Close を送った後、相手の Close を待つ期限。
     closing: Option<Instant>,
+    /// 書いている途中に来た閉じる要求。書きかけと列の残りを送ってから Close を送る。
+    deferred_close: Option<(u16, String)>,
     /// 閉じた番号（ログ用）。
     code: Option<u16>,
 }
@@ -258,7 +263,12 @@ where
                         Err(_) => 1000,
                     };
                     match self.drain_queue().await {
-                        Flow::Continue => self.start_close(code, "").await,
+                        Flow::Continue => {
+                            // 送り出す間に閉じる要求が来ていたら、その番号で閉じる。
+                            let (code, reason) =
+                                self.deferred_close.take().unwrap_or((code, String::new()));
+                            self.start_close(code, &reason).await
+                        }
                         Flow::Break => Flow::Break,
                     }
                 }
@@ -297,6 +307,10 @@ where
                 Step::Idle => self.start_close(1000, "idle timeout").await,
                 Step::CloseTimeout => Flow::Break,
             };
+            let flow = match flow {
+                Flow::Continue => self.finish_deferred_close().await,
+                Flow::Break => Flow::Break,
+            };
             if matches!(flow, Flow::Break) {
                 break;
             }
@@ -316,25 +330,69 @@ where
     /// （相手が読まないので Close も届かない）。
     async fn write(&mut self, message: WsMessage) -> Flow {
         let limit = self.settings.write_timeout;
-        let interrupt = tokio::select! {
-            biased;
-            result = tokio::time::timeout(limit, self.stream.send(message)) => {
-                return match result {
-                    Ok(Ok(())) => Flow::Continue,
-                    Ok(Err(_)) => Flow::Break,
-                    Err(_) => {
-                        tracing::warn!(
-                            "WebSocket {} への書き込みが {} 秒進まないので切ります",
-                            self.conn.id(),
-                            limit.as_secs_f32()
-                        );
-                        self.conn.mark_closed();
-                        Flow::Break
+        self.send_interruptible(Some(message), limit).await
+    }
+
+    /// tungstenite に溜まった分（Pong の返事）を送り出す。
+    ///
+    /// 待つのは `write_timeout` と 5 秒の短いほうです。過ぎたら切ります
+    /// （Ping を送り続けて読まない相手に、Ping のたびに止められないように）。
+    async fn flush(&mut self) -> Flow {
+        let limit = self.settings.write_timeout.min(CLOSE_WAIT);
+        self.send_interruptible(None, limit).await
+    }
+
+    /// 1 通書く（`None` なら溜まった分を送り出すだけ）。書いている間も次のものに応じる。
+    ///
+    /// | 来たもの | すること |
+    /// |---|---|
+    /// | 閉じる要求（列あふれ） | 書きかけを捨てて、すぐ Close を送る |
+    /// | 閉じる要求（それ以外） | 書きかけを最後まで書き、列の残りも送ってから Close を送る |
+    /// | 停止の合図 | 書きかけを捨てて 1001 を送る |
+    ///
+    /// `limit` まで進まなければ、Close を送らずに切ります。
+    async fn send_interruptible(
+        &mut self,
+        message: Option<WsMessage>,
+        limit: std::time::Duration,
+    ) -> Flow {
+        let interrupt = {
+            let stream = &mut self.stream;
+            let op = tokio::time::timeout(limit, async move {
+                match message {
+                    Some(message) => stream.send(message).await,
+                    None => stream.flush().await,
+                }
+            });
+            tokio::pin!(op);
+            loop {
+                tokio::select! {
+                    biased;
+                    result = &mut op => {
+                        return match result {
+                            Ok(Ok(())) => Flow::Continue,
+                            Ok(Err(_)) => Flow::Break,
+                            Err(_) => {
+                                tracing::warn!(
+                                    "WebSocket {} への書き込みが {} 秒進まないので切ります",
+                                    self.conn.id(),
+                                    limit.as_secs_f32()
+                                );
+                                self.conn.mark_closed();
+                                Flow::Break
+                            }
+                        };
                     }
-                };
+                    Some((code, reason)) = self.receivers.ctrl.recv(), if self.deferred_close.is_none() => {
+                        if self.conn.overflowed() {
+                            break Interrupt::Close(code, reason);
+                        }
+                        // 書きかけは最後まで書く。列の残りを送ってから閉じる（`finish_deferred_close`）。
+                        self.deferred_close = Some((code, reason));
+                    }
+                    _ = self.shutdown.wait_for(|stop| *stop), if !self.shutdown_seen => break Interrupt::Shutdown,
+                }
             }
-            Some((code, reason)) = self.receivers.ctrl.recv() => Interrupt::Close(code, reason),
-            _ = self.shutdown.wait_for(|stop| *stop), if !self.shutdown_seen => Interrupt::Shutdown,
         };
         match interrupt {
             Interrupt::Close(code, reason) => self.start_close(code, &reason).await,
@@ -342,6 +400,17 @@ where
                 self.shutdown_seen = true;
                 self.start_close(1001, "server shutting down").await
             }
+        }
+    }
+
+    /// 書いている途中に閉じる要求が来ていたら、列の残りを送ってから Close を送る。
+    async fn finish_deferred_close(&mut self) -> Flow {
+        let Some((code, reason)) = self.deferred_close.take() else {
+            return Flow::Continue;
+        };
+        match self.drain_queue().await {
+            Flow::Continue => self.start_close(code, &reason).await,
+            Flow::Break => Flow::Break,
         }
     }
 
@@ -366,6 +435,7 @@ where
         if self.closing.is_some() {
             return Flow::Continue;
         }
+        self.deferred_close = None;
         self.conn.mark_closed();
         let code = super::close_code(code);
         let frame = CloseFrame {
@@ -395,8 +465,8 @@ where
             }
             Some(Ok(WsMessage::Ping(_))) => {
                 // tungstenite が Pong を積んでいる。アプリが読んでいなくても返す。
-                let _ = tokio::time::timeout(CLOSE_WAIT, self.stream.flush()).await;
-                Flow::Continue
+                // 送り出せない（相手が読まない）ときは切る。
+                self.flush().await
             }
             Some(Ok(WsMessage::Close(frame))) => {
                 let peer = frame.map(|frame| (u16::from(frame.code), frame.reason.to_string()));
@@ -1071,5 +1141,72 @@ mod tests {
         assert_eq!(next(&mut client).await, Some(WsMessage::text("from-task")));
         client.close(None).await.unwrap();
         finished(task).await;
+    }
+
+    #[tokio::test]
+    async fn 書き込みが詰まっている間にcloseしても書きかけと列の残りを送ってから閉じる() {
+        // 以前は、書きかけの 1 通と列の残りを捨てて Close を送っていた。
+        let big = "x".repeat(64 * 1024);
+        let sent = big.clone();
+        // duplex の入れ物を小さくして、相手が読むまで書き終わらないようにする。
+        let (mut client, _state, task) =
+            pair_with(Settings::default(), 512, |mut socket| async move {
+                socket.send_text(sent).unwrap();
+                // I/O のタスクが大きい 1 通を書き始めてから、残りを積んで閉じる。
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                socket.send_text("a").unwrap();
+                socket.send_text("b").unwrap();
+                socket.close(4000, "app").await;
+            })
+            .await;
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(next(&mut client).await, Some(WsMessage::text(big)));
+        assert_eq!(next(&mut client).await, Some(WsMessage::text("a")));
+        assert_eq!(next(&mut client).await, Some(WsMessage::text("b")));
+        assert_eq!(close_code_of(&mut client).await, Some(4000));
+        finished(task).await;
+    }
+
+    #[tokio::test]
+    async fn pingを送り続けて読まない相手はpongが送れず切る() {
+        let settings = Settings {
+            write_timeout: Duration::from_millis(200),
+            ..Settings::default()
+        };
+        let (mut client, state, task) = pair_with(settings, 512, echo).await;
+        // Pong（1 通 100 バイトほど）で入れ物を埋める。相手（client）は読まない。
+        // サーバーが切った後は書けなくなるので、送れたかどうかは見ない。
+        for _ in 0..20 {
+            let send = client.send(WsMessage::Ping(vec![0; 100].into()));
+            if !matches!(tokio::time::timeout(TEST_WAIT, send).await, Ok(Ok(()))) {
+                break;
+            }
+        }
+        // 以前は送り出しの失敗を見ずに続け、次に読むものを待ち続けていた。
+        finished(task).await;
+        assert_eq!(state.active(), 0, "席は返る");
+        drop(client);
+    }
+
+    #[tokio::test]
+    async fn 席はアプリの後始末が終わってから返る() {
+        let (release, wait) = tokio::sync::oneshot::channel::<()>();
+        let (closed_tx, closed_rx) = tokio::sync::oneshot::channel::<()>();
+        let (mut client, state, task) = pair(|mut socket| async move {
+            while socket.recv().await.is_some() {}
+            let _ = closed_tx.send(());
+            // 閉じた後の後始末。
+            let _ = wait.await;
+        })
+        .await;
+        client.close(None).await.unwrap();
+        let _ = client.next().await;
+        closed_rx.await.unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(state.active(), 1, "後始末の間は席を持ったまま");
+        assert!(!state.wait_idle(Duration::from_millis(20)).await);
+        let _ = release.send(());
+        finished(task).await;
+        assert_eq!(state.active(), 0, "席は返る");
     }
 }

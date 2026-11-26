@@ -15,6 +15,8 @@
 //! 1 は目印（`.env` / `storage/`）を確かめませんが、**その場所があるかは確かめます**。
 //! 打ち間違いを通すと、無い場所の下に `storage/` を作り始めてしまうためです。
 //!
+//! 1 と 2 は、空の値（空白だけの値も）を「無い」と見て次へ進みます。
+//!
 //! 2 だけ目印を確かめません。`init` は `.env` も `storage/` も無い状態で動くためです。
 //! この変数は子プロセスに引き継がれるので、`cargo run` から起動した子プロセスも
 //! cargo のプロジェクトを基準にします。別の場所を見せたいときは `APP_BASE_PATH` を使ってください。
@@ -101,7 +103,10 @@ fn resolve() -> &'static Resolved {
         // `cargo run` から別の実行ファイルを起動すると、その子も cargo の
         // プロジェクトを基準にします。本番の場所を見せたいときは、
         // APP_BASE_PATH に絶対パスを渡してください（1 が優先されます）。
-        if let Some(p) = std::env::var_os("CARGO_MANIFEST_DIR") {
+        //
+        // 空の値は「無い」と見る（`APP_BASE_PATH` と同じ）。そのまま使うと基準が `""`
+        // になり、カレントディレクトリからの相対パスで動いてしまう。
+        if let Some(p) = set_var_os("CARGO_MANIFEST_DIR") {
             return Resolved {
                 path: PathBuf::from(p),
                 source: Source::Cargo,
@@ -247,7 +252,7 @@ pub(crate) fn guard_storage() -> Result<()> {
 /// `.env` の `APP_STORAGE_PATH=` は、空の環境変数として入ります。
 /// そのまま見ると「相対パス」と判定され、起動が止まります。
 /// `env()` の「空は未設定」と同じ扱いにそろえます。
-fn set_var_os(name: &str) -> Option<std::ffi::OsString> {
+pub(crate) fn set_var_os(name: &str) -> Option<std::ffi::OsString> {
     std::env::var_os(name).filter(|raw| !is_blank(raw))
 }
 
@@ -288,6 +293,11 @@ pub fn public_path(relative: impl AsRef<Path>) -> PathBuf {
 ///
 /// `APP_STORAGE_PATH`（絶対パス）で場所を変えられます。
 /// プロセスを2つ以上動かすときは、全プロセスで同じ場所を指してください。
+///
+/// **場所は最初に呼んだときに決まり、以後は変わりません。** 起動（`bengara::run()`）と
+/// `#[bengara::test]` は `.env` を読んでから呼ぶので、`.env` の `APP_STORAGE_PATH` も効きます。
+/// `#[bengara::test]` の付かないテストから先に呼ぶと、`.env` を読む前の場所に決まります。
+/// そのときは `.env` を読んだときに警告のログを出します。
 pub fn storage_path(relative: impl AsRef<Path>) -> PathBuf {
     storage_root().join(relative)
 }
@@ -295,12 +305,40 @@ pub fn storage_path(relative: impl AsRef<Path>) -> PathBuf {
 /// `storage/` そのもの。
 pub(crate) fn storage_root() -> &'static Path {
     STORAGE
-        .get_or_init(|| match set_var_os("APP_STORAGE_PATH") {
-            // 相対パスは guard_storage() が止めるので、ここでは絶対パスだけを見る。
-            Some(raw) if Path::new(&raw).is_absolute() => PathBuf::from(raw),
-            _ => app_path("storage"),
-        })
+        .get_or_init(|| storage_from(set_var_os("APP_STORAGE_PATH")))
         .as_path()
+}
+
+/// `APP_STORAGE_PATH` の値から `storage/` の場所を決める。
+fn storage_from(raw: Option<std::ffi::OsString>) -> PathBuf {
+    match raw {
+        // 相対パスは guard_storage() が止めるので、ここでは絶対パスだけを見る。
+        Some(raw) if Path::new(&raw).is_absolute() => PathBuf::from(raw),
+        _ => app_path("storage"),
+    }
+}
+
+/// `.env` を読んだ後に呼ぶ。`storage/` の場所が `.env` を読む前に決まっていて、
+/// いまの `APP_STORAGE_PATH` と食い違うなら、知らせる文を返す。
+///
+/// 場所は `OnceLock` で固定しているので、後から直せません。止めもしません
+/// （テストのバイナリで起きる形なので、起動を止めるほどではない）。黙って
+/// 違う場所に書かないよう、気づけるようにだけします。
+pub(crate) fn storage_frozen_warning() -> Option<String> {
+    let frozen = STORAGE.get()?;
+    frozen_storage_message(frozen, &storage_from(set_var_os("APP_STORAGE_PATH")))
+}
+
+/// 決まった場所といまの指定が違うときの文。同じなら `None`。
+fn frozen_storage_message(frozen: &Path, now: &Path) -> Option<String> {
+    (frozen != now).then(|| {
+        format!(
+            "storage/ の場所は .env を読む前に {} に決まっていたので、.env の APP_STORAGE_PATH（{}）は効きません。\
+             `#[bengara::test]` の付かないテストで storage_path() などを先に呼んでいないか確かめてください",
+            frozen.display(),
+            now.display()
+        )
+    })
 }
 
 #[cfg(test)]
@@ -396,6 +434,33 @@ mod tests {
         }
         // このテストでは APP_STORAGE_PATH を指定していない。
         assert!(guard_storage().is_ok());
+    }
+
+    #[test]
+    fn env前に決まったstorageの食い違いを知らせる() {
+        // 以前は黙って `.env` の APP_STORAGE_PATH を無視していた。
+        let frozen = Path::new("/srv/app/storage");
+        assert_eq!(frozen_storage_message(frozen, frozen), None);
+        let text = frozen_storage_message(frozen, Path::new("/data/storage")).unwrap();
+        assert!(text.contains("/srv/app/storage"), "{text}");
+        assert!(text.contains("/data/storage"), "{text}");
+        assert!(text.contains("APP_STORAGE_PATH"), "{text}");
+        // このテストのプロセスでは食い違わない（APP_STORAGE_PATH を指定していない）。
+        let _ = storage_root();
+        assert_eq!(storage_frozen_warning(), None);
+    }
+
+    #[test]
+    fn storageの場所は絶対パスの指定だけを採る() {
+        use std::ffi::OsString;
+
+        let absolute = std::env::temp_dir().join("bengara_paths_from");
+        assert_eq!(storage_from(Some(absolute.clone().into())), absolute);
+        assert_eq!(storage_from(None), app_path("storage"));
+        assert_eq!(
+            storage_from(Some(OsString::from("relative"))),
+            app_path("storage")
+        );
     }
 
     #[test]

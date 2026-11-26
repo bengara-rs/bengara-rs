@@ -106,7 +106,7 @@ pub(crate) fn load_dotenv(base: &Path) -> (Option<std::path::PathBuf>, Vec<Strin
             .ok()
             .filter(|value| !value.trim().is_empty())
     };
-    let (pairs, warnings) = parse_dotenv(text, &real);
+    let (pairs, mut warnings) = parse_dotenv(text, &real);
     for (key, value) in first_wins(pairs) {
         if is_unset(std::env::var_os(&key).as_deref()) {
             // SAFETY: 起動直後、スレッドを作る前に1回だけ呼ぶ。
@@ -117,6 +117,8 @@ pub(crate) fn load_dotenv(base: &Path) -> (Option<std::path::PathBuf>, Vec<Strin
             };
         }
     }
+    // `storage/` の場所が `.env` を読む前に決まっていたら、ここで気づけるようにする。
+    warnings.extend(crate::paths::storage_frozen_warning());
     (Some(path), warnings)
 }
 

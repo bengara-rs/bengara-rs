@@ -21,7 +21,7 @@
 //! Route::post("/login", AuthController::login).middleware("guest");
 //! ```
 
-use super::PersonalAccessToken;
+use super::{Authenticatable, PersonalAccessToken};
 use crate::error::Error;
 use crate::http::handler::BoxFuture;
 use crate::http::middleware::{Middleware, Next};
@@ -86,10 +86,38 @@ fn remembers_intended(method: &str) -> bool {
 ///
 /// **覚えるのは `GET` と `HEAD` のときだけです**（Laravel も `GET` のときだけ覚えます）。
 /// ログイン後の転送は `GET` で飛ぶので、`POST` 専用のパスを覚えても 405 になります。
+///
+/// # 利用者がまだいるかは見ません（[`provider`](Self::provider) を付けたときだけ見ます）
+///
+/// 既定では、セッションの利用者 ID（トークンなら持ち主）があれば通します。**DB は引きません。**
+/// 利用者の行を消しても、その人のセッションやトークンは期限まで通ります。
+/// Laravel の `auth` は毎回利用者を読むので、ここは違います。
+/// 利用者を消すときは、`logout_user` でセッションを切り、`tokens().delete()` で
+/// トークンも消してください。毎回確かめたいときは [`provider`](Self::provider) を付けます。
 pub struct Authenticate {
     redirect_to: Option<String>,
     /// セッションではなく、API のトークンで確かめるか（[`token`](Self::token)）。
     token: bool,
+    /// 利用者の型（[`provider`](Self::provider)）。`None` なら利用者を引きません。
+    provider: Option<Provider>,
+}
+
+/// [`Authenticate::provider`] で決めた、利用者の型。
+#[derive(Clone)]
+struct Provider {
+    /// トークンの持ち主の種類として通す名前（[`Authenticatable::morph_class`]）。
+    morph_class: String,
+    /// その主キーの利用者がいるか。
+    exists: fn(String) -> ExistsFuture,
+}
+
+/// [`Provider::exists`] が返す future。
+type ExistsFuture =
+    std::pin::Pin<Box<dyn std::future::Future<Output = crate::error::Result<bool>> + Send>>;
+
+/// `U` の表に、その主キーの行があるか。
+fn user_exists<U: Authenticatable>(id: String) -> ExistsFuture {
+    Box::pin(async move { Ok(U::find(id).await?.is_some()) })
 }
 
 impl Authenticate {
@@ -98,6 +126,7 @@ impl Authenticate {
         Self {
             redirect_to: None,
             token: false,
+            provider: None,
         }
     }
 
@@ -108,7 +137,37 @@ impl Authenticate {
         Self {
             redirect_to: Some(path.into()),
             token: false,
+            provider: None,
         }
+    }
+
+    /// 利用者の型を決め、**その利用者がまだいるか**を毎回確かめる。
+    /// Laravel の `config/auth.php` の `providers`（`'model' => User::class`）に当たります。
+    ///
+    /// ```ignore
+    /// // bootstrap/app.rs
+    /// .alias("auth", Authenticate::redirect_to("/login").provider::<User>())
+    /// .alias("auth:sanctum", Authenticate::token().provider::<User>())
+    /// ```
+    ///
+    /// | 形 | 通さないもの | 返すもの |
+    /// |---|---|---|
+    /// | セッション | 利用者 ID の行が `U` の表に無い | ログインしていないときと同じ（401 か 302） |
+    /// | トークン | 持ち主の種類（`tokenable_type`）が `U::morph_class()` と違う | 401 |
+    /// | トークン | 持ち主の行が `U` の表に無い | 401 |
+    ///
+    /// - **通るたびに主キーで 1 回 DB を引きます。** ハンドラで `user::<U>()` を
+    ///   呼ぶと、もう 1 回引きます。
+    /// - トークンでは、別の型（`Admin` など）のトークンがこのルートを通らなくなります。
+    ///   付けないと、`req.auth().id()` は持ち主の種類を見ずに `tokenable_id` を返します。
+    /// - セッションの中身は書き換えません（利用者がいないときも、ログインの情報は残ります）。
+    /// - DB を引けなかったときはエラー（500）です。
+    pub fn provider<U: Authenticatable>(mut self) -> Self {
+        self.provider = Some(Provider {
+            morph_class: U::morph_class(),
+            exists: user_exists::<U>,
+        });
+        self
     }
 
     /// API のトークン（`Authorization: Bearer ..`）で確かめる形で作る。
@@ -135,23 +194,42 @@ impl Authenticate {
     ///   書けなかったときは警告をログに出し、要求は通します。
     /// - セッションでログインしていても、トークンが無ければ 401 です
     ///   （SPA の Cookie 認証は作っていません）。
+    /// - **持ち主の種類と、持ち主がまだいるかは見ません。** 見るときは
+    ///   [`provider`](Self::provider) を付けてください（`Authenticate::token().provider::<User>()`）。
     pub fn token() -> Self {
         Self {
             redirect_to: None,
             token: true,
+            provider: None,
         }
     }
 }
 
 /// トークンで確かめる（[`Authenticate::token`]）。
-fn authenticate_token(req: Request, next: Next) -> BoxFuture {
+fn authenticate_token(req: Request, next: Next, provider: Option<Provider>) -> BoxFuture {
     let options = next.render_options();
     Box::pin(async move {
         let found = match req.bearer_token() {
             Some(token) => PersonalAccessToken::find_token(token).await?,
             None => None,
         };
-        let Some(token) = found.filter(|token| !token.is_expired()) else {
+        let found = found.filter(|token| !token.is_expired());
+        // 利用者の型を決めてあれば、持ち主の種類と、持ち主がまだいるかも見る。
+        let found = match (found, provider) {
+            (Some(token), Some(provider)) => {
+                if token.tokenable_type != provider.morph_class {
+                    tracing::debug!("トークンの持ち主の種類が違います");
+                    None
+                } else if !(provider.exists)(token.tokenable_id.clone()).await? {
+                    tracing::debug!("トークンの持ち主が見つかりません");
+                    None
+                } else {
+                    Some(token)
+                }
+            }
+            (found, _) => found,
+        };
+        let Some(token) = found else {
             let error = Error::http(401, "ログインしてください");
             tracing::debug!("{error}");
             return Ok(crate::http::response::error_response(&error, options));
@@ -174,7 +252,7 @@ impl Default for Authenticate {
 impl Middleware for Authenticate {
     fn handle(&self, req: Request, next: Next) -> BoxFuture {
         if self.token {
-            return authenticate_token(req, next);
+            return authenticate_token(req, next, self.provider.clone());
         }
         // セッションが無いと、ログインしていても理由なく 401 になる。登録し忘れを知らせる。
         if req.try_session().is_none() {
@@ -185,43 +263,59 @@ impl Middleware for Authenticate {
                 ))
             });
         }
-        if req.auth().check() {
-            return next.run(req);
+        match (req.auth().id(), &self.provider) {
+            (Some(_), None) => return next.run(req),
+            // 利用者の型を決めてあれば、その利用者がまだいるかを見る。
+            (Some(id), Some(provider)) => {
+                let exists = provider.exists;
+                let redirect_to = self.redirect_to.clone();
+                return Box::pin(async move {
+                    if exists(id).await? {
+                        return next.run(req).await;
+                    }
+                    tracing::debug!("セッションの利用者が見つかりません");
+                    unauthenticated(req, next, redirect_to).await
+                });
+            }
+            (None, _) => {}
+        }
+        unauthenticated(req, next, self.redirect_to.clone())
+    }
+}
+
+/// ログインしていない（または利用者が見つからない）ときの応答。転送か 401 を返す。
+fn unauthenticated(req: Request, next: Next, redirect_to: Option<String>) -> BoxFuture {
+    let options = next.render_options();
+    Box::pin(async move {
+        // 転送するかどうかを先に決める。転送しないなら戻り先も覚えない。
+        let will_redirect = redirect_to.is_some() && !options.wants_json;
+
+        // 戻り先を覚えておく（ログイン後に元の画面へ返せるように）。
+        // **自分のサイトの中だけ**を覚えます。
+        // 401 を返すだけの経路で覚えても使い道が無く、401 のたびに
+        // セッションの書き込みが増えるだけなので、転送するときに限ります。
+        //
+        // **`GET` と `HEAD` のときだけ覚えます。** ログイン後は `GET` で飛ばすので、
+        // `POST` 専用の口のパスを覚えると、ログインできた直後に 405 になります。
+        if will_redirect && remembers_intended(req.method()) {
+            if let Some(session) = req.try_session() {
+                let intended = req.full_path();
+                if is_internal_path(&intended) {
+                    session.put(INTENDED_KEY, intended);
+                }
+            }
         }
 
-        let options = next.render_options();
-        let redirect_to = self.redirect_to.clone();
-        Box::pin(async move {
-            // 転送するかどうかを先に決める。転送しないなら戻り先も覚えない。
-            let will_redirect = redirect_to.is_some() && !options.wants_json;
-
-            // 戻り先を覚えておく（ログイン後に元の画面へ返せるように）。
-            // **自分のサイトの中だけ**を覚えます。
-            // 401 を返すだけの経路で覚えても使い道が無く、401 のたびに
-            // セッションの書き込みが増えるだけなので、転送するときに限ります。
-            //
-            // **`GET` と `HEAD` のときだけ覚えます。** ログイン後は `GET` で飛ばすので、
-            // `POST` 専用の口のパスを覚えると、ログインできた直後に 405 になります。
-            if will_redirect && remembers_intended(req.method()) {
-                if let Some(session) = req.try_session() {
-                    let intended = req.full_path();
-                    if is_internal_path(&intended) {
-                        session.put(INTENDED_KEY, intended);
-                    }
-                }
+        match redirect_to {
+            // JSON が欲しいなら、転送ではなく 401 を返す。
+            Some(path) if !options.wants_json => crate::http::redirect().to(path),
+            _ => {
+                let error = Error::http(401, "ログインしてください");
+                tracing::debug!("{error}");
+                Ok(crate::http::response::error_response(&error, options))
             }
-
-            match redirect_to {
-                // JSON が欲しいなら、転送ではなく 401 を返す。
-                Some(path) if !options.wants_json => crate::http::redirect().to(path),
-                _ => {
-                    let error = Error::http(401, "ログインしてください");
-                    tracing::debug!("{error}");
-                    Ok(crate::http::response::error_response(&error, options))
-                }
-            }
-        })
-    }
+        }
+    })
 }
 
 /// ログイン中の人を止めるミドルウェア。Laravel の `guest` に当たります。
@@ -323,21 +417,29 @@ impl Middleware for RedirectIfAuthenticated {
 /// - `Authenticate::token()` より**後ろ**に置いてください。前に置くと、
 ///   まだ認証していないので必ず 401 になります。
 /// - セッションでログインしているだけの要求も 401 です（Laravel も同じ）。
-/// - 能力を 1 つも書かなければ、トークンがあれば通します。
+/// - 能力を 1 つも書かなければ、トークンがあれば通します（組み立てるときに警告を出します）。
 pub struct CheckAbilities {
     abilities: Vec<String>,
 }
 
 impl CheckAbilities {
     /// 要る能力を決めて作る。
+    ///
+    /// 能力を 1 つも渡さないと、トークンさえあれば通ります（Laravel と同じ）。
+    /// 書き忘れに気づけるよう、**組み立てるときに警告を出します。**
     pub fn new<I, S>(abilities: I) -> Self
     where
         I: IntoIterator<Item = S>,
         S: Into<String>,
     {
-        Self {
-            abilities: abilities.into_iter().map(Into::into).collect(),
+        let abilities: Vec<String> = abilities.into_iter().map(Into::into).collect();
+        if abilities.is_empty() {
+            tracing::warn!(
+                "CheckAbilities::new に能力が 1 つもありません。トークンさえあれば、\
+                 どのトークンも通ります"
+            );
         }
+        Self { abilities }
     }
 }
 

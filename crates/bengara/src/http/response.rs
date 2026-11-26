@@ -369,7 +369,12 @@ fn is_redirect_status(status: u16) -> bool {
 /// ```ignore
 /// if !allowed { return abort(403); }
 /// ```
+///
+/// **転送（3xx）には使わないでください。** `abort(302)` は `Location` の無い 302 に
+/// なり、ブラウザはどこへも移りません（Laravel の `abort(302)` も同じです）。
+/// 転送は `redirect().to(..)` で作ります。3xx を渡したときは、ログに警告を 1 行残します。
 pub fn abort<T>(status: u16) -> Result<T> {
+    warn_if_redirect(status);
     Err(Error::Http {
         status,
         message: String::new(),
@@ -377,11 +382,23 @@ pub fn abort<T>(status: u16) -> Result<T> {
 }
 
 /// メッセージ付きで処理を打ち切る。
+///
+/// 3xx を渡したときの扱いは [`abort`] と同じです（`Location` は付きません）。
 pub fn abort_with<T>(status: u16, message: impl Into<String>) -> Result<T> {
+    warn_if_redirect(status);
     Err(Error::Http {
         status,
         message: message.into(),
     })
+}
+
+/// `abort` に 3xx が渡されたら警告を残す。応答は変えません（ステータスはそのまま）。
+fn warn_if_redirect(status: u16) {
+    if (300..400).contains(&status) {
+        tracing::warn!(
+            "abort({status}) は Location の無い {status} になります。転送は redirect().to(..) で作ってください"
+        );
+    }
 }
 
 /// エラーをどう見せるかの指定。起動時とリクエストごとに決まり、以後は変わりません。
@@ -578,6 +595,29 @@ pub(crate) fn render(result: crate::error::Result<Response>, options: RenderOpti
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn abortに3xxを渡すと警告を残しステータスは変えない() {
+        use crate::logging::{layer::LogLayer, stdout::Stdout, Outputs};
+        use tracing_subscriber::prelude::*;
+
+        let buffer = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let outputs = std::sync::Arc::new(Outputs::new(
+            Stdout::capture(buffer.clone()),
+            false,
+            "testing".into(),
+        ));
+        let subscriber = tracing_subscriber::registry().with(LogLayer::new(outputs));
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        let error = abort::<()>(302).unwrap_err();
+        assert_eq!(error.status(), 302);
+        assert_eq!(abort_with::<()>(404, "無い").unwrap_err().status(), 404);
+        let text = String::from_utf8(buffer.lock().unwrap().clone()).unwrap();
+        assert!(text.contains("abort(302)"), "{text}");
+        assert!(text.contains("redirect()"), "{text}");
+        assert!(!text.contains("abort(404)"), "{text}");
+    }
 
     #[test]
     fn with_headerは置き換えwith_added_headerは足す() {

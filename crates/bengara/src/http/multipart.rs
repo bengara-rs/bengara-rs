@@ -161,11 +161,17 @@ fn read_part(body: &Arc<Vec<u8>>, start: usize, end: usize, out: &mut Multipart)
     let part = &body[start..end];
     let (head, content) = split_head(part)?;
     let headers = parse_headers(head)?;
-    let disposition = headers
+    let mut dispositions = headers
         .iter()
-        .find(|(name, _)| name.eq_ignore_ascii_case("content-disposition"))
-        .map(|(_, value)| value.as_str())
+        .filter(|(name, _)| name.eq_ignore_ascii_case("content-disposition"))
+        .map(|(_, value)| value.as_str());
+    let disposition = dispositions
+        .next()
         .ok_or_else(|| broken("欄に Content-Disposition がありません"))?;
+    // 2 本あると、どちらを読むかで前段（WAF など）と食い違わせられる。
+    if dispositions.next().is_some() {
+        return Err(broken("欄に Content-Disposition が 2 本あります"));
+    }
     let disposition = parse_disposition(disposition)?;
 
     let Some(filename) = disposition.filename else {
@@ -220,18 +226,16 @@ fn split_head(part: &[u8]) -> Result<(&[u8], usize)> {
 /// 見出しの行を名前と値の組にする。
 ///
 /// 値は UTF-8 として読みます（ブラウザは日本語のファイル名をそのまま UTF-8 で送ります）。
-/// 空白かタブで始まる行は、前の行の続きとして扱います（古い折り返しの形）。
+///
+/// 空白かタブで始まる行（古い折り返しの形。obs-fold）は 400 です。
+/// RFC 7230 が廃止した形で、ブラウザは送りません。読むと、折り返しを読まない前段と
+/// 見出しの中身が食い違います。
 fn parse_headers(head: &[u8]) -> Result<Vec<(String, String)>> {
     let text = String::from_utf8_lossy(head);
     let mut out: Vec<(String, String)> = Vec::new();
     for line in text.split("\r\n") {
         if line.starts_with([' ', '\t']) {
-            let (_, value) = out
-                .last_mut()
-                .ok_or_else(|| broken("見出しの最初の行が続きの形です"))?;
-            value.push(' ');
-            value.push_str(line.trim());
-            continue;
+            return Err(broken("見出しの折り返し（空白で始まる行）は受けません"));
         }
         let (name, value) = line
             .split_once(':')
@@ -256,6 +260,7 @@ struct Disposition {
 /// | 種類 | `form-data` だけ（RFC 7578 の 4.2） |
 /// | `name` | 無ければ 400 |
 /// | 同じ引数が 2 回 | 400。どちらを使うかで食い違わせる手口を断る |
+/// | 値の無い引数（`; foo;`）・閉じの `"` の後ろに続く文字 | 400。上の確認をすり抜けるため |
 /// | 引用符の中の `\"` と `\\` | 1 文字に戻す（RFC 2045 の quoted-string） |
 /// | `%22` など | 戻さない。ブラウザが `"` を `%22` にして送りますが、PHP も戻しません |
 /// | `filename*` | `filename` より優先する（RFC 6266 の 4.3）。UTF-8 と ISO-8859-1 だけ |
@@ -273,16 +278,30 @@ fn parse_disposition(value: &str) -> Result<Disposition> {
         let (key, after) = rest
             .split_once('=')
             .ok_or_else(|| broken("Content-Disposition の引数の形が正しくありません"))?;
+        // 引数の名前は token（RFC 9110）だけ。値の無い引数があると `foo; filename` が
+        // 1 つの名前になり、`filename` を読み落としてファイルが文字の欄に化けていました。
+        let key = key.trim();
+        if key.is_empty() || !key.bytes().all(is_token_byte) {
+            return Err(broken("Content-Disposition の引数の形が正しくありません"));
+        }
         let after = after.trim_start_matches([' ', '\t']);
         let (parsed, remaining) = match after.strip_prefix('"') {
-            Some(quoted_part) => quoted(quoted_part)?,
+            Some(quoted_part) => {
+                let (parsed, remaining) = quoted(quoted_part)?;
+                // 閉じの `"` の後ろは、空白の後に `;` か終わりだけ。
+                let remaining = remaining.trim_start_matches([' ', '\t']);
+                if !(remaining.is_empty() || remaining.starts_with(';')) {
+                    return Err(broken("Content-Disposition の引用符の後ろに文字があります"));
+                }
+                (parsed, remaining)
+            }
             None => {
                 let end = after.find(';').unwrap_or(after.len());
                 (after[..end].trim_end().to_string(), &after[end..])
             }
         };
         rest = remaining;
-        let slot = match key.trim().to_ascii_lowercase().as_str() {
+        let slot = match key.to_ascii_lowercase().as_str() {
             "name" => &mut name,
             "filename" => &mut filename,
             "filename*" => &mut extended,
@@ -343,14 +362,18 @@ fn decode_extended(raw: &str) -> Option<String> {
 }
 
 /// `%xx` を戻す。壊れた `%` があれば `None`（`+` は空白にしません）。
+///
+/// `xx` は 16 進の 2 桁だけです。`u8::from_str_radix` は先頭の `+` を受ける
+/// （`%+F` が通る）ので使いません。
 fn percent_decode_strict(s: &str) -> Option<Vec<u8>> {
     let bytes = s.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());
     let mut i = 0;
     while i < bytes.len() {
         if bytes[i] == b'%' {
-            let hex = std::str::from_utf8(bytes.get(i + 1..i + 3)?).ok()?;
-            out.push(u8::from_str_radix(hex, 16).ok()?);
+            let high = hex_value(*bytes.get(i + 1)?)?;
+            let low = hex_value(*bytes.get(i + 2)?)?;
+            out.push(high << 4 | low);
             i += 3;
         } else {
             out.push(bytes[i]);
@@ -363,6 +386,16 @@ fn percent_decode_strict(s: &str) -> Option<Vec<u8>> {
 /// パスの最後の要素（`C:\Users\a\b.jpg` → `b.jpg`）。
 fn base_name(name: &str) -> &str {
     name.rsplit(['/', '\\']).next().unwrap_or(name)
+}
+
+/// 16 進の 1 桁の値。16 進でなければ `None`。
+fn hex_value(byte: u8) -> Option<u8> {
+    char::from(byte).to_digit(16).map(|digit| digit as u8)
+}
+
+/// token の文字か（RFC 9110 の tchar）。
+fn is_token_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&byte)
 }
 
 /// `Content-Type` の `boundary` を取り出す。形が正しくなければ `None`。
@@ -586,12 +619,54 @@ mod tests {
     }
 
     #[test]
-    fn 見出しの名前は大文字小文字を区別せず_折り返しも読む() {
+    fn 見出しの名前は大文字小文字を区別しない() {
         let body = b"--XyZ\r\n\
-            content-disposition: FORM-DATA;\r\n name=\"a\"\r\n\
+            content-disposition: FORM-DATA; name=\"a\"\r\n\
             X-Other: 1\r\n\r\n\
             1\r\n--XyZ--";
         assert_eq!(fields(&run(body).unwrap()), [("a", "1")]);
+    }
+
+    #[test]
+    fn 見出しの折り返しは400() {
+        // 以前は前の行の続きとして読んでいた。折り返しを読まない前段と食い違う。
+        let body = b"--XyZ\r\n\
+            content-disposition: form-data;\r\n name=\"a\"\r\n\r\n\
+            1\r\n--XyZ--";
+        assert_eq!(run(body).unwrap_err().status(), 400);
+    }
+
+    #[test]
+    fn 引数の形の食い違いは400() {
+        let cases: &[&[u8]] = &[
+            // 閉じの `"` の後ろに文字。以前は 2 つ目の filename を読み飛ばし、重複の確認をすり抜けた。
+            b"--XyZ\r\nContent-Disposition: form-data; name=\"a\"; filename=\"x\"junk; filename=\"y\"\r\n\r\n1\r\n--XyZ--",
+            // 値の無い引数。以前は `foo; filename` を知らない引数として読み飛ばし、ファイルが文字の欄になった。
+            b"--XyZ\r\nContent-Disposition: form-data; name=\"a\"; foo; filename=\"b\"\r\n\r\n1\r\n--XyZ--",
+            // Content-Disposition が 2 本。
+            b"--XyZ\r\nContent-Disposition: form-data; name=\"a\"\r\nContent-Disposition: form-data; name=\"b\"; filename=\"c\"\r\n\r\n1\r\n--XyZ--",
+        ];
+        for body in cases {
+            let error = run(body)
+                .err()
+                .unwrap_or_else(|| panic!("{:?} が通った", String::from_utf8_lossy(body)));
+            assert_eq!(error.status(), 400, "{:?}", String::from_utf8_lossy(body));
+        }
+        // 閉じの `"` の後ろの空白はかまわない。
+        let body = b"--XyZ\r\nContent-Disposition: form-data; name=\"a\" ; filename=\"b.txt\" \r\n\r\n1\r\n--XyZ--";
+        assert_eq!(
+            run(body).unwrap().files[0].1.client_original_name(),
+            "b.txt"
+        );
+    }
+
+    #[test]
+    fn filename星の16進は2桁だけ() {
+        // `u8::from_str_radix` は `+F` を 15 と読んでいた。
+        assert_eq!(percent_decode_strict("%+F"), None);
+        assert_eq!(percent_decode_strict("%-1"), None);
+        assert_eq!(percent_decode_strict("%E"), None);
+        assert_eq!(percent_decode_strict("%e7%94"), Some(vec![0xe7, 0x94]));
     }
 
     #[test]
