@@ -1,0 +1,8 @@
+# CodeQL の設定（codeql.yml から読む）。
+query-filters:
+  # 「暗号に固定の値を使っている」の検査を外す。
+  # Rust のテストは本体と同じファイル（mod tests）にあるので、パスではテストだけを外せない。
+  # テストの固定のパスワード・鍵・塩と、時間合わせの空回しの固定の塩で 100 件を超えて出る。
+  # 本物の鍵（APP_KEY）は環境変数から読み、コードには書かない。
+  - exclude:
+      id: rust/hard-coded-cryptographic-value

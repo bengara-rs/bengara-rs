@@ -35,6 +35,8 @@ jobs:
           languages: rust
           build-mode: none
           queries: security-extended
+          # 外す検査とその理由は、この設定ファイルに書いてある。
+          config-file: ./.github/codeql/codeql-config.yml
       - uses: github/codeql-action/analyze@v4
         with:
           category: "/language:rust"

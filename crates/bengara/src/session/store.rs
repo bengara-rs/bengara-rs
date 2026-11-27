@@ -274,6 +274,20 @@ const TEMP_STALE_SECS: u64 = 300;
 /// 実際の割合は **6/256（約 2.3%）** です。切り上げのぶん 2% より少し多めです。
 const SWEEP_LOTTERY: (u8, u8) = (2, 100);
 
+/// テストのビルドでの抽選。**当たりません。**
+///
+/// 本物の抽選のままだと、どのテストの `write` でも裏の掃除がでたらめに走り、
+/// 同じ置き場所のファイルを先に消します（ときどき落ちるテストになる）。
+/// 掃除を確かめるテストは `sweep` を直接呼び、抽選は `with_sweep_lottery` で
+/// 当たりを決めて確かめます。
+#[cfg(test)]
+const SWEEP_LOTTERY_IN_TESTS: (u8, u8) = (0, 1);
+
+/// 1 バイトの乱数 `draw`（0..=255）が抽選に当たったか（[`SWEEP_LOTTERY`] を参照）。
+fn lottery_hits(draw: u8, (hits, out_of): (u8, u8)) -> bool {
+    u32::from(draw) * u32::from(out_of) < u32::from(hits) * 256
+}
+
 /// 書き込みのついでの掃除が、1 回で見るファイルの数の上限。
 ///
 /// 上限が無いと、抽選に当たった 1 回が置き場所の全ファイルを解析します。
@@ -333,6 +347,8 @@ pub struct FileStore {
     lifetime_secs: u64,
     /// ディレクトリの権限を直したか（`ensure_dir` が1回だけ呼びます）。
     restricted: std::sync::Once,
+    /// 書き込みのついでの掃除の抽選（[`SWEEP_LOTTERY`] を参照）。
+    sweep_lottery: (u8, u8),
 }
 
 impl FileStore {
@@ -342,7 +358,18 @@ impl FileStore {
             dir: dir.into(),
             lifetime_secs,
             restricted: std::sync::Once::new(),
+            #[cfg(not(test))]
+            sweep_lottery: SWEEP_LOTTERY,
+            #[cfg(test)]
+            sweep_lottery: SWEEP_LOTTERY_IN_TESTS,
         }
+    }
+
+    /// 抽選を決める（テスト用）。`(1, 1)` で毎回当たり、`(0, 1)` で当たらない。
+    #[cfg(test)]
+    fn with_sweep_lottery(mut self, lottery: (u8, u8)) -> Self {
+        self.sweep_lottery = lottery;
+        self
     }
 
     /// `storage/framework/sessions/` に置く（既定）。
@@ -463,10 +490,7 @@ impl FileStore {
     fn maybe_sweep(&self) {
         use std::sync::atomic::Ordering;
 
-        let draw = crypto::random_bytes::<1>()[0];
-        // 0..=255 のうち、当たる幅（`SWEEP_LOTTERY` を参照）。
-        let (hits, out_of) = SWEEP_LOTTERY;
-        if u32::from(draw) * u32::from(out_of) >= u32::from(hits) * 256 {
+        if !lottery_hits(crypto::random_bytes::<1>()[0], self.sweep_lottery) {
             return;
         }
         // すでに走っていれば何もしない。
@@ -1172,8 +1196,7 @@ mod tests {
     #[test]
     fn 期限切れだけを掃除する() {
         let dir = temp_dir("sweep");
-        // `FileStore::write` を使わずに直接書きます。`write` は抽選で裏の掃除を
-        // 走らせるので、当たると下の `sweep` より先に old を消してしまいます。
+        // 期限の違うファイルを 1 つの置き場所に置くため、`FileStore::write` を使わずに直接書きます。
         let put = |id: &str, lifetime_secs: u64| {
             let stored = StoredRef {
                 expires_at: now_seconds_u64() + lifetime_secs,
@@ -1348,6 +1371,39 @@ mod tests {
             temp.exists(),
             "書きかけは触らない（消すと rename が失敗する）"
         );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn 抽選の当たる割合() {
+        let count = |lottery| (0..=255u8).filter(|&d| lottery_hits(d, lottery)).count();
+        assert_eq!(count(SWEEP_LOTTERY), 6, "本物は 6/256（約 2.3%）");
+        assert_eq!(count(SWEEP_LOTTERY_IN_TESTS), 0, "テストでは当たらない");
+        assert_eq!(count((1, 1)), 256, "(1, 1) は毎回当たる");
+    }
+
+    #[test]
+    fn 抽選に当たると書き込みのついでに裏で掃除する() {
+        // テストのビルドでは抽選が当たらないので、ここだけ毎回当たりにする。
+        // 裏の掃除を走らせるのはこのテストだけなので、`SWEEPING` を取り合わない。
+        let dir = temp_dir("sweep-lottery");
+        FileStore::new(&dir, 0)
+            .write("old", &data(&[("a", "1")]))
+            .unwrap();
+        assert!(dir.join("old").exists(), "当たらない抽選では消えない");
+
+        FileStore::new(&dir, 60)
+            .with_sweep_lottery((1, 1))
+            .write("new", &data(&[("a", "1")]))
+            .unwrap();
+        // 掃除は別のスレッドなので、終わるまで少し待つ。
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while dir.join("old").exists() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(!dir.join("old").exists(), "期限切れは裏の掃除で消える");
+        assert!(dir.join("new").exists(), "書いたものは残る");
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1651,7 +1707,7 @@ mod tests {
     #[test]
     fn 掃除は一度に見る数を打ち切る() {
         // 上限が無いと、抽選に当たった 1 回が置き場所の全ファイルを解析する。
-        // `store.write` は抽選つきなので、ここではファイルを直に置く。
+        // 期限切れを 5 件まとめて置くため、ここではファイルを直に置く。
         let dir = temp_dir("sweep-max");
         let stored = Stored {
             expires_at: now_seconds_u64().saturating_sub(10),
