@@ -1424,6 +1424,11 @@ mod tests {
     #[test]
     fn 版指定の形() {
         let requirement = version_requirement();
-        assert!(requirement.starts_with('0') || requirement.parse::<u32>().is_ok());
+        if env!("CARGO_PKG_VERSION_PRE").is_empty() {
+            assert!(requirement.starts_with('0') || requirement.parse::<u32>().is_ok());
+        } else {
+            // 試験版は `0.1` では選ばれないので、版をそのまま書く。
+            assert_eq!(requirement, env!("CARGO_PKG_VERSION"));
+        }
     }
 }

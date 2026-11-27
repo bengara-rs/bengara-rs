@@ -35,7 +35,7 @@ cargo new myapp && cd myapp
 ```toml
 # Cargo.toml に足す（ソースを myapp の隣に置いた例）
 [dependencies]
-bengara = { version = "0.1", features = ["sqlite"] }
+bengara = { version = "0.1.0-alpha.1", features = ["sqlite"] }
 
 [patch.crates-io]
 bengara = { path = "../bengara-rs/crates/bengara" }

@@ -245,7 +245,13 @@ pub(crate) fn cargo_command() -> PathBuf {
 }
 
 /// `bengara` に依存を書くときの版指定（`0.1` のような形）。
+///
+/// 試験版（`0.1.0-alpha.1` のような `-` の付いた版）のときは、版をそのまま返します。
+/// Cargo は `0.1` という指定に試験版を選ばないので、`0.1` と書くと見つからずにビルドが落ちます。
 pub(crate) fn version_requirement() -> String {
+    if !env!("CARGO_PKG_VERSION_PRE").is_empty() {
+        return env!("CARGO_PKG_VERSION").to_string();
+    }
     let major = env!("CARGO_PKG_VERSION_MAJOR");
     let minor = env!("CARGO_PKG_VERSION_MINOR");
     if major == "0" {

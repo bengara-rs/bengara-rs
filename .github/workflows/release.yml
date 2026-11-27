@@ -1,0 +1,64 @@
+name: Release
+
+# main に push したら crates.io に出す。
+# workspace の version（Cargo.toml）が crates.io にまだ無いクレートだけを出す。
+# 版を上げずに push したときは、何も出さずに終わる。
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+permissions:
+  contents: read
+
+# 出している途中で次の push が来ても、止めずに順に流す。
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    name: publish
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      # 出す前に、最低限の検査をもう一度通す（ci.yml の check と同じ）。
+      - run: cargo fmt --all --check
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - run: cargo test --workspace
+      - name: crates.io に出す
+        shell: bash
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: |
+          if [ -z "$CARGO_REGISTRY_TOKEN" ]; then
+            echo "secrets.CARGO_REGISTRY_TOKEN がありません"
+            exit 1
+          fi
+          version=$(cargo metadata --no-deps --format-version 1 \
+            | jq -r '.packages[] | select(.name == "bengara") | .version')
+          echo "版: $version"
+          # 依存される側から順に出す（bengara は bengara-macros に依存する）。
+          # cargo publish は、出した版が索引に載るまで待ってから終わる。
+          for crate in bengara-macros bengara-build bengara; do
+            status=$(curl -s -o /dev/null -w '%{http_code}' \
+              -A "bengara-rs release (https://github.com/bengara-rs/bengara-rs)" \
+              "https://crates.io/api/v1/crates/$crate/$version")
+            if [ "$status" = "200" ]; then
+              echo "$crate $version は出してあります。飛ばします"
+              continue
+            fi
+            if [ "$status" != "404" ]; then
+              echo "crates.io に問い合わせられませんでした（$status）"
+              exit 1
+            fi
+            echo "$crate $version を出します"
+            cargo publish -p "$crate" --locked
+          done

@@ -23,10 +23,15 @@ fuzz_target!(|data: &[u8]| {
     assert_eq!(bengara::fuzzing::sha256(message), expected, "sha256");
 
     // HMAC-SHA256
-    let mut mac = <Hmac<Sha256> as KeyInit>::new_from_slice(key).expect("HMAC は鍵の長さを問わない");
+    let mut mac =
+        <Hmac<Sha256> as KeyInit>::new_from_slice(key).expect("HMAC は鍵の長さを問わない");
     mac.update(message);
     let expected: [u8; 32] = mac.finalize().into_bytes().into();
-    assert_eq!(bengara::fuzzing::hmac_sha256(key, message), expected, "hmac_sha256");
+    assert_eq!(
+        bengara::fuzzing::hmac_sha256(key, message),
+        expected,
+        "hmac_sha256"
+    );
 
     // PBKDF2-HMAC-SHA256（回数は 1〜4）
     let mut expected = [0u8; 32];
@@ -38,7 +43,10 @@ fuzz_target!(|data: &[u8]| {
     );
 
     // 定数時間の比較は == と同じ真偽。
-    assert_eq!(bengara::fuzzing::constant_time_eq(key, message), key == message);
+    assert_eq!(
+        bengara::fuzzing::constant_time_eq(key, message),
+        key == message
+    );
     assert!(bengara::fuzzing::constant_time_eq(message, message));
 
     // 16 進は往復で戻る。読めない文字列でもパニックしない。

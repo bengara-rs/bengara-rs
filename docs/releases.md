@@ -3,7 +3,7 @@
 bengara の版の付け方と、版を上げても壊さないと約束する範囲です。Laravel の「Release Notes」に当たります。
 
 - 変更の中身は [CHANGELOG.md](../CHANGELOG.md) にあります。
-- 版の番号は 0.1.0 です。crates.io には出していません（[README](../README.md#動かす)）。
+- 版の番号は 0.1.0-alpha.1 です。crates.io には出していません（[README](../README.md#動かす)）。
 
 ## 版の付け方
 
@@ -13,6 +13,24 @@ bengara の版の付け方と、版を上げても壊さないと約束する範
 |------------|--------------------|------------------------|
 | 0.x の間   | minor（0.1 → 0.2） | patch（0.1.0 → 0.1.1） |
 | 1.0 から先 | major（1.x → 2.0） | minor か patch         |
+
+### 試験版（alpha）
+
+`-alpha.1` のように `-` の付いた版は試験版です。
+
+- 試験版の間は、下の「壊さない約束」をしません。壊す変更でも `-alpha.1` → `-alpha.2` と上げます。
+- Cargo は、`bengara = "0.1"` という指定に試験版を選びません。試すときは版をそのまま書きます。
+
+```toml
+[dependencies]
+bengara = { version = "0.1.0-alpha.1", features = ["sqlite"] }
+
+[build-dependencies]
+bengara-build = "0.1.0-alpha.1"
+```
+
+- `cargo run -- init` は、試験版のときは版をそのまま `Cargo.toml` に書きます。
+- `0.1.0` を出したら、`"0.1"` と書けば選ばれるようになります。
 
 - 「壊す変更」は、下の「壊さない約束の範囲」を変えるものです。
 - Cargo は `0.1` と書いた依存を、0.1.x の中だけで上げます。

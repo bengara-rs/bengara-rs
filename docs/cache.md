@@ -94,7 +94,8 @@ let stats: Stats = Cache::remember_json("stats", 600, || async { Ok(count().awai
 
 - 知らない名前を書くと、警告を出して `file` にします。
 - **プロセスを 2 つ以上動かすときは `file` にします。** 全部が同じ `storage/` を見るようにしてください。
-- `storage/` が無いと、`file` は書き込みでエラーになります。`storage:init` で作ってください（[deployment.md](deployment.md)）。
+- `storage/` が無いと、`file` は書き込みでエラーになります。`storage:init`
+  で作ってください（[deployment.md](deployment.md)）。
 - `storage/framework/cache/` は、無ければ作ります。所有者だけが読める権限にします。
 
 `config/cache.rs` を置くと、そちらを使います。無くても動きます。

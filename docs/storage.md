@@ -30,7 +30,8 @@ Storage::delete("notes/memo.txt").await?;
 | `append(パス, 文字)`             | `Result<()>`              | 末尾に書き足す（[書き足す](#書き足す)） |
 
 - 書く途中で落ちると、途中までのファイルが残ります（Laravel と同じ）。
-- `storage/` そのものが無いと、書き込みはエラーです。先に `storage:init` で作ります（[置き場所を動かす](#置き場所を動かす)）。
+- `storage/` そのものが無いと、書き込みはエラーです。先に `storage:init`
+  で作ります（[置き場所を動かす](#置き場所を動かす)）。
 - 空のパス（`""` や `"."`）はエラーです。
 - 文字として読めない中身を `get` するとエラーです。`get_bytes` で読みます。
 
@@ -97,8 +98,8 @@ pub fn config() -> StorageConfig {
 
 ### 一覧を取る
 
-`files` は下のディレクトリまで全部見て、ディスクからの相対パスを返します。
-**Laravel の `allFiles` に当たります。** Laravel の `files`（その階だけ）に当たるものはありません。
+`files` は下のディレクトリまで全部見て、ディスクからの相対パスを返します。 **Laravel の `allFiles` に当たります。** Laravel
+の `files`（その階だけ）に当たるものはありません。
 
 ```rust
 Storage::default_disk()?.files("notes").await?;

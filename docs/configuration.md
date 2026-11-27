@@ -131,7 +131,8 @@ pub fn config() -> CorsConfig {
 - オリジンのスキームとホストは、大文字小文字を区別せずに比べます。
 - Laravel の `allowed_origins_patterns`（正規表現）はありません。
 - Laravel の既定の `paths` にある `sanctum/csrf-cookie` は入っていません（その口がありません）。
-- 矛盾する組み合わせ（`supports_credentials` と `*` など）は、起動時に止まります（[middleware.md](middleware.md#起動時に止まる設定)）。
+- 矛盾する組み合わせ（`supports_credentials` と `*`
+  など）は、起動時に止まります（[middleware.md](middleware.md#起動時に止まる設定)）。
 
 ### いまの環境を調べる
 
@@ -396,7 +397,7 @@ TRUSTED_PROXIES=10.0.0.1,10.0.0.2
 
 ```toml
 [dependencies]
-bengara = { version = "0.1", features = ["sqlite", "mail"] }
+bengara = { version = "0.1.0-alpha.1", features = ["sqlite", "mail"] }
 ```
 
 | フラグ           | 既定           | 入れると使えるもの                                                                      |
@@ -426,7 +427,7 @@ bengara = { version = "0.1", features = ["sqlite", "mail"] }
 
 ```toml
 [dependencies]
-bengara = { version = "0.1", default-features = false, features = ["sqlite"] }
+bengara = { version = "0.1.0-alpha.1", default-features = false, features = ["sqlite"] }
 ```
 
 ## パスを作る関数

@@ -74,7 +74,7 @@ cp /path/to/.env.example .env   # 中身を本番用に直す
 `./myapp about` で、いまの設定と置き場所を出します。
 
 ```
-bengara           0.1.0
+bengara           0.1.0-alpha.1
 アプリ名          myapp
 環境              production
 デバッグ表示      なし

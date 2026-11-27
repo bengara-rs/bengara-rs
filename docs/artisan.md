@@ -148,7 +148,8 @@ $ cargo artisan cache:clear --tries=9
 
 `migrate:rollback` / `migrate:reset` / `migrate:refresh` / `migrate:fresh` / `db:wipe`
 
-**表を変えるコマンドは同時に流せません。** 2 つ目は「実行中です」で止まります（[deployment.md](deployment.md#migrate-の同時実行)）。
+**表を変えるコマンドは同時に流せません。** 2
+つ目は「実行中です」で止まります（[deployment.md](deployment.md#migrate-の同時実行)）。
 
 ## serve の動き
 

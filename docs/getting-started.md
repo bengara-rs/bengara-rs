@@ -14,7 +14,7 @@ cargo new myapp && cd myapp
 
 ```toml
 [dependencies]
-bengara = { version = "0.1", features = ["sqlite"] }
+bengara = { version = "0.1.0-alpha.1", features = ["sqlite"] }
 
 # 取得したソースの場所を書く（下は myapp の隣に置いた例）
 [patch.crates-io]

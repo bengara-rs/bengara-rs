@@ -10,7 +10,10 @@ fuzz_target!(|data: &[u8]| {
     let _ = bengara::fuzzing::percent_decode_strict(&text);
 
     let encoded = bengara::fuzzing::percent_encode(&text);
-    assert!(encoded.is_ascii(), "符号化した結果は ASCII だけ: {encoded:?}");
+    assert!(
+        encoded.is_ascii(),
+        "符号化した結果は ASCII だけ: {encoded:?}"
+    );
     assert_eq!(
         bengara::fuzzing::percent_decode_strict(&encoded),
         text,

@@ -139,11 +139,12 @@ pub async fn login(req: Request) -> Result<Response> {
   ログイン後の画面で取り直します（[session.md](session.md)）。
 - `login(&user)` は、保存していないモデル（主キーが `0`・空など）では `Err` です。先に `save()` します。
 - `user()` は呼ぶたびに DB を引きます。何度も使うときは変数に入れます。
-- `check()` / `guest()` / `id()` と `auth` ミドルウェアは、セッションだけを見ます。
-  **利用者がまだいるかは見ません**（Laravel と違います）。
-  - 利用者の行を消しても、セッションが残るあいだは通ります。
-  - **利用者を消したら `logout_user(id)` を呼びます。**
-  - 毎回確かめるときは、ミドルウェアに `provider::<User>()` を付けます（[下の節](#利用者がまだいるかも確かめるprovider)）。
+- `check()` / `guest()` / `id()` と `auth` ミドルウェアは、セッションだけを見ます。 **利用者がまだいるかは見ません**
+  （Laravel と違います）。
+    - 利用者の行を消しても、セッションが残るあいだは通ります。
+    - **利用者を消したら `logout_user(id)` を呼びます。**
+    - 毎回確かめるときは、ミドルウェアに `provider::<User>()`
+      を付けます（[下の節](#利用者がまだいるかも確かめるprovider)）。
 - 利用者がいないときも、`attempt` は照合と同じだけ時間をかけます。応答の速さで登録の有無が分からないようにするためです。
 
 ### ログインの回数を制限する
@@ -471,7 +472,8 @@ Route::prefix("api").name("api.").middleware("auth:sanctum").group(|| {
 - `last_used_at` を書きます。前に書いてから 60 秒たっていなければ書きません。
 - 名前の `auth:sanctum` は好きに決めてかまいません。`alias` に渡した名前で呼びます。
 - **持ち主の種類と、持ち主がまだいるかは見ません。** 見るときは `Authenticate::token().provider::<User>()` にします
-  （[利用者がまだいるかも確かめる](#利用者がまだいるかも確かめるprovider)）。付けないと、`Admin` のトークンも `User` のルートを通ります。
+  （[利用者がまだいるかも確かめる](#利用者がまだいるかも確かめるprovider)）。付けないと、`Admin` のトークンも `User`
+  のルートを通ります。
 
 ### ハンドラで読む
 
@@ -542,7 +544,7 @@ user.tokens().delete().await?;
 値を他人に読めない形にします。機能フラグ `encryption` が要ります。
 
 ```toml
-bengara = { version = "0.1", features = ["sqlite", "encryption"] }
+bengara = { version = "0.1.0-alpha.1", features = ["sqlite", "encryption"] }
 ```
 
 ```rust
@@ -574,7 +576,7 @@ let plain = decrypt(&hidden)?;       // 改ざんされていればエラー
 Laravel の users 表を持ち込んだとき、全員にパスワードを設定し直してもらわずに済みます。
 
 ```toml
-bengara = { version = "0.1", features = ["sqlite", "bcrypt"] }
+bengara = { version = "0.1.0-alpha.1", features = ["sqlite", "bcrypt"] }
 ```
 
 - **照合だけです。bcrypt で作ることはできません。**
@@ -620,7 +622,7 @@ pub fn config() -> HashConfig {
 ### Argon2id の強さ
 
 ```toml
-bengara = { version = "0.1", features = ["sqlite", "argon2"] }
+bengara = { version = "0.1.0-alpha.1", features = ["sqlite", "argon2"] }
 ```
 
 | 環境変数        | 既定     | 意味                   | 範囲                         |

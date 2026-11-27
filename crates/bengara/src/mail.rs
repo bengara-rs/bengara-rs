@@ -22,7 +22,7 @@
 //! `features` に `"mail"` を**足します**（DB のフラグは残します）。
 //!
 //! ```toml
-//! bengara = { version = "0.1", features = ["sqlite", "mail"] }
+//! bengara = { version = "0.1.0-alpha.1", features = ["sqlite", "mail"] }
 //! ```
 
 use std::sync::atomic::{AtomicBool, Ordering};

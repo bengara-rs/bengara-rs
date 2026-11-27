@@ -253,7 +253,7 @@ SELECT time, method, path, duration_us / 1000.0 AS ms FROM access ORDER BY durat
 
 ```toml
 [dependencies]
-bengara = { version = "0.1", features = ["sqlite", "metrics-system"] }
+bengara = { version = "0.1.0-alpha.1", features = ["sqlite", "metrics-system"] }
 ```
 
 ## 2 つのプロセスで動かすとき

@@ -9,7 +9,7 @@
 //! 使うには Cargo の機能フラグが必要です。
 //!
 //! ```toml
-//! bengara = { version = "0.1", features = ["sqlite"] }
+//! bengara = { version = "0.1.0-alpha.1", features = ["sqlite"] }
 //! ```
 //!
 //! フラグが無い状態でもコンパイルはできます。実際に接続しようとしたときだけ、

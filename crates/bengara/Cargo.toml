@@ -19,7 +19,7 @@ default = ["log-filter"]
 log-filter = ["tracing-subscriber/env-filter"]
 
 # データベース。既定では入りません。使うドライバを利用者が選びます。
-#   bengara = { version = "0.1", features = ["sqlite"] }
+#   bengara = { version = "0.1.0-alpha.1", features = ["sqlite"] }
 # フラグが無いときも database モジュールはコンパイルされ、実際に接続しようとした
 # ときだけ「features に "sqlite" を足してください」というエラーになります。
 sqlite = ["database", "sqlx/sqlite"]

@@ -17,7 +17,7 @@
 | `crates/bengara-build`  | `build.rs` の自動検出                    | **依存クレートを持たない**。**パニック禁止**（問題は生成コードの `compile_error!` で伝える）                                                     |
 | `crates/bengara-macros` | `#[bengara::test]` と `#[derive(Model)]` | ここに機能を増やさない。マクロのエラーは分かりやすい文で出す。例外：`#[derive(Model)]` の `columns` 指定（型付きの列の定数）は足した（判断 240） |
 
-- workspace 共通: version 0.1.0 / edition 2021 / rust-version 1.88 / license `MIT OR Apache-2.0`。
+- workspace 共通: version 0.1.0-alpha.1 / edition 2021 / rust-version 1.88 / license `MIT OR Apache-2.0`。
   bengara 自身は edition 2021 で書く。MSRV は 1.88（依存の版を固定せずに済む下限。判断 248）。
   依存を増やすときは MSRV を上げないか確かめる。
 - `bengara-build` が生成するモジュールは、クレート直下に平らに並べる。入れ子の `#[path]` は書かない
@@ -66,6 +66,13 @@ cargo audit        # 無視するものは .cargo/audit.toml（deny.toml とそ�
 
 - 無視の一覧（`ignore`）には、mao さんの了承なしに足さない。
 
+crates.io への公開（`.github/workflows/release.yml`）：
+
+- `main` に push すると、workspace の version が crates.io にまだ無いクレートだけを出す。
+  順は `bengara-macros` → `bengara-build` → `bengara`。
+- 版を上げずに push したときは何も出さない。出したい変更は、先に version と `CHANGELOG.md` を上げる。
+- 一度出した版は消せない（取り下げ＝yank だけ）。
+
 ファジング（`fuzz/`。nightly の Rust と `cargo install cargo-fuzz` が要る）：
 
 ```sh
@@ -77,7 +84,8 @@ cargo +nightly fuzz run multipart -- -max_total_time=600 -max_len=65536
 
 - ターゲットは `multipart` `cookie_header` `percent` `dotenv` `cargo_toml` `lang_toml` `crypto` `log_line`。
 - 内部の関数は `cfg(fuzzing)` のときだけある `bengara::fuzzing` / `bengara_build::fuzzing` から呼ぶ（公開 API ではない）。
-- Windows では ASan の DLL（`clang_rt.asan_dynamic-x86_64.dll`。Visual Studio の `VC\Tools\MSVC\<版>\bin\Hostx64\x64`）を `PATH` に足す。
+- Windows では ASan の DLL（`clang_rt.asan_dynamic-x86_64.dll`。Visual Studio の `VC\Tools\MSVC\<版>\bin\Hostx64\x64`）を
+  `PATH` に足す。
 - 見つかった不具合は、最小の入力を通常のテストに回帰テストとして足してから直す。
 
 ## ドキュメントの置き場所

@@ -1,7 +1,7 @@
 //! テンプレート（`resources/views/*.html`）。Laravel の `view()` に当たります。
 //!
 //! ```ignore
-//! // 機能フラグが要ります: bengara = { version = "0.1", features = ["view"] }
+//! // 機能フラグが要ります: bengara = { version = "0.1.0-alpha.1", features = ["view"] }
 //! use bengara::serde_json::json;
 //!
 //! async fn index(req: Request) -> Result<Response> {

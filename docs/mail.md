@@ -43,7 +43,8 @@ Mail::to("alice@example.com")
 
 - 改行を断るのは、ヘッダーに偽の行を混ぜられないようにするためです。本文の改行は通ります。
 - 空白だけの宛先・写しは飛ばします（`.cc("")` でも落ちません）。
-- **アドレスの形は確かめません。** 入力から受け取るなら、`email` の検査規則を通してください（[validation.md](validation.md)）。
+- **アドレスの形は確かめません。** 入力から受け取るなら、`email`
+  の検査規則を通してください（[validation.md](validation.md)）。
 
 ### キューから送る
 
@@ -153,7 +154,8 @@ async fn お知らせを送る() {
 
 - 溜まったメールは残り続けます。数える前に `Mail::clear_sent()` を呼びます。
 - 溜まる場所はプロセスに 1 つです。`Mail::sent()` を見るテストは `exclusive()` の札を取ります。
-- DB の札も取るときは、`refresh_database()` → `exclusive()` の順です（[testing.md](testing.md#テストどうしがぶつからないように)）。
+- DB の札も取るときは、`refresh_database()` → `exclusive()`
+  の順です（[testing.md](testing.md#テストどうしがぶつからないように)）。
 - `MAIL_MAILER=log cargo test` のように環境変数で渡すと、そちらを使います。
 - `Message` で見られる欄は `to`・`cc`・`bcc`・`from`・`reply_to`・`subject`・`text`・`html` です。
 - `User::register` はアプリの側の関数です（[authentication.md](authentication.md)）。
@@ -165,7 +167,7 @@ Cargo の機能フラグ `mail` を足します。**既定では入りません�
 
 ```toml
 [dependencies]
-bengara = { version = "0.1", features = ["sqlite", "mail"] }
+bengara = { version = "0.1.0-alpha.1", features = ["sqlite", "mail"] }
 ```
 
 `.env` に送り先を書きます。送るコードは変えません。
@@ -208,8 +210,8 @@ MAIL_FROM_NAME=myapp
 
 ### `MAIL_SCHEME`（Laravel 11）
 
-Laravel 11 の `.env` は、`MAIL_ENCRYPTION` の代わりに `MAIL_SCHEME` を書きます。
-**書いてあれば `MAIL_ENCRYPTION` より先に見ます。**
+Laravel 11 の `.env` は、`MAIL_ENCRYPTION` の代わりに `MAIL_SCHEME` を書きます。 **書いてあれば `MAIL_ENCRYPTION`
+より先に見ます。**
 
 | `MAIL_SCHEME` | つなぎ方                                              |
 |---------------|-------------------------------------------------------|

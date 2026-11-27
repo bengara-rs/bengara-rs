@@ -127,7 +127,10 @@ jobs:
           cd myapp
           # cargo new の Cargo.toml は [dependencies] で終わるので、そこへ追記する。
           # 公開前なので、crates.io ではなく手元のソースを使う。
-          printf 'bengara = { version = "0.1", features = ["sqlite"] }\n\n' >> Cargo.toml
+          # [patch] は依存の版の指定に合うときだけ効く。試験版（0.1.0-alpha.1 など）は
+          # "0.1" に合わないので、workspace の版をそのまま書く。
+          version=$(sed -n 's/^version = "\(.*\)"$/\1/p' ../bengara-rs/Cargo.toml | head -n 1)
+          printf 'bengara = { version = "%s", features = ["sqlite"] }\n\n' "$version" >> Cargo.toml
           printf '[patch.crates-io]\n' >> Cargo.toml
           printf 'bengara = { path = "../bengara-rs/crates/bengara" }\n' >> Cargo.toml
           printf 'bengara-build = { path = "../bengara-rs/crates/bengara-build" }\n' >> Cargo.toml
@@ -187,7 +190,8 @@ jobs:
         run: |
           cargo new myapp
           cd myapp
-          printf 'bengara = { version = "0.1", features = ["sqlite"] }\n\n' >> Cargo.toml
+          version=$(sed -n 's/^version = "\(.*\)"$/\1/p' ../bengara-rs/Cargo.toml | head -n 1)
+          printf 'bengara = { version = "%s", features = ["sqlite"] }\n\n' "$version" >> Cargo.toml
           printf '[patch.crates-io]\n' >> Cargo.toml
           printf 'bengara = { path = "../bengara-rs/crates/bengara" }\n' >> Cargo.toml
           printf 'bengara-build = { path = "../bengara-rs/crates/bengara-build" }\n' >> Cargo.toml

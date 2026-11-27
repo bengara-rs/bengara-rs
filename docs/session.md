@@ -191,7 +191,8 @@ StartSession::from_env().with_config(SessionConfig {
 | `path`          | `/`               | -                        | Cookie を送る範囲                                          |
 
 - **`with_config` は設定を丸ごと置き換えます。** 残りは `..SessionConfig::from_env()` で埋めてください。
-- `..SessionConfig::default()` で埋めると、`SESSION_LIFETIME` と `SESSION_SECURE_COOKIE` が読まれません。期限も 7200 秒に戻ります。
+- `..SessionConfig::default()` で埋めると、`SESSION_LIFETIME` と `SESSION_SECURE_COOKIE` が読まれません。期限も 7200
+  秒に戻ります。
 - `SESSION_SECURE_COOKIE=true` にすると、本番以外でも `Secure` が付きます（ステージングを HTTPS で動かすときなど）。
 - 本番では、`SESSION_SECURE_COOKIE=false` にしても `Secure` が付きます。
 

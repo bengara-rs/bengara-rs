@@ -18,7 +18,7 @@ Cargo の機能フラグ `websocket` を足します。**既定では入りま�
 
 ```toml
 [dependencies]
-bengara = { version = "0.1", features = ["sqlite", "websocket"] }
+bengara = { version = "0.1.0-alpha.1", features = ["sqlite", "websocket"] }
 ```
 
 - フラグが無いと、`req.websocket()` が「features に "websocket" を足してください」のエラー（500）を返します。

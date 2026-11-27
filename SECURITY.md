@@ -17,7 +17,7 @@ English follows the Japanese text.
 ## 報告のしかた
 
 - **GitHub の非公開の脆弱性報告**で送ってください。
-  - 入口：<https://github.com/bengara-rs/bengara-rs/security/advisories/new>
+    - 入口：<https://github.com/bengara-rs/bengara-rs/security/advisories/new>
 - **公開の Issue・Pull Request・Discussions には書かないでください。** 直す前に誰でも読めてしまいます。
 - メールでの受け付けはしていません。
 
@@ -83,7 +83,7 @@ Fixes are released for the latest minor version only.
 ## Reporting a Vulnerability
 
 - Please use **GitHub private vulnerability reporting**.
-  - Entry point: <https://github.com/bengara-rs/bengara-rs/security/advisories/new>
+    - Entry point: <https://github.com/bengara-rs/bengara-rs/security/advisories/new>
 - **Do not post it in public Issues, Pull Requests, or Discussions.** Anyone could read it before a fix is out.
 - We do not accept reports by email.
 

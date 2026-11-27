@@ -755,7 +755,8 @@ MySQL・PostgreSQL・Linux・macOS での確認が残っているものは、そ
   `.stream_body()` のルートでは、本文を読む前にミドルウェアが通ります（判断 227）。
 - **その後** — ルートに当たらなかったリクエストでは、セッションを読むだけにしました（判断 163）。
   共通のミドルウェアは通りますが、錠も期限の延長も `Set-Cookie` もありません。
-- **その後** — 本文を受け取れなかった 413・400・408 も、共通のミドルウェアと `with_exceptions` を通すようにしました（判断 280）。
+- **その後** — 本文を受け取れなかった 413・400・408 も、共通のミドルウェアと `with_exceptions` を通すようにしました（判断
+  280）。
 
 ## 56. 回数の制限は接続元のアドレスで数える
 
@@ -3180,8 +3181,8 @@ MySQL・PostgreSQL・Linux・macOS での確認が残っているものは、そ
       退避と戻しが食い違い、錠が二重に持たれることがありました。
     - `hard_link` は付ける先が既にあると失敗します。`create_new` と同じく 1 つだけが通ります。
     - 戻すときに中身も更新時刻も変わらないので、持ち主の後始末も「古い錠」の判定も前と同じです。
-- **採らなかった案** — OS の助言ロックを使う。MSRV 1.85 には `File::try_lock` がありません。
-  **その後** — MSRV は判断 248 で 1.88 になりました。
+- **採らなかった案** — OS の助言ロックを使う。MSRV 1.85 には `File::try_lock` がありません。 **その後** — MSRV は判断 248
+  で 1.88 になりました。
 - **残る弱点**
     - 古いと見た錠が、外す直前に別の持ち主の生きた錠へ入れ替わると、
       退避して戻すまでの一瞬に、第三の側が錠を取れます（2 者が持ったつもりになる）。
@@ -3288,8 +3289,7 @@ MySQL・PostgreSQL・Linux・macOS での確認が残っているものは、そ
   | `hyper-util`        | 0.1.21（`tokio`）                                    | 切り替えた後のソケットを tokio の形に包む                                        |
   | `futures-util`      | 0.3.34（`sink`・`std`）                              | 読み書きの trait（Stream / Sink）                                                |
 
-  TLS（前段のプロキシが受ける）と圧縮は入れていません。
-  **その後** — MSRV は判断 248 で 1.88 になりました。
+  TLS（前段のプロキシが受ける）と圧縮は入れていません。 **その後** — MSRV は判断 248 で 1.88 になりました。
 
 - **元の指示書から変えたこと**
 
@@ -3912,12 +3912,12 @@ MySQL・PostgreSQL・Linux・macOS での確認が残っているものは、そ
     - 未定義の変数はエラー（`UndefinedBehavior::Strict`）。自動の逃がしは常に HTML。
     - テンプレートで使える関数は `route`・`url`・`__`。`req.view(..)` のときだけ `csrf_token`・`csrf_field`・`old`
       の中身が入る。この 3 つの名前は `context` の鍵に使えない。
-    - `errors`（Laravel の `$errors`）と `method_field` は作らない。bengara には元になる仕組みが無い。
-      **その後** — `errors` は作りました。検査に落ちたら前の画面へ戻し、理由をテンプレートで読めます（判断 264）。
+    - `errors`（Laravel の `$errors`）と `method_field` は作らない。bengara には元になる仕組みが無い。 **その後** — `errors`
+      は作りました。検査に落ちたら前の画面へ戻し、理由をテンプレートで読めます（判断 264）。
 - **理由**
     - 画面を返すアプリで、HTML を `format!` で組み立てるのは逃がし忘れが起きやすい。テンプレートの自動の逃がしで防ぐ。
-    - minijinja は依存が serde だけで、MSRV（1.70）が bengara の 1.85 より低い。継承・`include`・マクロがある。
-      **その後** — MSRV は判断 248 で 1.88 になりました。
+    - minijinja は依存が serde だけで、MSRV（1.70）が bengara の 1.85 より低い。継承・`include`・マクロがある。 **その後** —
+      MSRV は判断 248 で 1.88 になりました。
     - 埋め込めば、本番に置くものは今までどおり実行ファイル・`.env`・`storage/` の 3 つで済む（判断 14 の予告のとおり）。
     - 未定義の変数を空にすると、打ち間違いが黙って空の画面になる。エラーのほうが気づける。
     - デバッグで毎回読めば、`serve` を作り直さずに次のリクエストから反映される。
@@ -4198,7 +4198,8 @@ MySQL・PostgreSQL・Linux・macOS での確認が残っているものは、そ
   文字列の中の `?` も値の置き場所と数え、値の数が合わないエラーになっていた。
 - **引き換えに失うもの**
     - JSONB の `?` 演算子は書けない。`jsonb_exists` などの関数で書く。
-    - ドライバで数え方を変えると、組み立ての検査と実行の直前の振り直しが食い違う。だから MySQL の `\'` は見ない（`''` で逃がす）。
+    - ドライバで数え方を変えると、組み立ての検査と実行の直前の振り直しが食い違う。だから MySQL の `\'` は見ない（`''`
+      で逃がす）。
 
 ## 263. 見直しの小さな変更（2026-11-25）
 
@@ -4263,7 +4264,8 @@ MySQL・PostgreSQL・Linux・macOS での確認が残っているものは、そ
 ## 265. bcrypt は照合だけ。`blowfish` クレートと自前の読み取りで作る
 
 - **決めたこと**
-    - 機能フラグ `bcrypt` で、`$2y$`・`$2b$`・`$2a$` を照合する。作ることはしない。`HASH_DRIVER=bcrypt` は警告を出して pbkdf2 にする。
+    - 機能フラグ `bcrypt` で、`$2y$`・`$2b$`・`$2a$` を照合する。作ることはしない。`HASH_DRIVER=bcrypt` は警告を出して
+      pbkdf2 にする。
     - `needs_rehash` は bcrypt の値でいつも真。ログインのついでに設定の方式（PBKDF2 か Argon2id）へ移る。
     - `$2x$`・長さが 60 でない値・bcrypt の base64 でない値・cost が 4〜16 の外の値は、計算せずに偽。
     - 72 バイトで切るのは PHP と同じ。NUL を含む平文は偽（PHP は NUL で切って照合する）。
@@ -4277,7 +4279,7 @@ MySQL・PostgreSQL・Linux・macOS での確認が残っているものは、そ
   | **`blowfish` ＋ 自前** | 7（`argon2` と一緒なら 4） | 暗号の部分は実績のあるクレートに任せ、読み取りと回数は自分で決める（判断 30） |
   | すべて自前             | 0                          | Blowfish の初期表（1,042 語）を手で載せることになる                           |
 
-    - 増えるクレートの MSRV は 1.85 以下。`cargo +1.88.0 check` で確かめた。
+  - 増えるクレートの MSRV は 1.85 以下。`cargo +1.88.0 check` で確かめた。
 - **cost の上限を 16 にした理由** — 既定の 12 の 16 倍で、リリースビルドで約 8 秒。PBKDF2 の上限と同じ考え方。
   細工した値 1 つで、照合と空回しをいくらでも重くさせないため。Laravel で使われる 10〜14 は収まる。
 - **引き換えに失うもの** — cost 17 以上の値は照合できない。NUL を含むパスワードは、PHP では通っても偽になる。
@@ -4285,16 +4287,20 @@ MySQL・PostgreSQL・Linux・macOS での確認が残っているものは、そ
 ## 266. CORS は `HandleCors` を利用者が `prepend` で足す。`init` には入れない
 
 - **決めたこと**
-    - `bengara::HandleCors` と `bengara::CorsConfig`（`config/cors.rs`）を足す。欄は Laravel の `config/cors.php` と同じ。`prelude` には入れない。
+    - `bengara::HandleCors` と `bengara::CorsConfig`（`config/cors.rs`）を足す。欄は Laravel の `config/cors.php` と同じ。
+      `prelude` には入れない。
     - 事前確認（`OPTIONS` で `Access-Control-Request-Method` がある）は、対象のパスなら先へ進めずに 204 を返す。
     - メソッドとヘッダーが `*` のときは、資格情報の有無にかかわらず聞かれた値を返す。`max_age` は 0 でも付ける。
     - 相手を選ぶ設定では、許さなかった応答にも `Vary: Origin` を付ける。
-    - 起動時にパニックで止める設定：`supports_credentials` と `allowed_origins` の `*`、`supports_credentials` と `exposed_headers` の `*`、
+    - 起動時にパニックで止める設定：`supports_credentials` と `allowed_origins` の `*`、`supports_credentials` と
+      `exposed_headers` の `*`、
       ホストの先頭以外の `*`、パス付きのオリジン、`paths` に書いた URL。
 - **理由**
     - `init` に入れない：既定のままだと全オリジンに `api/*` を開く。相手を決めてから足す形にする。
-    - `prepend`：`StartSession` より前なら事前確認にセッションを配らない。`VerifyCsrfToken`・`Throttle` より前なら 419・429 にも付く。
-    - `*` を聞き返す：Fetch Standard では `Access-Control-Allow-Headers: *` が `Authorization` を含まない（判断 268 のトークンが止まる）。
+    - `prepend`：`StartSession` より前なら事前確認にセッションを配らない。`VerifyCsrfToken`・`Throttle` より前なら 419・429
+      にも付く。
+    - `*` を聞き返す：Fetch Standard では `Access-Control-Allow-Headers: *` が `Authorization` を含まない（判断 268
+      のトークンが止まる）。
     - `max_age` の 0：付けないとブラウザの既定（Chromium は 5 秒）になる。fruitcake/php-cors も 0 を付ける。
     - 資格情報と `*` で止める：Laravel は相手のオリジンを返すので、どのサイトにも Cookie 付きの呼び出しを許してしまう。
 - **引き換えに失うもの**
@@ -4306,11 +4312,15 @@ MySQL・PostgreSQL・Linux・macOS での確認が残っているものは、そ
 - **決めたこと**
     - 解析は依存を足さずに自前で書く（RFC 7578・RFC 2046）。本文を全部受けた直後に読む。`.stream_body()` のルートでは読まない。
     - `bengara::UploadedFile` を足す。`req.file()`・`req.files()`・`req.has_file()` で読む。`name` と `name[]` は同じに扱う。
-    - 文字の欄は入力（`input`・`validate`・CSRF の `_token`）に送られた順で入る。ファイルの欄は入力にも前の入力（`old`）にも `Validated` にも入れない。
-    - 上限はファイル 20（PHP の `max_file_uploads`）、欄 1000（`max_input_vars`）、欄の見出し 8 KiB。超えたら 413、形が壊れていたら 400。
+    - 文字の欄は入力（`input`・`validate`・CSRF の `_token`）に送られた順で入る。ファイルの欄は入力にも前の入力（`old`）にも
+      `Validated` にも入れない。
+    - 上限はファイル 20（PHP の `max_file_uploads`）、欄 1000（`max_input_vars`）、欄の見出し 8 KiB。超えたら 413、形が壊れていたら
+      400。
       本文の上限と同じく、ミドルウェアを通さずに返す。
-    - `store` の名前は 40 文字の 16 進の乱数。拡張子は中身から推したもの（JPEG・PNG・GIF・WebP・BMP）だけ。HTML と SVG には推さない。
-    - ディスクを選ぶ口は、Laravel の `putFile` / `putFileAs` の名前で `Storage::disk(..).put_file(..)` / `put_file_as(..)`。
+    - `store` の名前は 40 文字の 16 進の乱数。拡張子は中身から推したもの（JPEG・PNG・GIF・WebP・BMP）だけ。HTML と SVG
+      には推さない。
+    - ディスクを選ぶ口は、Laravel の `putFile` / `putFileAs` の名前で `Storage::disk(..).put_file(..)` /
+      `put_file_as(..)`。
     - 検査の規則 `file`・`image`・`mimes:` を足す。ファイルのときの `min`・`max`・`between`・`size` は KB で比べる。
       `mimes` に書けるのは中身から推せる種類だけ（ほかは実行時 500、`rules!` ではコンパイルで止まる）。
     - `filename*` も読み、`filename` より優先する（RFC 6266）。
@@ -4332,7 +4342,8 @@ MySQL・PostgreSQL・Linux・macOS での確認が残っているものは、そ
 - **決めたこと**
     - 表・列・値の形は Sanctum 4 と同じにする。渡す値は `{id}|{英数字 40 文字＋crc32b}`、`token` 列は平文の SHA-256。
       `|` があれば id で引いて定数時間で比べ、無ければ値全体の SHA-256 で引く。
-    - `bengara::auth` に `PersonalAccessToken`・`NewAccessToken`・`HasApiTokens`・`CheckAbilities`・`CheckForAnyAbility` を足す。
+    - `bengara::auth` に `PersonalAccessToken`・`NewAccessToken`・`HasApiTokens`・`CheckAbilities`・`CheckForAnyAbility`
+      を足す。
       `Authenticate::token()` が `auth:sanctum` に当たる。転送せず 401。セッションは読みも書きもしない。
     - 認証したトークンは `Request` の欄（`Option<Arc<..>>`）に持つ。ロックも共有の表も足さない。
     - `req.auth()` の `check`・`id`・`user` はトークンを先に見る。`login`・`logout` はセッションへの操作のまま。
@@ -4394,7 +4405,8 @@ MySQL・PostgreSQL・Linux・macOS での確認が残っているものは、そ
 ## 271. ログの設定は `LOG_CHANNEL` と `LOG_DAILY_DAYS` だけ。種類を止めるのは `RUST_LOG`
 
 - **決めたこと**
-    - `LOG_CHANNEL`：`daily`（既定。標準出力＋テキスト＋SQLite）か `stdout`（標準出力だけ）。読めない値は WARN を 1 回出して `daily`。
+    - `LOG_CHANNEL`：`daily`（既定。標準出力＋テキスト＋SQLite）か `stdout`（標準出力だけ）。読めない値は WARN を 1 回出して
+      `daily`。
     - `LOG_DAILY_DAYS`：残す日数（既定 14。`0` は消さない）。今日を含めて N 日分を残す。読めない値は WARN を 1 回出して 14。
     - 種類ごとの出し先の設定は作らない。止めたい種類は `RUST_LOG=info,bengara::access=off` のように止める。
     - 読むのはログを始めるとき（`config/` を読む前）。環境変数を直接読む。
@@ -4420,9 +4432,11 @@ MySQL・PostgreSQL・Linux・macOS での確認が残っているものは、そ
 ## 273. ログの書き出しで本体を待たせない。溢れたら捨てて数える
 
 - **決めたこと**
-    - 出し先ごとにキュー（`std::sync::mpsc::sync_channel`、8,192 件）と書き手のスレッドを 1 本持つ。入れるのは `try_send` だけ。
+    - 出し先ごとにキュー（`std::sync::mpsc::sync_channel`、8,192 件）と書き手のスレッドを 1 本持つ。入れるのは `try_send`
+      だけ。
     - 入らなければ捨てて、出し先ごとに `AtomicU64` で数える。書けなかった数も足し、メトリクスの `dropped` に出す。
-    - 書き手のスレッドで出たイベントは、層の側で捨てる（スレッドローカルの印）。書けなかったことは `eprintln!` で 60 秒に 1 回まで知らせる。
+    - 書き手のスレッドで出たイベントは、層の側で捨てる（スレッドローカルの印）。書けなかったことは `eprintln!` で 60 秒に 1
+      回まで知らせる。
     - 標準出力は `serve` だけ裏のスレッドで書く。ほかの場面はその場で書く。色は端末で、`NO_COLOR` が無いか空のときだけ。
     - テキストはファイルごとにまとめ、1 秒ごとか 64 KiB を超えたら追記で書く。1 回の書き出しは `write_all` 1 回。
     - 正常に終わるときは全部のキューを書き切る（上限 5 秒）。`serve` の「待ち受けます」「終了しました」と順番を入れ替えない。
@@ -4436,16 +4450,20 @@ MySQL・PostgreSQL・Linux・macOS での確認が残っているものは、そ
 ## 274. リクエスト ID は入口で決め、task-local でログへ伝える
 
 - **決めたこと**
-    - ヘッダーは `X-Request-Id`。受け取るのは、接続元が `TRUSTED_PROXIES` で信頼されていて、値が `[0-9A-Za-z._-]` の 1〜64 文字のときだけ。何本も来たら最初の 1 本。
+    - ヘッダーは `X-Request-Id`。受け取るのは、接続元が `TRUSTED_PROXIES` で信頼されていて、値が `[0-9A-Za-z._-]` の 1〜64
+      文字のときだけ。何本も来たら最初の 1 本。
     - それ以外は作る。32 文字の小文字の 16 進。前半 64 ビットはプロセスごとの乱数、後半は連番を起動後に 1 回だけ決めた鍵で混ぜたもの
       （`((連番 ^ 鍵1) × 奇数の鍵2) ^ 鍵3`。どれも戻せるので重ならない）。リクエストごとに OS の乱数を呼ばない。
     - 決めるのは `Application::handle_logged` の入口（本物の HTTP もテストも通る）。`server.rs` は受け取ってよい値を先に載せる。
     - すべての応答に付ける（404・405・413・408・419・500・パニック・静的ファイル・101 を含む）。ハンドラが付けていても上書きする。
-    - 公開の口は `Request::request_id()` だけ。アクセスログの IP は Throttle と同じ判定（`throttle::client_ip`）。`Request::ip()` は変えない。
-    - ログへは `tokio::task_local!` で伝える。`handle_logged` の全体と、`run_stack` の `tokio::spawn` に渡す future を同じ ID で包む。
+    - 公開の口は `Request::request_id()` だけ。アクセスログの IP は Throttle と同じ判定（`throttle::client_ip`）。
+      `Request::ip()` は変えない。
+    - ログへは `tokio::task_local!` で伝える。`handle_logged` の全体と、`run_stack` の `tokio::spawn` に渡す future を同じ
+      ID で包む。
 - **理由**
     - アクセスの行とアプリの行を、同じ ID でつなげて読めるようにする（SQLite なら JOIN できる）。
-    - span にしないのは、`RUST_LOG` の絞り込みで span が無効になると（`RUST_LOG=myapp=debug` で bengara の span が切れるなど）ID が付かなくなるため。
+    - span にしないのは、`RUST_LOG` の絞り込みで span が無効になると（`RUST_LOG=myapp=debug` で bengara の span が切れるなど）ID
+      が付かなくなるため。
     - 信頼していない相手の値を受け取ると、相手が自由に決めた文字列がログに混ざる。
 - **引き換えに失うもの**
     - アプリが自分で spawn したタスクと `spawn_blocking` の中には ID が伝わらない。
@@ -4455,7 +4473,8 @@ MySQL・PostgreSQL・Linux・macOS での確認が残っているものは、そ
 ## 275. アクセスの行は nginx の combined 形式にそろえ、Referer は残さない
 
 - **決めたこと**
-    - テキストの行は `{IP} - - [{時刻}] "{メソッド} {行き先} {プロトコル}" {ステータス} {バイト数} "-" "{User-Agent}" rt={秒} req={ID} route={ルート名}`。
+    - テキストの行は
+      `{IP} - - [{時刻}] "{メソッド} {行き先} {プロトコル}" {ステータス} {バイト数} "-" "{User-Agent}" rt={秒} req={ID} route={ルート名}`。
     - 行き先は伏せた後のもの（判断 69・206）。ルートに当たらなかったものは届いたまま（判断 206 の制限と同じ）。
     - `"…"` の中の `"` と `\` と制御文字は `\xHH`。User-Agent は先頭 512 バイトまで（文字の切れ目で切る）。
     - Referer はいつも `-`。
@@ -4469,7 +4488,8 @@ MySQL・PostgreSQL・Linux・macOS での確認が残っているものは、そ
 ## 276. メトリクスは 60 秒ごとにログへ出す。OS の数は `metrics-system` で、依存を足さずに自前で取る
 
 - **決めたこと**
-    - `serve` が 60 秒ごと（固定）に `bengara::metrics` のイベントを 1 件出す。最初の 1 件は 60 秒後。止めるときに最後の 1 件は出さない。
+    - `serve` が 60 秒ごと（固定）に `bengara::metrics` のイベントを 1 件出す。最初の 1 件は 60 秒後。止めるときに最後の 1
+      件は出さない。
     - 数はすべて Atomic で持ち、見回りのたびに `swap(0)` で取り出す。数えるのは `dispatch`（本物の HTTP）だけ。
     - 応答時間は 19 の枠（100 µs〜60 秒と上限なし）で数え、分位は「件数 × p」（切り上げ）に届いた枠の上限を出す。上限なしの枠なら最大値。
     - 行は logfmt。鍵の名前と順は SQLite の `metrics` 表の列と同じ。値が無い鍵は書かない。
@@ -4478,7 +4498,8 @@ MySQL・PostgreSQL・Linux・macOS での確認が残っているものは、そ
     - `cpu_percent` はコア数で割らない（100 を超えてよい）。
 - **理由**
     - `/metrics` の口を作らなくても、ログを集めれば変化を追える。後で足しやすいよう logfmt にした。
-    - `sysinfo` は 0.39 から Rust 1.95 が要り、MSRV 1.88 を守れない。0.38 に止めると版を固定することになる（判断 248 に反する）。Windows では依存が 15 個ほど増える。
+    - `sysinfo` は 0.39 から Rust 1.95 が要り、MSRV 1.88 を守れない。0.38 に止めると版を固定することになる（判断 248
+      に反する）。Windows では依存が 15 個ほど増える。
     - `libc` と `windows-sys` は今の依存の木にある（0.2.190 と 0.61.2）。新しいクレートは増えない。
 - **引き換えに失うもの**
     - 間隔を変えられない。キューの残り・DB の接続数は無い。Linux・macOS・Windows 以外では OS の数を出さない。
@@ -4488,7 +4509,8 @@ MySQL・PostgreSQL・Linux・macOS での確認が残っているものは、そ
 - **決めたこと**
     - `LOG_CHANNEL=daily` で、機能フラグ `sqlite` があり、`storage/logs/` があるときに書く。テキストと同じ記録を書く。
     - 表は `access`・`app`・`metrics`。時刻は文字列。`PRAGMA user_version` が 0 なら表を作って 1 にする。1 より大きければ書かない。
-    - 開き方は WAL・`synchronous=NORMAL`・`busy_timeout` 5 秒。文のログは止める。512 件か 1 秒でまとめ、`BEGIN IMMEDIATE` 〜 `COMMIT` の 1 回で書く。
+    - 開き方は WAL・`synchronous=NORMAL`・`busy_timeout` 5 秒。文のログは止める。512 件か 1 秒でまとめ、`BEGIN IMMEDIATE` 〜
+      `COMMIT` の 1 回で書く。
     - sqlx のコードは `database/sqlite.rs` の `LogStore` に置く。書き手のスレッドは自分専用の `current_thread` のランタイムを持つ。
     - 書けなかった 1 回分は捨てて数える。開けないときは 60 秒ごとに開き直す。
 - **理由**

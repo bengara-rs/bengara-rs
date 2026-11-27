@@ -18,7 +18,7 @@ Cargo の機能フラグ `view` を足します。**既定では入りません�
 
 ```toml
 [dependencies]
-bengara = { version = "0.1", features = ["sqlite", "view"] }
+bengara = { version = "0.1.0-alpha.1", features = ["sqlite", "view"] }
 ```
 
 - フラグが無いときも関数はあります。呼ぶと「features に "view" を足してください」のエラー（500）になります。

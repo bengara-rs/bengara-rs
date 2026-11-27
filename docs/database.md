@@ -12,7 +12,7 @@ SQLite・MySQL（MariaDB）・PostgreSQL で同じコードが動きます。
 
 ```toml
 [dependencies]
-bengara = { version = "0.1", features = ["sqlite"] }
+bengara = { version = "0.1.0-alpha.1", features = ["sqlite"] }
 ```
 
 | データベース | フラグ                          | `DB_CONNECTION` に書く名前 |
