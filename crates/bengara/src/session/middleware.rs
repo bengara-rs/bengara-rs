@@ -2245,24 +2245,28 @@ mod tests {
         // 錠を持たずに読んでいるので、丸ごと書き戻すと、そのあいだに保存された
         // 別のリクエストの値（作ったばかりの CSRF トークンなど）を消してしまう。
         let store = Counting::new();
+        // 錠の地図はプロセス全体で 1 つ。並んで走る他のテストと ID が重ならないようにする。
+        let id = format!("s1-{}", crypto::random_token());
         store.seed(
-            "s1",
+            &id,
             &[("a", "1"), ("b", "2"), ("__flash:status", "保存しました")],
         );
-        let cookie = sign("s1", TEST_KEY);
+        let cookie = sign(&id, TEST_KEY);
 
         let res = {
             let shared = store.clone();
+            let id = id.clone();
             send(
                 &store,
                 Some(&cookie),
                 false,
                 handler(move |req: Request| {
                     let shared = shared.clone();
+                    let id = id.clone();
                     async move {
                         // 読んだあとで、別のリクエストがトークンを足して保存した。
                         shared.seed(
-                            "s1",
+                            &id,
                             &[
                                 ("a", "1"),
                                 ("b", "2"),
@@ -2281,7 +2285,7 @@ mod tests {
         };
         assert!(cookie_of(&res).is_some(), "書き換えたので Cookie を返す");
         assert_eq!(
-            store.peek("s1").unwrap(),
+            store.peek(&id).unwrap(),
             pairs_to_map(&[
                 ("b", "9"),
                 (CSRF_KEY, "別のリクエストのトークン"),
@@ -2293,19 +2297,21 @@ mod tests {
         assert!(!id_locks()
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .contains_key("s1"));
+            .contains_key(id.as_str()));
 
         // 処理中にセッションが消えていたら、書き戻さない（ログアウトを取り消さない）。
         let res = {
             let shared = store.clone();
+            let id = id.clone();
             send(
                 &store,
                 Some(&cookie),
                 false,
                 handler(move |req: Request| {
                     let shared = shared.clone();
+                    let id = id.clone();
                     async move {
-                        shared.destroy("s1")?;
+                        shared.destroy(&id)?;
                         req.session().put("b", "10");
                         Ok(Response::text("ok"))
                     }
@@ -2314,7 +2320,7 @@ mod tests {
             .await
         };
         assert!(res.header("set-cookie").is_none());
-        assert!(store.peek("s1").is_none(), "消えたセッションを復活させない");
+        assert!(store.peek(&id).is_none(), "消えたセッションを復活させない");
 
         // 新しいセッション（Cookie なし）でも、書き換えれば保存して Cookie を返す。
         let res = send(

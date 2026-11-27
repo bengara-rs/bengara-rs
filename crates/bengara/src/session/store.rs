@@ -1172,12 +1172,17 @@ mod tests {
     #[test]
     fn 期限切れだけを掃除する() {
         let dir = temp_dir("sweep");
-        FileStore::new(&dir, 0)
-            .write("old", &data(&[("a", "1")]))
-            .unwrap();
-        FileStore::new(&dir, 3600)
-            .write("new", &data(&[("a", "1")]))
-            .unwrap();
+        // `FileStore::write` を使わずに直接書きます。`write` は抽選で裏の掃除を
+        // 走らせるので、当たると下の `sweep` より先に old を消してしまいます。
+        let put = |id: &str, lifetime_secs: u64| {
+            let stored = StoredRef {
+                expires_at: now_seconds_u64() + lifetime_secs,
+                data: &data(&[("a", "1")]),
+            };
+            std::fs::write(dir.join(id), serde_json::to_string(&stored).unwrap()).unwrap();
+        };
+        put("old", 0);
+        put("new", 3600);
 
         let removed = sweep(&dir, 60).unwrap();
         assert_eq!(removed, 1);

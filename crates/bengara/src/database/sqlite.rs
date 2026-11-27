@@ -525,6 +525,18 @@ const METRICS_COLUMNS: &[&str] = &[
 /// 1 文の INSERT に入れる行の上限。
 const LOG_ROWS_PER_STATEMENT: usize = 512;
 
+/// ログの SQLite で、ほかの書き手を待つ長さ。
+const LOG_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// ほかの接続と取り合って負けたエラー（`SQLITE_BUSY` と、その細分の拡張コード）か。
+fn is_busy(error: &sqlx::Error) -> bool {
+    error
+        .as_database_error()
+        .and_then(|e| e.code())
+        .and_then(|code| code.parse::<i32>().ok())
+        .is_some_and(|code| code & 0xff == 5)
+}
+
 /// ログの SQLite の 1 ファイル。書き手のスレッドが 1 つだけ持ちます。
 ///
 /// 上の層（`logging/sqlite.rs`）には文字列と数の行（`AccessRow` など）だけを受け取ります。
@@ -572,19 +584,31 @@ impl LogStore {
         Ok(Self { conn })
     }
 
+    /// 開く。ほかの書き手と取り合って `SQLITE_BUSY` になったら、少し待って開き直します。
+    ///
+    /// 新しいファイルを 2 つの書き手が同時に開くと、`PRAGMA journal_mode = WAL` が
+    /// `busy_timeout` を待たずに「database is locked」を返すことがあります
+    /// （読む錠を持ったまま書く錠を待つと詰まるので、SQLite は待たずに返す）。
     async fn connect(path: &std::path::Path) -> Result<sqlx::SqliteConnection> {
         use sqlx::ConnectOptions as _;
-        SqliteConnectOptions::new()
+        let options = SqliteConnectOptions::new()
             .filename(path)
             .create_if_missing(true)
             .journal_mode(SqliteJournalMode::Wal)
             .synchronous(sqlx::sqlite::SqliteSynchronous::Normal)
-            .busy_timeout(Duration::from_secs(5))
+            .busy_timeout(LOG_BUSY_TIMEOUT)
             // ログを書く文そのものをログに出さない（輪になる）。
-            .disable_statement_logging()
-            .connect()
-            .await
-            .map_err(|e| Error::msg(format!("ログの SQLite を開けません: {e}")))
+            .disable_statement_logging();
+        let deadline = tokio::time::Instant::now() + LOG_BUSY_TIMEOUT;
+        loop {
+            match options.connect().await {
+                Ok(conn) => return Ok(conn),
+                Err(e) if is_busy(&e) && tokio::time::Instant::now() < deadline => {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+                Err(e) => return Err(Error::msg(format!("ログの SQLite を開けません: {e}"))),
+            }
+        }
     }
 
     async fn read_version(conn: &mut sqlx::SqliteConnection) -> Result<i64> {
