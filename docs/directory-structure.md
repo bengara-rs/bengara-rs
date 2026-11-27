@@ -78,7 +78,7 @@ use crate::app::http::controllers::HomeController;
 | 小文字始まりのファイル | モジュール（`routes/web.rs` → `crate::routes::web`）                             |
 | 日付で始まるファイル   | 先頭に `m` が付く（`2026_…` → `m2026_…`）                                        |
 
-- **大文字始まりのファイルも、モジュールの名前は snake_case です。** 大文字の前に `_` を入れて小文字にします。
+- **大文字始まりのファイルも、モジュールの名前は小文字と `_` です。** 大文字の前に `_` を入れて小文字にします。
   `app/Jobs/SendWelcome.rs` のモジュールは `crate::app::jobs::send_welcome` です。
 - **頭字語は 1 文字ずつ区切られます。** `app/Models/API.rs` のモジュールは `crate::app::models::a_p_i` です
   （型の名前は `API` のまま）。読みにくいときは `Api.rs` と書きます。
@@ -164,22 +164,23 @@ app/Jobs/
 
 実行時の書き込み先です。中身はリポジトリに入れません（`storage/.gitignore` が全部を無視します）。
 
-| ディレクトリ                 | 置かれるもの                |
-|------------------------------|-----------------------------|
-| `storage/app`                | アプリが置くファイル        |
-| `storage/app/public`         | `/storage/...` で配信する分 |
-| `storage/framework/cache`    | キャッシュ                  |
-| `storage/framework/schedule` | 定期処理の前回の時刻        |
-| `storage/framework/sessions` | セッション                  |
-| `storage/logs`               | ログ（`access-`・`app-`・`metrics-YYYY-MM-DD.log`、`logs-YYYY-MM-DD.sqlite`。[logging.md](logging.md)）とメールのログ（`mail.log`） |
+| ディレクトリ                 | 置かれるもの                                                 |
+|------------------------------|--------------------------------------------------------------|
+| `storage/app`                | アプリが置くファイル                                         |
+| `storage/app/public`         | `/storage/...` で配信する分                                  |
+| `storage/framework/cache`    | キャッシュ                                                   |
+| `storage/framework/schedule` | 定期処理の前回の時刻                                         |
+| `storage/framework/sessions` | セッション                                                   |
+| `storage/logs`               | ログ（[logging.md](logging.md)）とメールのログ（`mail.log`） |
 
 - 手元では `cargo run -- init` が作ります。本番では `./myapp storage:init` を 1 回流します。
 - どちらも、作ったディレクトリを Unix では所有者だけ（0700）にします。すでにあるものには触りません。
 
 ## テストの置き場所
 
-テストは `tests/Feature/` か `tests/Unit/` に置きます（[testing.md](testing.md)）。 **`tests/` の直下に `.rs`
-を置かないでください。** 警告が出ます。
+テストは `tests/Feature/` か `tests/Unit/` に置きます（[testing.md](testing.md)）。
+
+- **`tests/` の直下に `.rs` を置かないでください。** 警告が出ます。
 
 ## 置いたのに動かないとき
 
@@ -218,8 +219,8 @@ app/Jobs/
 **無かったディレクトリを後から作ったら、`build.rs` を保存し直してください**（`touch build.rs`）。
 作っただけでは、ビルドが見つけ直しません。
 
-**`database/` だけは、中を 1 つずつ見張ります。** SQLite のファイル（`database/database.sqlite`）に
-書くたびに作り直さないためです。
+**`database/` だけは、中を 1 つずつ見張ります。**
+SQLite のファイル（`database/database.sqlite`）に書くたびに、作り直さないためです。
 
 | `database/` に足したもの                                  | 見つけ直すか                         |
 |-----------------------------------------------------------|--------------------------------------|

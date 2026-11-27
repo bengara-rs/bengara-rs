@@ -115,7 +115,7 @@ Laravel から来た人がつまずきやすい違いを、分野ごとに並べ
 
 ## セッションと CSRF
 
-CSRF は、別のサイトからの なりすまし送信のことです。
+CSRF は、別のサイトからのなりすまし送信のことです。
 
 | Laravel                                   | bengara                                                           |
 |-------------------------------------------|-------------------------------------------------------------------|
@@ -195,25 +195,27 @@ CSRF は、別のサイトからの なりすまし送信のことです。
 
 ## 認証と認可
 
-| Laravel                                     | bengara                                                                                                                           |
-|---------------------------------------------|-----------------------------------------------------------------------------------------------------------------------------------|
-| `Hash::make()` の既定は bcrypt              | 既定は PBKDF2。`HASH_DRIVER=argon2id` も使える（フラグ `argon2`）                                                                 |
-| bcrypt（`$2y$`）の値で照合する              | フラグ `bcrypt` で照合できる。ログインのついでに設定の方式へ移る。**作ることはできない**。NUL を含むパスワードと cost 17 以上は偽 |
-| `$user->createToken('n')`（Sanctum）        | `use bengara::auth::HasApiTokens;` して `user.create_token("n", &["*"], None).await?`。能力と期限は毎回書く                       |
-| `auth:sanctum` / `abilities:a,b`            | `Authenticate::token()` / `CheckAbilities::new(["a", "b"])` を `alias` で登録する。転送せず 401                                   |
-| `Auth::validate($credentials)` は真偽を返す | `req.auth().validate::<User>(列, 値, パスワード)` は**照合した利用者**を返す（ログインしない）                                    |
-| `last_used_at` は要求のたびに書く           | **60 秒以内なら書かない**                                                                                                         |
-| SPA の Cookie 認証（Sanctum の stateful）   | 無い                                                                                                                              |
-| 非同期の中でも `Hash::make`                 | `Hash::make_async` / `Hash::check_async` を使う                                                                                   |
-| `Auth::user()`                              | `req.auth().user::<User>().await?`。**`req` から読む**                                                                            |
-| `Auth::logoutOtherDevices($password)`       | `req.auth().logout_other_devices_async()`。パスワードの確認は自分で                                                               |
-| `redirect()->intended('/')`                 | `req.session().intended()` を読んで、自分で転送する                                                                               |
-| `$this->authorize('update', $post)`         | `authorize(PostPolicy::update(&user, &post))?`（ただの関数）                                                                      |
-| `encrypt()` / `decrypt()`                   | 同じ名前。機能フラグ `encryption` が要る                                                                                          |
-| `Password::sendResetLink()`                 | `PasswordReset::create()` ＋ `link()`。送信は自分で書く                                                                           |
-| `APP_KEY` は base64 の 32 バイト            | **64 文字以上**の文字列。`base64:...` の鍵は使えない（`key:generate` で作り直す）                                                 |
+| Laravel                                     | bengara                                                                                                     |
+|---------------------------------------------|-------------------------------------------------------------------------------------------------------------|
+| `Hash::make()` の既定は bcrypt              | 既定は PBKDF2。`HASH_DRIVER=argon2id` も使える（フラグ `argon2`）                                           |
+| bcrypt（`$2y$`）の値で照合する              | フラグ `bcrypt` で照合だけできる（下）。**作ることはできない**                                              |
+| `$user->createToken('n')`（Sanctum）        | `use bengara::auth::HasApiTokens;` して `user.create_token("n", &["*"], None).await?`。能力と期限は毎回書く |
+| `auth:sanctum` / `abilities:a,b`            | `Authenticate::token()` / `CheckAbilities::new(["a", "b"])` を `alias` で登録する。転送せず 401             |
+| `Auth::validate($credentials)` は真偽を返す | `req.auth().validate::<User>(列, 値, パスワード)` は**照合した利用者**を返す（ログインしない）              |
+| `last_used_at` は要求のたびに書く           | **60 秒以内なら書かない**                                                                                   |
+| SPA の Cookie 認証（Sanctum の stateful）   | 無い                                                                                                        |
+| 非同期の中でも `Hash::make`                 | `Hash::make_async` / `Hash::check_async` を使う                                                             |
+| `Auth::user()`                              | `req.auth().user::<User>().await?`。**`req` から読む**                                                      |
+| `Auth::logoutOtherDevices($password)`       | `req.auth().logout_other_devices_async()`。パスワードの確認は自分で                                         |
+| `redirect()->intended('/')`                 | `req.session().intended()` を読んで、自分で転送する                                                         |
+| `$this->authorize('update', $post)`         | `authorize(PostPolicy::update(&user, &post))?`（ただの関数）                                                |
+| `encrypt()` / `decrypt()`                   | 同じ名前。機能フラグ `encryption` が要る                                                                    |
+| `Password::sendResetLink()`                 | `PasswordReset::create()` ＋ `link()`。送信は自分で書く                                                     |
+| `APP_KEY` は base64 の 32 バイト            | **64 文字以上**の文字列。`base64:...` の鍵は使えない（`key:generate` で作り直す）                           |
 
-くわしくは [authentication.md](authentication.md) と [authorization.md](authorization.md) にあります。
+- bcrypt の値は、ログインのついでに設定の方式（`HASH_DRIVER`）で作り直します。
+- NUL 文字を含むパスワードと、cost（計算の重さ）が 17 以上の bcrypt の値は、照合しても偽になります。
+- くわしくは [authentication.md](authentication.md) と [authorization.md](authorization.md) にあります。
 
 ## テスト
 
@@ -253,8 +255,7 @@ CSRF は、別のサイトからの なりすまし送信のことです。
 | 言語ファイルは PHP の配列                   | `resources/lang/<言語>.toml`。**ビルド時に読む**                |
 | `$signature` でコマンド名を決める           | **ファイル名**から決まる。名前に `:` は入れられない             |
 
-くわしくは [mail.md](mail.md) / [processes.md](processes.md) / [localization.md](localization.md) / [console-commands.md](console-commands.md)
-にあります。
+くわしくは [mail.md](mail.md) / [processes.md](processes.md) / [localization.md](localization.md) / [console-commands.md](console-commands.md) にあります。
 
 ## WebSocket と配信
 
@@ -269,14 +270,14 @@ CSRF は、別のサイトからの なりすまし送信のことです。
 
 ## ログ
 
-| Laravel                                              | bengara                                                              |
-|------------------------------------------------------|----------------------------------------------------------------------|
-| `Log::warning('…', [...])`（`Log` ファサード）       | **`tracing::warn!(key = 値, "…")`**（`bengara::tracing`）            |
-| チャンネルは `stack`・`single`・`daily`・`slack` など | **`daily` と `stdout` だけ**（`LOG_CHANNEL`）。ほかは警告して `daily` |
-| 細かさは `LOG_LEVEL`                                 | **`RUST_LOG`**（`info,bengara::access=off` のように種類ごとにも）     |
-| 時刻は `config/app.php` の `timezone`                | **UTC だけ**。ファイルの日付も UTC                                    |
-| `laravel-YYYY-MM-DD.log`                             | 種類ごとに `access-`・`app-`・`metrics-YYYY-MM-DD.log`。行の形はアプリが Laravel と同じ |
-| ログを SQLite に残す仕組みは無い                     | **`logs-YYYY-MM-DD.sqlite`** にも同じ記録を書く（機能フラグ `sqlite`） |
+| Laravel                                               | bengara                                                                |
+|-------------------------------------------------------|------------------------------------------------------------------------|
+| `Log::warning('…', [...])`（`Log` ファサード）        | **`tracing::warn!(key = 値, "…")`**（`bengara::tracing`）              |
+| チャンネルは `stack`・`single`・`daily`・`slack` など | **`daily` と `stdout` だけ**（`LOG_CHANNEL`）。ほかは警告して `daily`  |
+| 細かさは `LOG_LEVEL`                                  | **`RUST_LOG`**（`info,bengara::access=off` のように種類ごとにも）      |
+| 時刻は `config/app.php` の `timezone`                 | **UTC だけ**。ファイルの日付も UTC                                     |
+| `laravel-YYYY-MM-DD.log`                              | 種類ごとに 3 つのファイル。`app-` の行の形は Laravel と同じ            |
+| ログを SQLite に残す仕組みは無い                      | **`logs-YYYY-MM-DD.sqlite`** にも同じ記録を書く（機能フラグ `sqlite`） |
 
 くわしくは [logging.md](logging.md) にあります。
 

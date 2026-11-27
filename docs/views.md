@@ -10,7 +10,7 @@ HTML の画面を、テンプレート（`resources/views/*.html`）から作り
 | 値を逃がす       | `{{ title }}` の値は自動で HTML の逃がし方をする                 |
 
 - 書き方は **Jinja 系**です（中身は minijinja）。**Blade の構文ではありません。**
-- 使う関数は `prelude` に入っていません。`bengara::view` から使います。
+- `req.view(..)` のほかの関数は `prelude` に入っていません。`bengara::view` から使います。
 
 ## 使えるようにする
 
@@ -64,8 +64,8 @@ impl PostController {
 ```
 
 - 返すのは 200、`text/html; charset=utf-8` のレスポンスです。
-- 2 つ目の引数は、構造体（`Serialize`）か `json!({ .. })` のオブジェクトです。何も渡さないなら `()` です。配列や数を渡すと
-  500 です。
+- 2 つ目の引数は、構造体（`Serialize`）か `json!({ .. })` のオブジェクトです。
+- 何も渡さないなら `()` です。配列や数を渡すと 500 です。
 
 ### 描くための関数
 
@@ -109,8 +109,8 @@ let body = bengara::view::render("emails.welcome", json!({ "name": user.name }))
 | `$errors->any()` / `$errors->all()`               | `errors.any()` / `errors.all()`                                      |
 
 - 変数に `$` は付けません。
-- **使っていない名前（未定義の変数）はエラーです。** 打ち間違いが空の画面にならないようにしています。
-  あるか分からない値は `{% if title is defined %}` で確かめます。
+- **渡していない名前（未定義の変数）はエラーです。** 打ち間違いが空の画面にならないようにしています。
+- あるか分からない値は `{% if title is defined %}` で確かめます。
 - 値は自動で逃がされます。`<script>` は `&lt;script&gt;` になります。逃がしたくない値だけに `|safe` を付けます。
 
 ## テンプレートで使える関数
@@ -199,7 +199,7 @@ let body = bengara::view::render("emails.welcome", json!({ "name": user.name }))
 
 ## Laravel と違うところ
 
-- `$errors` は `errors` です。袋の名前分け（`$errors->login`）はありません。1 つの袋だけです。
+- `$errors` は `errors` です。名前で分けた袋（`$errors->login`）はありません。1 つの袋だけです。
 - 利用者の `context` に `errors` という名前は使えません（Laravel は渡した値で上書きできます）。
 - `@method('PUT')` はありません。フォームからは POST のルートで受けます。
 - メールの本文は、`render(..)` で描いた文字列を `Mail::to(..)` の `.html(..)` に渡します。

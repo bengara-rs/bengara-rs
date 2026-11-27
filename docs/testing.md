@@ -171,8 +171,9 @@ get("/").await
 ```
 
 - `assert_*` はつなげて書けます。
-- **`assert_see` と `assert_dont_see` は、本文そのままと比べます。** Laravel の `assertSee` と違い、HTML の逃がし（`<` →
-  `&lt;`）をしません。画面に `<b>` と出る値は `assert_see("&lt;b&gt;")` と書きます。
+- **`assert_see` と `assert_dont_see` は、本文そのままと比べます。**
+  Laravel の `assertSee` と違い、HTML の逃がし（`<` → `&lt;`）をしません。
+  画面に `<b>` と出る値は `assert_see("&lt;b&gt;")` と書きます。
 - 失敗すると、URI と本文の先頭（400 文字まで）を出します。
 - **`json()` は、本文が JSON でないとパニックします。**
 
@@ -181,8 +182,8 @@ get("/").await
 - 下の表の環境変数を入れてから、`.env` と `config/` を読みます（プロセスで 1 回）。
 - `bootstrap/app.rs` の `app()` でアプリを組み立てます（テスト 1 件ごと）。
 - メールの送り先を `array` にします。**本当には送りません。**
-- パスワードの計算を軽くします。PBKDF2 は 1,000 回（本番の既定は 240,000）、Argon2id は最小に近い設定です。変えるときは
-  `HASH_ITERATIONS=20000 cargo test` のように渡します。
+- パスワードの計算を軽くします。PBKDF2 は 1,000 回（本番の既定は 240,000）、Argon2id は最小に近い設定です。
+  変えるときは `HASH_ITERATIONS=20000 cargo test` のように渡します。
 - `APP_KEY` が本物の環境変数にも `.env` にも無ければ、テスト用の鍵を入れます。
 - ソケットは開きません。ポートの衝突を気にせず並べて走らせられます。
 - 回数の制限（throttle）は本番と同じく効きます。接続元は `127.0.0.1` として数えます。
@@ -214,7 +215,8 @@ get("/").await
 - 札は変数で受け取ります（`let _db = ...`）。受け取らないと、その場で手放されます。
 - `exclusive()` の札を手放すと、溜まったメール（`Mail::sent()`）は空になります。配信の fake も終わります。
 - 1 つのテストで同じ札を 2 回取ると、パニックします。
-- **両方要るときは `refresh_database()` → `exclusive()` の順です。** 逆に取ると、`refresh_database()` がパニックして知らせます。
+- **両方要るときは `refresh_database()` → `exclusive()` の順です。**
+  逆に取ると、`refresh_database()` がパニックして知らせます。
 
 ```rust
 let _db = refresh_database().await;
@@ -225,15 +227,10 @@ Mail::clear_sent();
 ### キャッシュとファイルは自動で消えない
 
 **鍵とパスは、テストごとに変えます。** 同じ名前だと、並んで走るテストが互いに踏みます。
+書き方の例は [cache.md](cache.md#テスト) にあります。
 
-```rust
-Cache::forget("test.count").await.unwrap();      // 前の残りを消す
-assert_eq!(Cache::increment("test.count", 1).await.unwrap(), 1);
-Cache::forget("test.count").await.unwrap();      // 片付ける
-```
-
-セッションとキャッシュはメモリに置くので、ディスクにファイルは残りません。
-ただしメモリの中身もプロセスが終わるまで残ります。鍵を変えるのは同じです。
+- セッションとキャッシュはメモリに置くので、ディスクにファイルは残りません。
+- ただしメモリの中身は、プロセスが終わるまで残ります。鍵を変えるのは同じです。
 
 ## 周辺機能のテスト
 

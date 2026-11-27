@@ -68,7 +68,7 @@ pub async fn show(req: Request) -> Result<Response> {
 
 - 読み方は [requests-and-responses.md](requests-and-responses.md) にあります。
 - 日本語のパスも書けます（`/記事-{id}` は `/記事-12` に当たります）。
-- `%xx` の形で書いたパスは、16 進の大文字小文字を問わずに当たります（`/caf%c3%a9` も `/caf%C3%A9` も同じ）。
+- `%xx` の 16 進は、大文字でも小文字でも当たります（`/caf%c3%a9` と `/caf%C3%A9` は同じ）。
 
 ### 書けない形
 
@@ -101,7 +101,8 @@ Route::get("/posts/{post}", PostController::show).name("posts.show");
 | `route_url("home")`                               | 名前付きルートの完全な URL |
 | `route_url_with("posts.show", &[("post", "12")])` | 同上（パス引数つき）       |
 
-- `url()` 以外は `Result<String>` を返します。知らない名前と、足りないパス引数はエラーです。
+- `url()` 以外は `Result<String>` を返します。
+- 知らない名前と、足りないパス引数はエラーです。
 - `url()` に `http://` か `https://` で始まる文字列を渡すと、そのまま返します。
 - リダイレクトでも同じ名前を使えます（`redirect().route("home")`）。
 - パスに使わなかった引数は、クエリとして後ろに付きます（`/posts?page=2`）。
@@ -129,7 +130,7 @@ pub async fn unsubscribe(req: Request) -> Result<Response> {
 - **`APP_KEY` が要ります（64 文字以上）。** くわしくは [configuration.md](configuration.md) にあります。
 - **署名が合わなくても自動では止まりません。** 何を返すかは自分で決めます。
 - クエリの並び順が変わっても、末尾に `/` が付いても通ります。
-- パスの `%xx` の 16 進の大文字小文字が変わっても通ります（途中のプロキシが書き換えることがあるため）。
+- パスの `%xx` の大文字小文字が変わっても通ります。途中のプロキシが書き換えることがあるためです。
 - `signature` と `expires` は引数の名前に使えません（仕組みが使います）。
 - 渡すのはパスだけです。完全な URL（`https://...`）と `//` で始まるものはエラーです。
 - 空白・`?`・`#`・日本語を含むパスもエラーです。先に `%xx` に符号化して渡します。
@@ -221,7 +222,8 @@ Route::prefix("admin")
 cargo artisan route:list
 ```
 
-METHOD・URI・NAME・MIDDLEWARE の列が出ます。ミドルウェアを付けたルートが無ければ、MIDDLEWARE の列は出ません。
+METHOD・URI・NAME・MIDDLEWARE の列が出ます。
+ミドルウェアを付けたルートが 1 本も無ければ、MIDDLEWARE の列は出ません。
 
 ## 関連
 

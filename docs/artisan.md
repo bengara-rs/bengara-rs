@@ -43,9 +43,8 @@
 - 本体を引数なしで動かすと `serve` です（`./myapp`）。`--host` か `--port` から始めたときも同じです。
 - `key:generate` と `storage:init` は `bootstrap/app.rs` を呼びません。ルートの組み立てで落ちるアプリでも動きます。
 - `key:generate` は、本物の環境変数に `APP_KEY` があると警告します。そちらが優先され、`.env` に書いた鍵は使われないためです。
-- `about` は鍵そのものを出しません。`APP_KEY` は「あり／なし／短すぎる」で出します。
-- `about` のセッションとキャッシュは、実際に使う方式を出します（知らない名前なら `file`）。
-- `about` のログは、`LOG_CHANNEL` と `LOG_DAILY_DAYS` の実際の値と、SQLite に書けるか（機能フラグ `sqlite`）を出します（[logging.md](logging.md)）。
+- `about` の出す中身は [deployment.md](deployment.md#いまの設定を確かめる) にあります。
+  鍵そのものは出しません。セッションとキャッシュは、実際に使う方式を出します。
 
 ### データベース
 
@@ -149,8 +148,7 @@ $ cargo artisan cache:clear --tries=9
 
 `migrate:rollback` / `migrate:reset` / `migrate:refresh` / `migrate:fresh` / `db:wipe`
 
-**表を変えるコマンドは同時に流せません。** 2
-つ目は「実行中です」で止まります（[deployment.md](deployment.md#migrate-の同時実行)）。
+**表を変えるコマンドは同時に流せません。** 2 つ目は「実行中です」で止まります（[deployment.md](deployment.md#migrate-の同時実行)）。
 
 ## serve の動き
 
@@ -176,12 +174,12 @@ cargo artisan --port 8124          # serve を省いた形。見張りもする
 **見張るのは、ビルドに影響するファイルだけです。**
 
 - `app/` `bootstrap/` `config/` `database/` `routes/` `resources/` の下の `.rs`
-- `resources/lang/` の言語ファイル（`ja.toml` と `ja/*.toml` の `.toml`）
+- `resources/lang/` の言語ファイル（`ja.toml` と `ja/*.toml`）
 - `.env` `Cargo.toml` `Cargo.lock` `build.rs` `main.rs` `artisan.rs` `.cargo/config.toml` `rust-toolchain.toml`
 
 | 見張らないもの                                                       | 理由・代わり                                               |
 |----------------------------------------------------------------------|------------------------------------------------------------|
-| `public/`                                                            | デバッグビルドはディスクから読むので、直せばすぐ反映される |
+| `public/`、`resources/views/` のテンプレート                         | デバッグビルドはディスクから読むので、直せばすぐ反映される |
 | `tests/`                                                             | テストは `cargo test` で走らせる                           |
 | `storage/` `target/` `node_modules/` `.git/`、データベースのファイル | ビルドに関係ない                                           |
 

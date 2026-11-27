@@ -271,20 +271,23 @@ MAIL_FROM_NAME="${APP_NAME}"
 
 ### セッションとパスワード
 
-| 名前                   | 既定     | 何に効くか                                | 設定ファイル  |
-|------------------------|----------|-------------------------------------------|---------------|
-| `SESSION_DRIVER`       | `file`   | セッションの置き場所（`file` / `memory`） | —             |
-| `SESSION_LIFETIME`     | `120`    | 最後に使ってから消えるまでの分            | —             |
-| `HASH_DRIVER`          | `pbkdf2` | パスワードの方式（`pbkdf2` / `argon2id`） | —             |
-| `HASH_ITERATIONS`      | `240000` | PBKDF2 の繰り返し回数                     | `HashConfig`  |
-| `ARGON_MEMORY`         | `65536`  | Argon2id のメモリ（KiB）                  | `ArgonConfig` |
-| `ARGON_TIME`           | `4`      | Argon2id の繰り返し                       | `ArgonConfig` |
-| `ARGON_THREADS`        | `1`      | Argon2id の並列の数                       | `ArgonConfig` |
-| `HASH_MAX_CONCURRENCY` | CPU の数 | パスワードの計算を同時に走らせる数の上限  | —             |
+| 名前                    | 既定     | 何に効くか                                 | 設定ファイル  |
+|-------------------------|----------|--------------------------------------------|---------------|
+| `SESSION_DRIVER`        | `file`   | セッションの置き場所（`file` / `memory`）  | —             |
+| `SESSION_LIFETIME`      | `120`    | 最後に使ってから消えるまでの分             | —             |
+| `SESSION_SECURE_COOKIE` | `false`  | セッションの Cookie に `Secure` を付けるか | —             |
+| `HASH_DRIVER`           | `pbkdf2` | パスワードの方式（`pbkdf2` / `argon2id`）  | —             |
+| `HASH_ITERATIONS`       | `240000` | PBKDF2 の繰り返し回数                      | `HashConfig`  |
+| `ARGON_MEMORY`          | `65536`  | Argon2id のメモリ（KiB）                   | `ArgonConfig` |
+| `ARGON_TIME`            | `4`      | Argon2id の繰り返し                        | `ArgonConfig` |
+| `ARGON_THREADS`         | `1`      | Argon2id の並列の数                        | `ArgonConfig` |
+| `HASH_MAX_CONCURRENCY`  | CPU の数 | パスワードの計算を同時に走らせる数の上限   | —             |
 
 - `SESSION_DRIVER` は大文字小文字を見ません。`array` は `memory` と同じです。
 - 知らない名前は、警告を出して `file` にします。
 - 本番で `memory` にすると、起動時に警告が出ます。起動し直すと全員がログアウトするためです。
+- `SESSION_SECURE_COOKIE` は、本番以外を HTTPS で動かすとき（ステージングなど）に `true` にします。
+  本番（`APP_ENV=production`）では、この値によらず `Secure` が付きます。
 - `SESSION_LIFETIME` は 1 分より短くなりません。最大 60 秒早く切れることがあります（[session.md](session.md)）。
 - `HASH_DRIVER=argon2id` には機能フラグ `argon2` が要ります。
   フラグが無いときと知らない名前のときは、ログに出して `pbkdf2` にします。
@@ -374,16 +377,17 @@ TRUSTED_PROXIES=10.0.0.1,10.0.0.2
 
 ## ログ
 
-ログは標準出力と、`storage/logs/` の日ごとのテキストと SQLite に出ます。くわしくは [logging.md](logging.md) にあります。
+ログは標準出力と、`storage/logs/` の日ごとのテキストと SQLite に出ます。
+くわしくは [logging.md](logging.md) にあります。
 
-| 名前             | 既定      | 何に効くか                                                            |
-|------------------|-----------|-----------------------------------------------------------------------|
-| `LOG_CHANNEL`    | `daily`   | `daily` は標準出力＋日ごとのテキスト＋SQLite。`stdout` は標準出力だけ |
-| `LOG_DAILY_DAYS` | `14`      | 残す日数。`0` は消さない                                              |
-| `RUST_LOG`       | （なし）  | 細かさ。`info,bengara::access=off` のように種類ごとにも止められる     |
+| 名前             | 既定     | 何に効くか                                                            |
+|------------------|----------|-----------------------------------------------------------------------|
+| `LOG_CHANNEL`    | `daily`  | `daily` は標準出力＋日ごとのテキスト＋SQLite。`stdout` は標準出力だけ |
+| `LOG_DAILY_DAYS` | `14`     | 残す日数。`0` は消さない                                              |
+| `RUST_LOG`       | （なし） | 細かさ（[logging.md](logging.md#絞り込み)）                           |
 
-- 細かさの既定は、**環境変数**の `APP_DEBUG` が真なら `debug`、偽なら `info` です。`config/app.rs` の `debug` は効きません。
-  ログの準備を、`config/` を読む前に済ませるためです。
+- 細かさの既定は、**環境変数**の `APP_DEBUG` が真なら `debug`、偽なら `info` です。
+- `config/app.rs` の `debug` は、ログの細かさに効きません。ログの準備を、`config/` を読む前に済ませるためです。
 - 読めない値は、警告を出して既定にします。
 
 ## 機能フラグ
@@ -395,20 +399,20 @@ TRUSTED_PROXIES=10.0.0.1,10.0.0.2
 bengara = { version = "0.1", features = ["sqlite", "mail"] }
 ```
 
-| フラグ       | 既定           | 入れると使えるもの                                              |
-|--------------|----------------|-----------------------------------------------------------------|
-| `sqlite`     | 入っていない   | SQLite（[database.md](database.md)）                            |
-| `mysql`      | 入っていない   | MySQL と MariaDB                                                |
-| `mariadb`    | 入っていない   | `mysql` と同じ                                                  |
-| `postgres`   | 入っていない   | PostgreSQL                                                      |
-| `mail`       | 入っていない   | SMTP でのメール送信（[mail.md](mail.md)）                       |
-| `websocket`  | 入っていない   | WebSocket の受け口（[websocket.md](websocket.md)）              |
-| `encryption` | 入っていない   | `encrypt` / `decrypt`（[authentication.md](authentication.md)） |
-| `argon2`     | 入っていない   | パスワードの Argon2id（`HASH_DRIVER=argon2id`）                 |
-| `bcrypt`     | 入っていない   | Laravel の bcrypt（`$2y$`）の照合だけ（作れない）               |
-| `view`       | 入っていない   | テンプレート（[views.md](views.md)）                            |
-| `metrics-system` | 入っていない | メトリクスに CPU・メモリー・ディスクの空きを足す（[logging.md](logging.md#メトリクス)） |
-| `log-filter` | **入っている** | `RUST_LOG=myapp=debug` のような絞り込み                         |
+| フラグ           | 既定           | 入れると使えるもの                                                                      |
+|------------------|----------------|-----------------------------------------------------------------------------------------|
+| `sqlite`         | 入っていない   | SQLite（[database.md](database.md)）                                                    |
+| `mysql`          | 入っていない   | MySQL と MariaDB                                                                        |
+| `mariadb`        | 入っていない   | `mysql` と同じ                                                                          |
+| `postgres`       | 入っていない   | PostgreSQL                                                                              |
+| `mail`           | 入っていない   | SMTP でのメール送信（[mail.md](mail.md)）                                               |
+| `websocket`      | 入っていない   | WebSocket の受け口（[websocket.md](websocket.md)）                                      |
+| `encryption`     | 入っていない   | `encrypt` / `decrypt`（[authentication.md](authentication.md)）                         |
+| `argon2`         | 入っていない   | パスワードの Argon2id（`HASH_DRIVER=argon2id`）                                         |
+| `bcrypt`         | 入っていない   | Laravel の bcrypt（`$2y$`）の照合だけ（作れない）                                       |
+| `view`           | 入っていない   | テンプレート（[views.md](views.md)）                                                    |
+| `metrics-system` | 入っていない   | メトリクスに CPU・メモリー・ディスクの空きを足す（[logging.md](logging.md#メトリクス)） |
+| `log-filter`     | **入っている** | `RUST_LOG=myapp=debug` のような絞り込み                                                 |
 
 - `init` で作ると `features = ["sqlite"]` が入ります。**別のデータベースなら書き換えてください。**
 - **キューとマイグレーションにも、データベースのフラグが要ります。**

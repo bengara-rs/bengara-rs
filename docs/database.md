@@ -44,7 +44,7 @@ bengara = { version = "0.1", features = ["sqlite"] }
 - 値に `#` を含むときは引用符で囲みます（`DB_PASSWORD="p#ss"`）。
 - **MySQL と PostgreSQL は、データベースを先に作っておきます。** bengara は作りません。
 - SQLite のファイルは無ければ作ります。置くディレクトリは先に用意します。
-- SQLite の相対パスは、`DB_DATABASE` でも `DB_URL`（`sqlite:database/app.db`）でも、プロジェクトの基準ディレクトリから見ます。
+- SQLite の相対パスは、プロジェクト直下から見ます。`DB_DATABASE` でも `DB_URL`（`sqlite:database/app.db`）でも同じです。
 
 ## 読む
 
@@ -109,20 +109,26 @@ Laravel の `->where('views', '>', 100)` は `where_op("views", ">", 100)` で�
 | `where_group(\|q\| q.where_("a", 1).or_where("b", 2))` | 括弧でくくる                  |
 | `or_where_group(...)`                                  | `or` でつないで括弧でくくる   |
 
-- `None` と `=` で比べると `is null` になります。`!=` なら `is not null` です。
-- `>` などで NULL と比べると必ず 0 件です。`where_null` を使います。
+NULL と一覧の扱いです。
+
+- `None` を `=` で比べると `is null`、`!=` なら `is not null` になります。
+- `>` などで NULL と比べると、必ず 0 件です。`where_null` を使います。
 - `where_in` に空の一覧を渡すと 0 件です。渡せるのは 30,000 件までです。
-- `where_in` / `where_not_in` の一覧に `None` があると、`is null` / `is not null` に分けて書きます。
+- `where_in` の一覧に `None` があると、`is null` を足します。
   `where_in("c", &[Some(1), None])` は `("c" in (?) or "c" is null)` です。
-- `where_between` / `where_not_between` の端に `None` を渡すとエラーです（必ず 0 件になるため）。
-- `where_like` と `like` / `not like` の逃がしの文字は、どのドライバでも `\` です。`100\%` は `100%` という文字に当たります（SQLite には `escape '\'` を足します）。
+- `where_between` の端に `None` を渡すとエラーです（必ず 0 件になるため）。
+- `where_like` と `like` の逃がしの文字は、どのドライバでも `\` です。`100\%` は「100%」という文字に当たります。
 - `where_group` の中では、条件だけが使われます。
-- `where_raw` / `or_where_raw` / `having_raw` に書いた SQL は、括弧でくくって置きます。`a = ? or b = ?` の `or` が外へ漏れません。
-- `where_raw` の `?` は値の置き場所です。文字列（`'...'`）と引用した名前（`"..."`・`` `...` ``）の中の `?` は数えません。
-- PostgreSQL の JSONB の演算子 `?` `?|` `?&` も値の置き場所として数えます。`jsonb_exists(列, 'キー')` のような関数で書きます。
-- MySQL の `\'` の逃がしは見ません。文字列の中の `'` は `''` と重ねて書きます。
-- 列には、モデルの型付きの列（`Post::TITLE`）も渡せます。値の型をコンパイルのときに確かめます（[models.md](models.md)
-  の「型付きの列」）。
+
+SQL を直に書くとき（`where_raw` / `or_where_raw` / `having_raw`）の決まりです。
+
+- 書いた SQL は括弧でくくって置きます。`a = ? or b = ?` の `or` が外へ漏れません。
+- `?` は値の置き場所です。文字列（`'...'`）と引用した名前（`"..."`・`` `...` ``）の中の `?` は数えません。
+- PostgreSQL の JSONB の演算子 `?` `?|` `?&` も置き場所と数えます。`jsonb_exists(列, 'キー')` と書きます。
+- MySQL の `\'` は見ません。文字列の中の `'` は `''` と重ねて書きます。
+
+列には、モデルの型付きの列（`Post::TITLE`）も渡せます。
+値の型をコンパイルのときに確かめます（[models.md](models.md#型付きの列)）。
 
 ### 並べる・件数を決める
 
@@ -136,7 +142,6 @@ Laravel の `->where('views', '>', 100)` は `where_op("views", ">", 100)` で�
 | `for_page(page, per_page)`                       | ページから件数を決める     |
 
 - `order_by_raw` と `select` / `add_select` には値を渡せません。引用の外に `?` を書くとエラーです。
-  JSONB のキーは `jsonb_exists(列, 'キー')` と書きます。
 
 **並びは一意にします。** 同じ値の行があると、ページの境目で同じ行が 2 回出ます。
 `latest()` に `order_by_desc("id")` を足すのが簡単です。
@@ -175,7 +180,8 @@ let sum = DB::table("posts").sum::<i64>("views").await?;                // Optio
 ```
 
 - `group_by` を付けた `count()` は、グループの数を返します。
-- `group_by` と `distinct()` の両方を付けると、`get()` が返す行（束ねて重なりを除いた行）の数です。数えられない形（下の「それ以外」）はエラーです。
+- `group_by` と `distinct()` の両方を付けると、`get()` が返す行の数です。
+- 数えられない形は、エラーです（[`distinct()` を付けて数えるとき](#distinct-を付けて数えるとき)）。
 - 行が無いとき、`sum` / `avg` / `min` / `max` は `None` です。
 - `sum` などは `group_by` と一緒に使えません。
 
@@ -199,7 +205,8 @@ DB::table("posts").truncate().await?;   // 全部消す。採番も 1 に戻る
 - `insert_many` の行は、列の名前と並びを最初の行とそろえます。
 - `insert_many` の `last_insert_id` は、SQLite では最後の行、MySQL では最初の行の番号です。
 - 主キーが `id` でない表の採番は、`insert_get_id_as(値, 主キーの名前)` で受け取ります。
-- 自動採番の無い表には `insert()` を使います。`insert_get_id` は MySQL でエラーになりますが、**行は入っています。**
+- 自動採番の無い表には `insert()` を使います。
+  `insert_get_id` は MySQL でエラーになりますが、**行は入っています。**
 - **条件の無い `update` / `delete` は全行が対象です。**
 - `update` は `updated_at` を入れません（モデルの `update` は入れます）。
 - `i64` に収まらない `u64` は、文字列として書き込みます。
@@ -283,8 +290,12 @@ json(&page)   // data / total / per_page / current_page が出る
 | 指定なし・`*`（`join` が無いとき）                     | 同上                                           |
 | それ以外                                               | エラー                                         |
 
-「それ以外」は、`join` した `*`、名前が重なる列（`posts.id` と `comments.id`）、式（`id as key`）、`posts.*` とほかの列の組み合わせです。
-名前の重なりは大文字小文字を区別せずに見ます。
+「それ以外」に当たるのは次のものです。
+
+- `join` した表で `*` を選ぶ
+- 名前が重なる列（`posts.id` と `comments.id`）。大文字小文字は区別しません
+- 式（`id as key`）
+- `posts.*` とほかの列の組み合わせ
 
 ## トランザクション
 
@@ -309,6 +320,7 @@ if let Err(e) = tx.table("posts").insert(&[("title", "x".into())]).await {
     return Err(e);
 }
 ```
+
 - SQLite では、ほかのトランザクションの途中なら、始めるところで 5 秒まで待ちます。
 - モデルを中で使うときは `save_using(&tx)` などを使います（[models.md](models.md)）。
 
@@ -324,7 +336,8 @@ let affected = DB::statement("update posts set views = views + 1", &[]).await?;
 | `DB::select(sql, &[値])`    | `Vec<Row>`                                                         |
 | `DB::statement(sql, &[値])` | `Affected`（`rows` は変わった行の数、`last_insert_id` は採番の値） |
 
-- 値の置き場所は、どのドライバでも `?` です。数が合わないとエラーです。数え方は `where_raw` と同じです（文字列の中の `?` は数えない）。
+- 値の置き場所は、どのドライバでも `?` です。数が合わないとエラーです。
+- `?` の数え方は `where_raw` と同じです（文字列の中の `?` は数えない）。
 - トランザクションの中では `tx.select(...)` / `tx.statement(...)` です。
 - PostgreSQL で `?` を 1 つも書かないときは、`$1` を直に書けます。
 - 組み立てた SQL は `.to_sql()` で見られます（`DB::table("posts").where_("id", 1).to_sql()`）。接続はしません。
@@ -380,10 +393,9 @@ pub fn config() -> DatabaseConfig {
 ### つなぎ方の決まり
 
 - 接続は、最初に使ったときに張ります。
-- SQLite の相対パスは、プロジェクト直下から見ます。
 - 名前か `url` に `:memory:` を含むと、メモリ上のデータベースになります。
-- **メモリ上の SQLite は接続が 1 本です。** トランザクションの途中で `DB::table(...)` や `save()` を呼ぶと、5
-  秒待ってエラーになります。中では `tx` を使います。
+- **メモリ上の SQLite は接続が 1 本です。**
+  トランザクションの途中で `DB::table(...)` や `save()` を呼ぶと、5 秒待ってエラーになります。中では `tx` を使います。
 - MySQL と PostgreSQL は、つながらないと 30 秒待ってからエラーになります。
 - エラー文には接続の名前とつなぎ先が出ます。パスワードは出しません。
 
@@ -400,30 +412,30 @@ pub fn config() -> DatabaseConfig {
 引用符・値の置き場所・列の型名は bengara が書き分けます。
 それでも残る違いは次のとおりです。
 
-| こと                                | SQLite               | MySQL                       | PostgreSQL                                     |
-|-------------------------------------|----------------------|-----------------------------|------------------------------------------------|
-| `decimal` の列に文字列を書く        | 通る                 | 通る                        | **断られる**。`f64` で読んで書く               |
-| 整数の列を文字列と比べる            | 通る                 | 通る                        | **SQL エラー**。整数で渡す                     |
-| 型の決まらない所の `None`           | 通る                 | 通る                        | エラー。`cast(? as text)` と書く               |
-| `having_op` に別名（`total`）を渡す | 通る                 | 通る                        | エラー。`having_raw` に式を書く                |
-| トランザクションの中の `truncate()` | できる               | **エラー**。`delete()` で   | できる                                         |
-| 外部キーで指される表の `truncate()` | 指す側が空ならできる | エラー                      | エラー                                         |
-| `ilike` / `not ilike`               | エラー               | エラー                      | 使える                                         |
-| `<=>`                               | エラー               | 使える                      | エラー                                         |
-| 1 つの文に渡せる値の数              | 32,766               | 65,535                      | 65,535                                         |
-| `Affected` の `last_insert_id`      | `insert` で入る。`do update` を含む文は `None` | `insert` で入る | 常に `None`。`returning` を付けて `DB::select` |
-| 読めない型                          | —                    | —                           | `uuid` / `money` / `inet` / 配列 / `interval`  |
-| 生の `Value` の真偽                 | `Int`                | `Bool`                      | `Bool`                                         |
-| 生の `Value` の `decimal`           | `Float`              | `Text`（末尾の 0 を落とす） | `Text`（末尾の 0 を落とす）                    |
+| こと                                | SQLite                                           | MySQL                       | PostgreSQL                                     |
+|-------------------------------------|--------------------------------------------------|-----------------------------|------------------------------------------------|
+| `decimal` の列に文字列を書く        | 通る                                             | 通る                        | **断られる**。`f64` で読んで書く               |
+| 整数の列を文字列と比べる            | 通る                                             | 通る                        | **SQL エラー**。整数で渡す                     |
+| 型の決まらない所の `None`           | 通る                                             | 通る                        | エラー。`cast(? as text)` と書く               |
+| `having_op` に別名（`total`）を渡す | 通る                                             | 通る                        | エラー。`having_raw` に式を書く                |
+| トランザクションの中の `truncate()` | できる                                           | **エラー**。`delete()` で   | できる                                         |
+| 外部キーで指される表の `truncate()` | 指す側が空ならできる                             | エラー                      | エラー                                         |
+| `ilike` / `not ilike`               | エラー                                           | エラー                      | 使える                                         |
+| `<=>`                               | エラー                                           | 使える                      | エラー                                         |
+| 1 つの文に渡せる値の数              | 32,766                                           | 65,535                      | 65,535                                         |
+| `Affected` の `last_insert_id`      | `insert` で入る（`do update` を含む文は `None`） | `insert` で入る             | 常に `None`。`returning` を付けて `DB::select` |
+| 読めない型                          | —                                                | —                           | `uuid` / `money` / `inet` / 配列 / `interval`  |
+| 生の `Value` の真偽                 | `Int`                                            | `Bool`                      | `Bool`                                         |
+| 生の `Value` の `decimal`           | `Float`                                          | `Text`（末尾の 0 を落とす） | `Text`（末尾の 0 を落とす）                    |
 
-- 使えないドライバの演算子は、流す前にエラーにします。`ilike` の代わりは `like` です（SQLite は英字の大文字小文字を区別しない。MySQL
-  は照合順序による）。
+- そのドライバで使えない演算子は、流す前にエラーにします。
+- `ilike` の代わりは `like` です。SQLite は英字の大文字小文字を区別しません。MySQL は照合順序（文字の比べ方の設定）によります。
 - 値の数の上限を超えると、投げる前にエラーにします。`insert_many` は「行 × 列」で数えます。
 - `truncate()` できない表は、`delete()` で空にします（採番は戻りません）。
 - 読めない型は、`cast(列 as text) as 列` で文字列にすれば読めます。
 - 生の値の違いは、`row.value()` で `Value` を直接見るときだけ気にします。`row.get::<T>()` ならどのドライバでも同じです。
-- 日付・時刻・日時は、どのドライバでも `YYYY-MM-DD` / `HH:MM:SS` / `YYYY-MM-DD HH:MM:SS` の文字列で返ります。PostgreSQL の
-  `timestamptz` は UTC に直します。
+- 日付・時刻・日時は、どのドライバでも `YYYY-MM-DD` / `HH:MM:SS` / `YYYY-MM-DD HH:MM:SS` の文字列で返ります。
+- PostgreSQL の `timestamptz`（時差付きの日時）は UTC に直します。
 
 ## 安全のための決まり
 

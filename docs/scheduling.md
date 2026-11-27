@@ -93,7 +93,8 @@ cargo artisan schedule:run
 - 失敗した処理は、次の間隔まで動きません。
 - 3 つめは処理を動かしていません。`storage/framework/schedule/` の権限と空き容量を確かめてください。
 - 失敗が 1 件でもあると、終了コードは `1` です。`storage/` が無いときも `1` です。
-- 画面の行に加えて、ログにも出します（成功は INFO、失敗は ERROR）。ログの出し先は [logging.md](logging.md) を見てください。
+- 画面の行に加えて、ログにも出します（成功は INFO、失敗は ERROR）。
+  ログの出し先は [logging.md](logging.md) を見てください。
 
 cron の側で拾う例です。
 

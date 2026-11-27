@@ -55,7 +55,9 @@ fn main() { bengara::run() }
 cargo run -- init
 ```
 
-Laravel と同じ構成のディレクトリとファイルができます。 **何度実行しても壊れません。** 足りないものだけを作ります。
+Laravel と同じ構成のディレクトリとファイルができます。
+
+- **何度実行しても壊れません。** 足りないものだけを作ります。
 
 | すること                        | 中身                                                                |
 |---------------------------------|---------------------------------------------------------------------|
@@ -87,10 +89,10 @@ Laravel と同じ構成のディレクトリとファイルができます。 **
 
 ## 4. APP_KEY を確かめる
 
-`init` は `.env` を**新しく作ったときだけ**、`APP_KEY`（署名と暗号化の鍵）を作って書き込みます。
+`init` は `.env` を**新しく作ったときだけ**、`APP_KEY`（署名と暗号化の鍵）を書き込みます。
 Laravel の `composer create-project` と同じです。
 
-- すでにあった `.env` には触りません。`APP_KEY` が空なら、次で作ります。
+すでにあった `.env` には触りません。`APP_KEY` が空なら、次で作ります。
 
 ```sh
 cargo artisan key:generate
@@ -163,8 +165,9 @@ cargo build --release --bin myapp
 
 ### cargo artisan の別名
 
-`cargo artisan` は Cargo の別名です。`init` が次のファイルを作ります。 **このファイルを `.gitignore`
-に入れないでください。**
+`cargo artisan` は Cargo の別名です。`init` が次のファイルを作ります。
+
+- **このファイルを `.gitignore` に入れないでください。**
 
 ```toml
 # .cargo/config.toml

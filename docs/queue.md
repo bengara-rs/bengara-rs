@@ -31,31 +31,6 @@ pub fn down(schema: &mut Schema) {
 
 置いたら `cargo artisan migrate` を流します。
 
-### 前の版で作った表の索引を付け替える
-
-前の版の `Queue::define` は、`jobs` 表に `(queue, available_at)` の索引を付けていました。
-いまは `(queue, id)` です。件数が多いと、古い索引では取り出しが遅くなります。
-`Queue::define` は作ってある表には効かないので、次のマイグレーションで付け替えます。
-
-```rust
-// database/migrations/2026_11_20_000000_add_queue_id_index_to_jobs_table.rs
-use bengara::prelude::*;
-
-pub fn up(schema: &mut Schema) {
-    schema.table(bengara::queue::TABLE, |t| {
-        t.index(&["queue", "id"]);
-    });
-    schema.drop_index(bengara::queue::TABLE, &["queue", "available_at"]);
-}
-
-pub fn down(schema: &mut Schema) {
-    schema.table(bengara::queue::TABLE, |t| {
-        t.index(&["queue", "available_at"]);
-    });
-    schema.drop_index(bengara::queue::TABLE, &["queue", "id"]);
-}
-```
-
 ## ジョブを書く
 
 `app/Jobs/` に置きます。**ファイル名がジョブの名前になります**（`SendWelcome.rs` → `SendWelcome`）。
@@ -173,7 +148,8 @@ Ctrl+C を押すと、いま動かしている 1 件を終わらせてから止�
 ```
 
 - 打ち切れるのは、`.await` で待っている所だけです（返事の来ない通信など）。
-- `.await` を挟まない長い計算は打ち切れません。このときは **worker をエラーで終えます**（同じジョブが 2 本同時に動くのを防ぐため）。
+- `.await` を挟まない長い計算は打ち切れません。このときは **worker をエラーで終えます**。
+  同じジョブが 2 本同時に動くのを防ぐためです。
 - 長い計算は小さく区切って、間に `.await` を挟んでください。
 - 再挑戦は最初からやり直します。途中まで進んだ分は戻りません。
 
@@ -214,8 +190,7 @@ pub fn config() -> QueueConfig {
 取り直すまでの時間は、「打ち切りの時間 + 30 秒」と `--retry-after` の遅いほうです。
 長いジョブが、動いている途中で取り直されることはありません。
 
-- この時間は、**予約した worker が期限として行（`jobs.reserved_at`）に書きます。**
-- 取り直す側は、行の期限といまの時刻だけを見ます。自分の `--retry-after` は使いません。
+- この時間は、予約した worker が期限として行に書きます。取り直す側は、その期限だけを見ます。
 - だから `--retry-after` が違う worker が混ざっていても、まだ動いているジョブは取り直しません。
 
 2 回動くのは次のときだけです。
@@ -227,15 +202,6 @@ pub fn config() -> QueueConfig {
 
 **どんな落ち方でも、動くのは `--tries` の回数までです。**
 複数の台で動かすときは、台どうしの時計をそろえてください（NTP など）。
-
-### 前の版から上げるとき
-
-`jobs.reserved_at` の意味が「予約した時刻」から「予約の期限」に変わりました。表の形は同じです。
-
-- **前の版の worker を全部止めてから、新しい版の worker を起動してください。**
-- 前の版の worker が処理中の行は、新しい版から見ると期限切れです。すぐ取り直されて、2 回動くことがあります。
-- 新しい版の worker が処理中の行を、前の版の worker が早く取り直すことはありません。
-- Ctrl+C や SIGTERM で止めれば、いま動かしている 1 件を終えてから止まります（[止める](#止める)）。
 
 ## 失敗したとき
 
@@ -256,7 +222,8 @@ cargo artisan queue:flush           # 記録を捨てる
 
 - コードからは `Queue::retry(Some(1))`・`Queue::retry(None)`・`Queue::flush_failed()` で同じことができます。
 - 全部を戻すときは、`id` の順に 500 件ずつ戻します。戻すのは始めたときにあった行までです。
-- `app/Jobs/` に無い名前のジョブは、再挑戦せず `failed_jobs` へ移します。ファイルを置いてから `queue:retry` で戻せます。
+- `app/Jobs/` に無い名前のジョブは、再挑戦せず `failed_jobs` へ移します。
+  ファイルを置いてから `queue:retry` で戻せます。
 
 ## 本番で動かす
 
@@ -264,8 +231,9 @@ cargo artisan queue:flush           # 記録を捨てる
 
 - `queue:work` と `serve` は別のプロセスです。同じ `.env` と同じ DB を見るようにします。
 - DB に一時的につながらないときは、数回待ってやり直します。直らなければエラーで終わります。
-- 結果を DB に書けないときも数回やり直します（1・2・4 秒待つ）。停止の合図を受けた後もこの待ちは省きません。
-- 成功・失敗・諦めは、画面の行に加えてログにも出します（成功は INFO、失敗と諦めは ERROR）。ログの出し先は [logging.md](logging.md) を見てください。
+- 結果を DB に書けないときも、1・2・4 秒待ってやり直します。止める合図を受けた後も、この待ちは省きません。
+- 成功・失敗・諦めは、画面の行に加えてログにも出します（成功は INFO、失敗と諦めは ERROR）。
+  ログの出し先は [logging.md](logging.md) を見てください。
 - 設定の例は [deployment.md](deployment.md) にあります。
 
 ## テスト

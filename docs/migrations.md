@@ -33,8 +33,8 @@ pub fn down(schema: &mut Schema) {
 - `up` / `down` は SQL を組み立てるだけです。流すのはコマンドです。
 - 登録は要りません。ファイルを置けば `build.rs` が拾います。
 - 表名・列名・索引名に使えるのは、英数字（日本語も可）と `_` `-` です。表名だけ `.` で区切れます（`main.posts`）。
-  外れた名前（空白・`(`・`;` を含むなど）は、SQL を流す前のエラーです。
-- `t.raw_column` の型・`default_raw`・`schema.raw` は SQL をそのまま置きます。外から来た文字列を渡さないでください。
+- 外れた名前（空白・`(`・`;` を含むなど）は、SQL を流す前にエラーにします。
+- `t.raw_column` の型・`default_raw`・`schema.raw` は SQL をそのまま置きます。**外から来た文字列を渡さないでください。**
 
 ## 流す
 
@@ -83,17 +83,18 @@ pub fn down(schema: &mut Schema) {
 - **MySQL は例外です。** 表を変える文はその場で確定するので、失敗より前の文は残ります。
 - `migrate:rollback` は、戻すファイルが全部いまの実行ファイルにあるかを先に確かめます。無ければ何も戻しません。
 - 組み立てに誤りがあると、SQL を 1 本も流さずに止まります（下の「エラーと警告」）。
-- `migrate:status` は、ファイルごとに `実行済み` / `未実行` / `ファイルなし` を出します。`ファイルなし`
-  は、記録にあるのに実行ファイルに無いものです。
+- `migrate:status` は、ファイルごとに `実行済み` / `未実行` / `ファイルなし` を出します。
+  `ファイルなし` は、記録にあるのに実行ファイルに無いものです。
 
 ### 二重に流さない錠
 
 表を変えるコマンドは、流す前に `migration_locks` 表で錠を取ります。
 同じコマンドが 2 つ同時に走るのを防ぐためです。
 
-- 誰かが錠を持っていると、「別のプロセスがマイグレーションを実行中です」で止まります。持ち主（ホスト名とプロセス番号）と時刻も出ます。
-- 失敗したとき・`up` / `down` がパニックしたとき・Ctrl-C で止めたときも、錠を返してから終わります（終わりのコードは 0 以外）。
-- 錠を返すときは、自分が取った錠だけを消します。`migrate:unlock` の後に別のプロセスが取った錠は消しません。
+- 誰かが錠を持っていると、「別のプロセスがマイグレーションを実行中です」で止まります。
+  持ち主（ホスト名とプロセス番号）と時刻も出ます。
+- 失敗・パニック・Ctrl-C で止めたときも、錠を返してから終わります（終了コードは 0 以外）。
+- 返すときは、自分が取った錠だけを消します。`migrate:unlock` の後に別のプロセスが取った錠は消しません。
 - プロセスが強制終了されると錠が残ります。本当に止まっているかを確かめてから、`migrate:unlock` で外します。
 - `migrate:fresh` と `db:wipe` は全部の表を消しますが、`migration_locks` 表だけは残します。
 
@@ -123,8 +124,8 @@ pub fn down(schema: &mut Schema) {
 | `t.soft_deletes()`                        | `deleted_at`（日時、NULL 可）                 | 同左                          | 同左               |
 
 - `t.foreign_id(列)` は `t.id()` と型がそろうので、そのまま外部キーを張れます。
-- `t.float` と `t.double` は、どのドライバでも 8 バイトです（Laravel と違います）。4 バイトなら `t.raw_column(列, "float")`
-  です。
+- `t.float` と `t.double` は、どのドライバでも 8 バイトです（Laravel と違います）。
+  4 バイトなら `t.raw_column(列, "float")` と書きます。
 - **PostgreSQL では、日付・日時・JSON が `text` 列になります。** bengara は日時を文字列で渡すためです。
 
 ## 列に付ける指定
@@ -143,8 +144,8 @@ pub fn down(schema: &mut Schema) {
 
 - `t.id()` と `t.increments(..)` には `nullable` / `default` / `unique` が効きません。警告が出ます。
 - 列の `unique()` と表の `t.unique(&["列"])` は同じものです。両方書いても索引は 1 つです。
-- **PostgreSQL では、日時の列に `default_raw("current_timestamp")` を書かないでください。** 列が `text` なので、bengara の
-  `YYYY-MM-DD HH:MM:SS` と違う形で入ります。日時は `timestamps()` と `save()` で入れます。
+- **PostgreSQL では、日時の列に `default_raw("current_timestamp")` を書かないでください。**
+  列が `text` なので、`YYYY-MM-DD HH:MM:SS` と違う形で入ります。日時は `timestamps()` と `save()` で入れます。
 
 ## 表に付ける指定
 
@@ -181,8 +182,8 @@ schema.create("comments", |t| {
 - 例: `posts_status_index`・`users_email_unique`・`comments_post_id_foreign`
 - 同じ名前が 2 つできるときや 63 バイトを超えるときは、末尾に 8 桁の 16 進を足します。
 - 表の名前の `.` と `-` は `_` にします（`main.posts` → `main_posts_status_index`）。
-- `unique()` が作るのは一意「索引」です。PostgreSQL の `on conflict (列)` は使えますが、`on conflict on constraint 名前`
-  には使えません。
+- `unique()` が作るのは一意「索引」で、制約ではありません。
+  PostgreSQL の `on conflict (列)` は使えますが、`on conflict on constraint 名前` には使えません。
 
 ## 表を変える
 
@@ -245,10 +246,14 @@ pub fn down(schema: &mut Schema) {
 `drop_index` / `drop_unique` は、作ったときと同じ規則で名前を組み立てます。
 名前が合わないときは、次のようにします。
 
-- 名前の末尾に 16 進が付いたもの: `drop_index_named` で名前を直に書きます。
-- SQL で `unique` と書いて作った制約: MySQL は `drop_index_named("users", "email")`（列の名前）です。PostgreSQL は
-  `{表}_{列}_key` を `raw` で `drop constraint` します。SQLite は表を作り直します。
-- 無い索引を落とすと、SQLite と PostgreSQL は何もしません。MySQL はエラーです。
+| 作り方                            | 落とし方                                                  |
+|-----------------------------------|-----------------------------------------------------------|
+| 名前の末尾に 16 進が付いた        | `drop_index_named` で名前を直に書く                       |
+| SQL で `unique` と書いた（MySQL） | `drop_index_named("users", "email")`（列の名前）          |
+| 同上（PostgreSQL）                | `{表}_{列}_key` を `schema.raw` で `drop constraint` する |
+| 同上（SQLite）                    | 表を作り直す                                              |
+
+無い索引を落とすと、SQLite と PostgreSQL は何もしません。MySQL はエラーです。
 
 ## エラーと警告
 

@@ -64,7 +64,7 @@ Event::dispatch("user.registered", &Payload { user_id: user.id }).await?;
 
 - 聞く側は、登録した順に 1 つずつ動きます。
 - 誰も聞いていないときは、何もせず成功します。
-- 聞く側のパニックも失敗として扱います。クロージャの最初の `.await` より前で起きたものも同じです。
+- 聞く側のパニックも失敗として扱います。
 - コントローラ・ジョブ・自作コマンド・定期処理の、どこから呼んでも届きます。
 - `Lang::with` の言語は聞く側に引き継ぎます。
 - 聞いている数は `Event::has_listeners(名前)` と `Event::listener_count(名前)` で分かります。
@@ -141,8 +141,8 @@ pub async fn handle(Json(payload): Json<Payload>) -> Result<()> {
 登録の表はプロセスに 1 つで、アプリを組み立てるたびに置き換わります。
 テストは並んで走るので、ほかのテストの登録で動くことがあります。
 
-- **`with_events` の中身を変えたアプリで `Event::dispatch` を呼ぶテストは、`exclusive()`
-  の札を取ってください**（[testing.md](testing.md)）。
+- **`with_events` の中身を変えたアプリで `Event::dispatch` を呼ぶテストは、`exclusive()` の札を取ってください**
+  （[testing.md](testing.md#テストどうしがぶつからないように)）。
 - `bootstrap/app.rs` の登録のまま使うテストには、札は要りません。
 
 ```rust

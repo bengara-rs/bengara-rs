@@ -7,9 +7,9 @@ English follows the Japanese text.
 
 修正を出すのは、最新の minor の版だけです。
 
-| 版        | 修正を出すか |
-|-----------|--------------|
-| 0.1.x     | 出す         |
+| 版         | 修正を出すか |
+|------------|--------------|
+| 0.1.x      | 出す         |
 | それより前 | 出さない     |
 
 - 版の付け方は [docs/releases.md](docs/releases.md) にあります。
@@ -23,22 +23,22 @@ English follows the Japanese text.
 
 ## 書いてほしいこと
 
-| 項目           | 例                                               |
-|----------------|--------------------------------------------------|
-| 版             | 版の番号か、コミットのハッシュ                   |
-| 機能フラグ     | `sqlite`・`websocket` など、有効にしていたもの   |
-| OS             | Windows 11・Ubuntu 24.04 など                    |
-| 再現の手順     | 送ったリクエスト、設定、最小のコード             |
-| 影響           | 何ができてしまうか（読める・書ける・止まるなど） |
-| 考えた直し方   | あれば                                           |
+| 項目         | 例                                               |
+|--------------|--------------------------------------------------|
+| 版           | 版の番号か、コミットのハッシュ                   |
+| 機能フラグ   | `sqlite`・`websocket` など、有効にしていたもの   |
+| OS           | Windows 11・Ubuntu 24.04 など                    |
+| 再現の手順   | 送ったリクエスト、設定、最小のコード             |
+| 影響         | 何ができてしまうか（読める・書ける・止まるなど） |
+| 考えた直し方 | あれば                                           |
 
 ## 返事の目安
 
-| 段階               | 目安                                          |
-|--------------------|-----------------------------------------------|
-| 最初の返事         | 報告から 7 日以内                             |
-| 影響の見立てを伝える | 報告から 14 日以内                          |
-| 公表               | 修正を出してから。遅くとも報告から 90 日以内 |
+| 段階                 | 目安                                         |
+|----------------------|----------------------------------------------|
+| 最初の返事           | 報告から 7 日以内                            |
+| 影響の見立てを伝える | 報告から 14 日以内                           |
+| 公表                 | 修正を出してから。遅くとも報告から 90 日以内 |
 
 ## 公表の流れ
 
@@ -54,14 +54,14 @@ English follows the Japanese text.
 
 ## 対象外
 
-| 対象外のもの                                                                 | 理由・報告先                                    |
-|------------------------------------------------------------------------------|-------------------------------------------------|
-| 利用者のアプリのコードの誤り                                                 | アプリの作り手が直すもの                        |
-| `bengara-rs-sandbox`（試すためのサンプルのアプリ）                           | 公開して使うものではない                        |
-| [前段のプロキシで守るもの](docs/deployment.md#前段のプロキシで守るもの)に挙げたもの（ヘッダーの待ち時間・同時接続数など） | 前段で掛ける前提にしている |
-| [直さないと決めた制限](docs/backlog.md#直さないと決めた制限)                 | 理由を書いたうえで受け入れている                |
-| `TRUSTED_PROXIES` などの設定の誤り                                           | 設定する人が直すもの                            |
-| 依存クレート自体の脆弱性                                                     | そのクレートへ報告してください。bengara に影響があれば、こちらにも |
+| 対象外のもの                                                                                      | 理由・報告先                                               |
+|---------------------------------------------------------------------------------------------------|------------------------------------------------------------|
+| 利用者のアプリのコードの誤り                                                                      | アプリの作り手が直すもの                                   |
+| `bengara-rs-sandbox`（試すためのサンプルのアプリ）                                                | 公開して使うものではない                                   |
+| [前段のプロキシで守るもの](docs/deployment.md#前段のプロキシで守るもの)（ヘッダーの待ち時間など） | 前段で掛ける前提にしている                                 |
+| [直さないと決めた制限](docs/backlog.md#直さないと決めた制限)                                      | 理由を書いたうえで受け入れている                           |
+| `TRUSTED_PROXIES` などの設定の誤り                                                                | 設定する人が直すもの                                       |
+| 依存クレート自体の脆弱性                                                                          | そのクレートへ報告する。bengara に影響があれば、こちらにも |
 
 ---
 
@@ -100,11 +100,11 @@ Fixes are released for the latest minor version only.
 
 ## Response Times
 
-| Step                         | Target                                                  |
-|------------------------------|---------------------------------------------------------|
-| First response               | Within 7 days of the report                             |
-| Assessment of the impact     | Within 14 days of the report                            |
-| Disclosure                   | After the fix is released, at the latest 90 days after the report |
+| Step                     | Target                                                            |
+|--------------------------|-------------------------------------------------------------------|
+| First response           | Within 7 days of the report                                       |
+| Assessment of the impact | Within 14 days of the report                                      |
+| Disclosure               | After the fix is released, at the latest 90 days after the report |
 
 ## Disclosure Process
 
@@ -120,11 +120,11 @@ Fixes are released for the latest minor version only.
 
 ## Out of Scope
 
-| Out of scope                                                                                  | Reason / where to report                     |
-|-----------------------------------------------------------------------------------------------|----------------------------------------------|
-| Mistakes in the user's own application code                                                   | To be fixed by the application author        |
-| `bengara-rs-sandbox` (a sample application for trying things out)                            | Not meant to be deployed                     |
-| Items listed in [What the front proxy must protect](docs/deployment.md#前段のプロキシで守るもの) (header timeouts, connection limits, etc.) | These are expected to be enforced by the front proxy |
-| [Limitations we decided not to fix](docs/backlog.md#直さないと決めた制限)                     | Accepted, with the reasons written down      |
-| Misconfiguration such as `TRUSTED_PROXIES`                                                    | To be fixed by whoever configures it         |
-| Vulnerabilities in dependency crates themselves                                               | Please report to that crate. If bengara is affected, report here as well |
+| Out of scope                                                                                             | Reason / where to report                                                 |
+|----------------------------------------------------------------------------------------------------------|--------------------------------------------------------------------------|
+| Mistakes in the user's own application code                                                              | To be fixed by the application author                                    |
+| `bengara-rs-sandbox` (a sample application for trying things out)                                        | Not meant to be deployed                                                 |
+| [What the front proxy must protect](docs/deployment.md#前段のプロキシで守るもの) (header timeouts, etc.) | Expected to be enforced by the front proxy                               |
+| [Limitations we decided not to fix](docs/backlog.md#直さないと決めた制限)                                | Accepted, with the reasons written down                                  |
+| Misconfiguration such as `TRUSTED_PROXIES`                                                               | To be fixed by whoever configures it                                     |
+| Vulnerabilities in dependency crates themselves                                                          | Please report to that crate. If bengara is affected, report here as well |

@@ -43,8 +43,7 @@ Mail::to("alice@example.com")
 
 - 改行を断るのは、ヘッダーに偽の行を混ぜられないようにするためです。本文の改行は通ります。
 - 空白だけの宛先・写しは飛ばします（`.cc("")` でも落ちません）。
-- **アドレスの形は確かめません。** 入力から受け取るなら、`email`
-  の検査規則を通してください（[validation.md](validation.md)）。
+- **アドレスの形は確かめません。** 入力から受け取るなら、`email` の検査規則を通してください（[validation.md](validation.md)）。
 
 ### キューから送る
 
@@ -80,7 +79,8 @@ Queue::push("SendWelcome", &Payload { user_id: user.id }).await?;
 | `MAIL_FROM_NAME`    | `bengara`             | 差出人の名前                                   |
 
 - **`MAIL_FROM_NAME` の既定は `bengara` です。** 自分のアプリ名を書いてください。
-- アドレスの欄にはアドレスだけを書きます。`myapp <noreply@example.com>` と書くと、警告を出して `<>` の中だけを使います。
+- アドレスの欄にはアドレスだけを書きます。
+  `myapp <noreply@example.com>` と書くと、警告を出して `<>` の中だけを使います。
 - `null`（大文字小文字は見ない）は空と同じです。Laravel の `.env` をそのまま使えます。
 
 `config/mail.rs` を置くと、そちらを使います。無くても動きます。
@@ -153,7 +153,7 @@ async fn お知らせを送る() {
 
 - 溜まったメールは残り続けます。数える前に `Mail::clear_sent()` を呼びます。
 - 溜まる場所はプロセスに 1 つです。`Mail::sent()` を見るテストは `exclusive()` の札を取ります。
-- DB の札も取るときは、`refresh_database()` → `exclusive()` の順です（[testing.md](testing.md)）。
+- DB の札も取るときは、`refresh_database()` → `exclusive()` の順です（[testing.md](testing.md#テストどうしがぶつからないように)）。
 - `MAIL_MAILER=log cargo test` のように環境変数で渡すと、そちらを使います。
 - `Message` で見られる欄は `to`・`cc`・`bcc`・`from`・`reply_to`・`subject`・`text`・`html` です。
 - `User::register` はアプリの側の関数です（[authentication.md](authentication.md)）。
@@ -208,8 +208,8 @@ MAIL_FROM_NAME=myapp
 
 ### `MAIL_SCHEME`（Laravel 11）
 
-Laravel 11 の `.env` は、`MAIL_ENCRYPTION` の代わりに `MAIL_SCHEME` を書きます。 **書いてあれば `MAIL_ENCRYPTION`
-より先に見ます。**
+Laravel 11 の `.env` は、`MAIL_ENCRYPTION` の代わりに `MAIL_SCHEME` を書きます。
+**書いてあれば `MAIL_ENCRYPTION` より先に見ます。**
 
 | `MAIL_SCHEME` | つなぎ方                                              |
 |---------------|-------------------------------------------------------|
@@ -220,8 +220,9 @@ Laravel 11 の `.env` は、`MAIL_ENCRYPTION` の代わりに `MAIL_SCHEME` を�
 
 - `smtp` で `MAIL_ENCRYPTION=none`（`null`・`false` も）なら、暗号化しません。
 - `MAIL_PORT` が空のとき、`smtp` は 587 番です（Laravel は 25 番）。
-- **Laravel と違うところ:** Laravel の `smtp` は、サーバが `STARTTLS` を持たなければ平文で送ります。bengara
-  は切り替えを必ず求めます。手元の受け口（Mailpit など）に送るときは、`MAIL_ENCRYPTION=none` を足してください。
+- **Laravel と違うところ:** Laravel の `smtp` は、サーバが暗号化に切り替えられなければ平文で送ります。
+  bengara は切り替えを必ず求めます。
+- 手元の受け口（Mailpit など）に送るときは、`MAIL_ENCRYPTION=none` を足してください。
 
 ### 知っておくこと
 

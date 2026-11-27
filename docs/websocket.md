@@ -23,7 +23,7 @@ bengara = { version = "0.1", features = ["sqlite", "websocket"] }
 
 - フラグが無いと、`req.websocket()` が「features に "websocket" を足してください」のエラー（500）を返します。
 - `Broadcast::publish` はフラグが無くても呼べます。定期処理だけのプロセスなどで使えます。
-  ただし接続を受ける口が無いので、`memory` で送った分はどこにも届きません（`serve` の中でも、警告を 1 回出します）。
+- ただしフラグが無いと接続を受ける口がありません。`memory` で送った分はどこにも届かず、警告を 1 回出します。
 - 使う型は `prelude` に入っていません。`use` で取り込みます。
 
 ```rust
@@ -82,12 +82,14 @@ if let Some(origin) = req.header("origin") {
 }
 ```
 
-- `same_origin` はアプリで書きます。「方式・ホスト・ポート」だけを比べます。パスは見ません。
-  ポートを省いたときは方式の既定（http は 80、https は 443）として比べます。
+- `same_origin` はアプリで書きます。比べるのは「方式・ホスト・ポート」だけです。パスは見ません。
+- ポートを省いたときは、方式の既定（http は 80、https は 443）として比べます。
 - 文字列の前方一致（`starts_with`）で比べないでください。`https://example.com.evil.test` が通ります。
-- ブラウザは `Origin` を必ず付けます。付いていないのはブラウザ以外（`curl` など）からの接続です。
-  そこも断るかはアプリで決めます。**Origin だけに頼らず、認証（チケットなど）もしてください。**
+- ブラウザは `Origin` を必ず付けます。付いていないのはブラウザ以外（`curl` など）です。断るかはアプリで決めます。
+- **Origin だけに頼らず、認証（チケットなど）もしてください。**
 - `APP_URL` を本番の URL にしておきます。違うと、正しいページからの接続も断られます。
+
+ほかの注意です。
 
 - **認証は切り替える前にします。** ここで `Err` を返せば、普通のエラー応答（401 など）になります。
 - 切り替えの要求か知りたいだけなら、`req.wants_websocket()` を使います。
@@ -349,9 +351,10 @@ pub fn config() -> BroadcastConfig {
 
 ### 切り替えの要求を送る
 
-`#[bengara::test]` の `client` で、切り替えのヘッダーを付けて送ります。 **ソケットが無いので、確かめた 101
-を返すだけです。クロージャは動きません。**
-認証や `Origin` の確かめを、ソケット無しで書けます。
+`#[bengara::test]` の `client` で、切り替えのヘッダーを付けて送ります。
+
+- **ソケットが無いので、101 を返すだけです。クロージャは動きません。**
+- 認証や `Origin` の確かめは、ソケット無しで試せます。
 
 ```rust
 #[bengara::test]
@@ -376,8 +379,9 @@ async fn 切り替えの要求に101を返す() {
 
 ### 配信を確かめる
 
-`Broadcast::fake()` を呼ぶと、以後の `publish` を記録だけして送りません。 **記録はプロセスで 1 つです。** 先に
-`exclusive()` の札を取ってください。
+`Broadcast::fake()` を呼ぶと、以後の `publish` と `disconnect` を記録だけして送りません。
+
+- **記録はプロセスで 1 つです。** 先に `exclusive()` の札を取ってください。
 
 ```rust
 use bengara::broadcast::Broadcast;
@@ -394,15 +398,19 @@ async fn 投稿すると配信される() {
 }
 ```
 
-| 書き方                                        | すること                           |
-|-----------------------------------------------|------------------------------------|
-| `Broadcast::fake()`                           | 記録を空にして、記録を始める       |
-| `Broadcast::published(名前)`                  | そのチャンネルへの中身（送った順） |
-| `Broadcast::assert_published(名前, 含む文字)` | 含む中身が無ければパニック         |
-| `Broadcast::assert_nothing_published()`       | 何か記録があればパニック           |
+| 書き方                                        | すること                                           |
+|-----------------------------------------------|----------------------------------------------------|
+| `Broadcast::fake()`                           | 記録を空にして、記録を始める                       |
+| `Broadcast::published(名前)`                  | そのチャンネルへの中身（送った順）                 |
+| `Broadcast::assert_published(名前, 含む文字)` | 含む中身が無ければパニック                         |
+| `Broadcast::assert_nothing_published()`       | `publish` の記録があればパニック                   |
+| `Broadcast::disconnected(名前)`               | そのチャンネルへの `disconnect` の（番号、理由）   |
+| `Broadcast::assert_disconnected(名前)`        | そのチャンネルへの `disconnect` が無ければパニック |
 
 - 札を手放すと、fake は終わり、記録も空になります。
-- fake の間は `memory` にも `database` にも送りません。**fake の間の `disconnect` は記録されません。** 名前を確かめるだけです（`published` にも出ません）。
+- fake の間は `memory` にも `database` にも送りません。接続も閉じません。
+- `disconnect` の記録は `published` に出ません。`assert_nothing_published` も見ません。
+- 記録する番号と理由は、直した後の値です（送れない番号は 1000、長い理由は 123 バイトに切る）。
 
 ## 関連
 

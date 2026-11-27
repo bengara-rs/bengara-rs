@@ -36,7 +36,8 @@ pub struct Post {
 
 - 使える型は、整数・`f32`・`f64`・`bool`・`String`・`Vec<u8>`・`Carbon`（日時）です。ふだんは `i64` と `String` を使います。
 - **NULL を許す列は `Option<...>` にします。** そうしないと、読むときにエラーです。
-- **`decimal` の列は `f64` のフィールドにします。** PostgreSQL では `String` にすると、読めても `save` で断られます（`numeric` の列に文字列は書けません）。桁を落とせないときは、`DB::statement` で `?::numeric` と書いて保存します。
+- **`decimal` の列は `f64` のフィールドにします。** PostgreSQL では `String` にすると、読めても `save` で断られます。
+  桁を落とせないときは、`DB::statement` で `?::numeric` と書いて保存します。
 - 構造体の指定（`table`・`columns`）とフィールドの `column` を 2 回書くと、コンパイルエラーです。
 - **主キーは自動採番の整数です。** `Option` にはできません。
 - `r#type` のようなフィールドは、`type` が列名になります。
@@ -81,26 +82,30 @@ let posts = Post::query()
 `Post::query()` の条件の足し方は、[database.md](database.md) と同じです。
 結果がモデルの型で返ります。
 
-| 呼ぶもの                                | 返るもの                                                         |
-|-----------------------------------------|------------------------------------------------------------------|
-| `get()`                                 | `Vec<Post>`                                                      |
-| `first()`                               | `Option<Post>`                                                   |
-| `first_or_fail()`                       | `Post`（無ければ 404）                                           |
-| `find(id)`                              | `Option<Post>`                                                   |
-| `count()`                               | `i64`                                                            |
-| `exists()` / `doesnt_exist()`           | `bool`                                                           |
-| `sum` / `avg` / `min` / `max::<T>(col)` | `Option<T>`                                                      |
-| `pluck::<T>(col)` / `value::<T>(col)`   | `Vec<T>` / `Option<T>`                                           |
-| `update(&[...])` / `delete()`           | `u64`（件数）                                                    |
-| `paginate(per_page, page)`              | `Paginator<Post>`（[database.md](database.md) の「ページ分け」） |
+| 呼ぶもの                                | 返るもの                                                   |
+|-----------------------------------------|------------------------------------------------------------|
+| `get()`                                 | `Vec<Post>`                                                |
+| `first()`                               | `Option<Post>`                                             |
+| `first_or_fail()`                       | `Post`（無ければ 404）                                     |
+| `find(id)`                              | `Option<Post>`                                             |
+| `count()`                               | `i64`                                                      |
+| `exists()` / `doesnt_exist()`           | `bool`                                                     |
+| `sum` / `avg` / `min` / `max::<T>(col)` | `Option<T>`                                                |
+| `pluck::<T>(col)` / `value::<T>(col)`   | `Vec<T>` / `Option<T>`                                     |
+| `update(&[...])` / `delete()`           | `u64`（件数）                                              |
+| `increment(col, n)` / `decrement`       | `u64`（件数）                                              |
+| `paginate(per_page, page)`              | `Paginator<Post>`（[database.md](database.md#ページ分け)） |
 
-- **`update` は、モデルに `updated_at` の列があれば今の時刻を足します**（Laravel と同じ）。自分で渡したときは、その値を使います。
+- **`update` と `increment` / `decrement` は、モデルに `updated_at` の列があれば今の時刻も入れます**（Laravel と同じ）。
+  `update` で自分で渡したときは、その値を使います。
 - **`get()` や `first()` は全部の列を読みます。** `select` で列を絞ると、足りない列でエラーです。
 - 一部の列だけ欲しいときは、`pluck` か下の `query_builder()` を使います。
+- `join` / `left_join` も書けます。**そのときは `select(&["posts.*"])` で列を絞ります。**
+  絞らないと、結合した表の同じ名前の列（`id` など）が混じり、読む値が食い違います。
 
 ### クエリビルダに降りる
 
-`join` や `increment` を使うときは、`query_builder()` を呼びます。
+ほかの表の列も一緒に読むときは、`query_builder()` を呼びます。
 降りると、結果はモデルでなく `Row` で返ります。
 
 ```rust
@@ -182,8 +187,9 @@ if post.save_only(&["title"]).await? == 0 {
 | 更新     | 書き戻さない | 入る         |
 
 - フィールドの型は `String`・`Option<String>`・`Carbon`・`Option<Carbon>` のどれでもかまいません。
-- **`DB::table(...)` で直接入れた行には、時刻が入りません。** `timestamps()` の列は NULL を許すので、`String`
-  のフィールドで読むとエラーです。`now()` を自分で入れるか、フィールドを `Option` にします。
+- **`DB::table(...)` で直接入れた行には、時刻が入りません。**
+  `timestamps()` の列は NULL を許すので、`String` のフィールドで読むとエラーです。
+  `now()` を自分で入れるか、フィールドを `Option` にします。
 
 ### 書きやすくする
 
@@ -294,7 +300,8 @@ let posts = Post::query()
 let titles = Post::query().pluck::<String>(Post::TITLE).await?;
 ```
 
-- 定数の名前は**列名を大文字にしたもの**です（`title` → `Post::TITLE`）。`#[model(column = "...")]` で変えた後の名前を使います。
+- 定数の名前は**列名を大文字にしたもの**です（`title` → `Post::TITLE`）。
+  `#[model(column = "...")]` で変えたときは、変えた後の名前です。
 - 定数の型は `bengara::Column<Post, 型>` です。型はフィールドの型そのまま（`Option<...>` も含む）。
 - `skip` の項目には作りません。`columns` を書かないときは、定数を作りません。
 - 文字列の列名も使えます。同じクエリに混ぜても動きます。`DB::table("posts")` にも渡せます。
@@ -306,7 +313,7 @@ let titles = Post::query().pluck::<String>(Post::TITLE).await?;
 | 条件           | `where_` 系・`where_in` 系・`where_null` 系・`where_between` 系・`where_like`・`where_column` |
 | 並び           | `order_by` / `order_by_desc` / `latest_by` / `oldest_by`                                      |
 | 値を読む       | `value` / `pluck` / `sum` / `avg` / `min` / `max`                                             |
-| 増やす・減らす | `increment` / `decrement`（クエリビルダだけ）                                                 |
+| 増やす・減らす | `increment` / `decrement`                                                                     |
 
 `select` / `group_by` / `having_op` / `join` / `insert` / `update` などは、文字列で受けます。
 型の違う列を 1 つの配列に並べられないためです。`.name()` で列名を渡します。
@@ -324,17 +331,17 @@ let rows = Post::query()
 列の型 `T` と同じ型か、`T` に欠けなく広げられる型を渡せます。
 `Option<T>` の列には、その `Option` も渡せます（`None` は `is null`）。
 
-| 列の型    | ほかに渡せる型                    |
-|-----------|-----------------------------------|
-| `i16`     | `i8` `u8`                         |
-| `i32`     | `i8` `i16` `u8` `u16`             |
-| `i64`     | `i8` `i16` `i32` `u8` `u16` `u32` |
-| `u16`     | `u8`                              |
-| `u32`     | `u8` `u16`                        |
-| `u64`     | `u8` `u16` `u32`                  |
+| 列の型    | ほかに渡せる型                                                  |
+|-----------|-----------------------------------------------------------------|
+| `i16`     | `i8` `u8`                                                       |
+| `i32`     | `i8` `i16` `u8` `u16`                                           |
+| `i64`     | `i8` `i16` `i32` `u8` `u16` `u32`                               |
+| `u16`     | `u8`                                                            |
+| `u32`     | `u8` `u16`                                                      |
+| `u64`     | `u8` `u16` `u32`                                                |
 | `f64`     | `f32` `i8` `i16` `i32` `u8` `u16` `u32`（整数は小数にして渡す） |
-| `String`  | `&str` `&String`                  |
-| `Vec<u8>` | `&[u8]`                           |
+| `String`  | `&str` `&String`                                                |
+| `Vec<u8>` | `&[u8]`                                                         |
 
 ### コンパイルで止まる書き方
 
@@ -389,7 +396,8 @@ post.published_at = Some(Carbon::now().add_days(3));
 | `is_past()` / `is_future()`                                     | いまより前 / 後                               |
 | `to_date_string()` / `to_time_string()` / `to_iso8601_string()` | `YYYY-MM-DD` / `HH:MM:SS` / `…T…Z`            |
 
-- `parse` が読むのは `YYYY-MM-DD` と `YYYY-MM-DD HH:MM(:SS)` です。秒は省けます（`2026-11-20 09:30` は 09:30:00）。区切りの `T`、末尾の `Z`、小数の秒も読みます。
+- `parse` が読むのは `YYYY-MM-DD` と `YYYY-MM-DD HH:MM(:SS)` です。秒は省けます（`2026-11-20 09:30` は 09:30:00）。
+- 区切りの `T`、末尾の `Z`、小数の秒も読みます。
 - 年は 4 桁、ほかは 2 桁ちょうどにそろえます。`2026-1-5` や `9:30`、`09:30:00:00` は読めません。
 - **タイムゾーンは UTC だけです。** `+09:00` のような時差付きは読みません。
 - 入力から取り出すときは `validated.get_as::<Carbon>("published_at")?` と書けます。
