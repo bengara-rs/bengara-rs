@@ -1,0 +1,49 @@
+name: Security
+
+# 依存の脆弱性・許諾（ライセンス）・重なった版・取得元を確かめる。
+# 新しい脆弱性は依存を変えなくても見つかるので、毎日も流す。
+on:
+  push:
+    branches: [ main, develop ]
+    # 文書だけの変更では動かさない。
+    paths-ignore: [ "**.md", "docs/**", "LICENSE-*" ]
+  pull_request:
+    paths-ignore: [ "**.md", "docs/**", "LICENSE-*" ]
+  schedule:
+    # 毎日 1 回（UTC の 3 時 17 分）。
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+permissions:
+  contents: read
+
+# 同じブランチに続けて push したら、前の実行を止める。
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # deny.toml の 4 つの検査（advisories bans licenses sources）。
+  cargo-deny:
+    name: cargo-deny
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check advisories bans licenses sources
+
+  # RustSec の脆弱性の一覧と Cargo.lock を突き合わせる。無視するものは .cargo/audit.toml。
+  cargo-audit:
+    name: cargo-audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-audit
+      - run: cargo audit

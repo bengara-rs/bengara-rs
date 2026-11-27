@@ -1,0 +1,110 @@
+# CLAUDE.md
+
+このリポジトリで作業するときの指示です。
+
+## このリポジトリの役割
+
+- **フレームワーク本体**です。Rust の workspace で、`crates/*` にクレートが入っています。
+- アプリ（利用者と同じ形のサンプル）は別リポジトリ `bengara-rs-sandbox` にあります。
+  `bengara-rs-sandbox` は本リポジトリをサブモジュールとして取り込み、`[patch.crates-io]` でパスへ差し替えています。
+- 動作確認は `bengara-rs-sandbox` 側で行うのが基本です。
+
+## クレート構成と約束
+
+| クレート                | 役割                                     | 守ること                                                                                                                                         |
+|-------------------------|------------------------------------------|--------------------------------------------------------------------------------------------------------------------------------------------------|
+| `crates/bengara`        | 利用者が依存に書く本体                   | 公開 API は `prelude` 経由で使える形を保つ。axum / hyper を外に漏らさない                                                                        |
+| `crates/bengara-build`  | `build.rs` の自動検出                    | **依存クレートを持たない**。**パニック禁止**（問題は生成コードの `compile_error!` で伝える）                                                     |
+| `crates/bengara-macros` | `#[bengara::test]` と `#[derive(Model)]` | ここに機能を増やさない。マクロのエラーは分かりやすい文で出す。例外：`#[derive(Model)]` の `columns` 指定（型付きの列の定数）は足した（判断 240） |
+
+- workspace 共通: version 0.1.0-alpha.1 / edition 2021 / rust-version 1.88 / license `MIT OR Apache-2.0`。
+  bengara 自身は edition 2021 で書く。MSRV は 1.88（依存の版を固定せずに済む下限。判断 248）。
+  依存を増やすときは MSRV を上げないか確かめる。
+- `bengara-build` が生成するモジュールは、クレート直下に平らに並べる。入れ子の `#[path]` は書かない
+  （rust-analyzer がパスを解決できなくなる）。
+
+## 守るルール
+
+- **公開 API を壊さない。** `pub use` と `prelude` の中身を消す・名前を変えるのは原則禁止。
+  `prelude` を絞る話（`docs/decisions.md` の判断 78）は 0.2 でやる。それまでは増やしも減らしもしない。
+- **Laravel の名前を優先する。** 迷ったら Laravel の呼び方・ファイル名に合わせる。Rust 寄りの別名を作らない。
+- **起動後は読むだけ。** ルートと設定は起動時に組み立てて固定する。ホットパス（リクエスト処理中）で
+  共有の表を書き換えない。ロックを増やさない。いま取っているのは次のものだけで、理由は `docs/decisions.md` にある。
+
+  | ロック                          | 場所                                                            | 取り方                                                                                                                              |
+  |---------------------------------|-----------------------------------------------------------------|-------------------------------------------------------------------------------------------------------------------------------------|
+  | ルート名の表                    | `http/routing.rs`                                               | 読み取りだけ（テストで組み直せるようにするため）                                                                                    |
+  | イベントの表                    | `events.rs`                                                     | 読み取りだけ（同上）                                                                                                                |
+  | いまの言語                      | `lang.rs`                                                       | 読み取りだけ。`Lang::with` の中では取らない                                                                                         |
+  | 名前付きの DB 接続              | `database/mod.rs`                                               | 読み取りだけ。書くのは接続ごとに初回の 1 回。既定の接続はロックなし                                                                 |
+  | 回数の制限                      | `http/throttle.rs`                                              | 書き込み。数えるために要る                                                                                                          |
+  | セッション（ID ごとの錠と中身） | `session/middleware.rs`・`session/mod.rs`                       | 利用者ごと。ID の表を引く間だけ共有のロックを取る                                                                                   |
+  | テスト・手元用の置き場所        | `cache/store.rs`・`session/store.rs`・`mail.rs`・`broadcast.rs` | `memory` のキャッシュとセッション、`array` のメール、`Broadcast::fake` の記録                                                       |
+  | WebSocket の接続の表            | `websocket/registry.rs`                                         | 接続・切断・join・leave で書き、publish・local_count で読む。送るのは放してから（接続とチャンネルはリクエスト処理中に増減するため） |
+  | パスワードの計算の同時数        | `auth/hashing.rs`                                               | `Semaphore` の permit。計算の間だけ持つ。リクエストの処理中はパスワードを計算するときだけ取る                                       |
+- **実装していない機能をドキュメントに書かない。** 将来の話は `docs/backlog.md` だけに書く。
+- **利用者に見える変更は `CHANGELOG.md` の `[Unreleased]` に書く。** 版の付け方は `docs/releases.md`。
+- 依存クレートを安易に増やさない。入れる前に自前で書けないか考える。
+- `panic = "abort"` にしない。ハンドラのパニックは 1 リクエストに閉じ込めて 500 を返す。
+
+## よく使うコマンド
+
+```sh
+cargo fmt
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test --workspace
+```
+
+- 変更を入れたら 3 つすべてを通す。clippy の警告は 0 を保つ。
+
+依存の脆弱性・許諾の検査（CI の `security.yml` と同じ）：
+
+```sh
+cargo deny check   # 設定は deny.toml
+cargo audit        # 無視するものは .cargo/audit.toml（deny.toml とそろえる）
+```
+
+- 無視の一覧（`ignore`）には、mao さんの了承なしに足さない。
+
+crates.io への公開（`.github/workflows/release.yml`）：
+
+- `main` に push し、その CI（`ci.yml`）が通ると、workspace の version が crates.io にまだ無いクレートだけを出す。
+  検査は CI に任せ、`release.yml` では繰り返さない。
+  順は `bengara-macros` → `bengara-build` → `bengara`。
+- 版を上げずに push したときは何も出さない。出したい変更は、先に version と `CHANGELOG.md` を上げる。
+- 一度出した版は消せない（取り下げ＝yank だけ）。
+
+ファジング（`fuzz/`。nightly の Rust と `cargo install cargo-fuzz` が要る）：
+
+```sh
+cd fuzz
+cargo +nightly fuzz build                                  # 全部のターゲットをビルドする
+cargo +nightly fuzz run percent -- -max_total_time=600     # 1 つを 10 分回す
+cargo +nightly fuzz run multipart -- -max_total_time=600 -max_len=65536
+```
+
+- ターゲットは `multipart` `cookie_header` `percent` `dotenv` `cargo_toml` `lang_toml` `crypto` `log_line`。
+- 内部の関数は `cfg(fuzzing)` のときだけある `bengara::fuzzing` / `bengara_build::fuzzing` から呼ぶ（公開 API ではない）。
+- Windows では ASan の DLL（`clang_rt.asan_dynamic-x86_64.dll`。Visual Studio の `VC\Tools\MSVC\<版>\bin\Hostx64\x64`）を
+  `PATH` に足す。
+- 見つかった不具合は、最小の入力を通常のテストに回帰テストとして足してから直す。
+
+## ドキュメントの置き場所
+
+| 置き場所                        | 用途                                                 |
+|---------------------------------|------------------------------------------------------|
+| このリポジトリの `docs/`        | **公開用**。フレームワークの利用者が読むもの         |
+| このリポジトリの `README.md`    | フレームワークの顔                                   |
+| `bengara-rs-sandbox` の `docs/` | **設計・実装用**。要件、設計、確認の手順、決定の記録 |
+
+- 設計メモを公開用 `docs/` に置かない。逆もしない。
+- `.memo/` は下書き置き場で、指針であって決定事項ではない。実装が正しい。
+
+## 文章の書き方
+
+- **日本語で書く。** 人間が読む前提。
+- 1 文を短く。長文の段落を書かない。
+- 表と箇条書きを中心にする。見出しは `##` と `###` までにする。
+- 難しい用語・略語を並べない。使うなら一言添える。
+- 実装されていない機能は書かない。
+- UTF-8（BOM なし）、改行 LF。

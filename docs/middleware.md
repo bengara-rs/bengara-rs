@@ -1,0 +1,321 @@
+# ミドルウェア
+
+ミドルウェアは、リクエストの前後に挟む処理です。
+Laravel の `app/Http/Middleware/` に当たります。
+
+## 書く
+
+`app/Http/Middleware/` に `.rs` を置くだけです。登録ファイルの編集は要りません。
+
+```rust
+// app/Http/Middleware/EnsureAdmin.rs
+use bengara::prelude::*;
+
+pub struct EnsureAdmin;
+
+impl EnsureAdmin {
+    pub async fn handle(req: Request, next: Next) -> Result<Response> {
+        if req.header("x-admin").is_none() {
+            return abort(403);
+        }
+        next.run(req).await
+    }
+}
+```
+
+`next.run(req).await` で先へ進みます。呼ばなければ、そこで止まります。
+
+## 登録する
+
+`bootstrap/app.rs` で登録します。
+
+```rust
+Application::configure()
+    .with_middleware(|m| {
+        m.append(AddPoweredBy::handle)            // 全部のリクエストに掛ける
+            .alias("admin", EnsureAdmin::handle)  // 名前を付ける
+    })
+    .with_routing(|r| r.web(crate::routes::web::routes).health("/up"))
+    .create()
+```
+
+| メソッド          | すること                             |
+|-------------------|--------------------------------------|
+| `append(mw)`      | 共通のミドルウェアの**後ろ**に足す   |
+| `prepend(mw)`     | 共通のミドルウェアの**前**に足す     |
+| `alias(name, mw)` | 名前を付ける。ルートから名前で呼べる |
+
+このページでは、`append` / `prepend` で登録したものを「共通のミドルウェア」と呼びます。
+
+ルートには名前で付けます。`.middleware()` は何回でも書けて、書いた順に通ります。
+グループにまとめて付ける書き方は [routing.md](routing.md) にあります。
+
+```rust
+// routes/web.rs
+Route::get("/admin", AdminController::index).middleware("admin");
+```
+
+## 通る順番
+
+```
+リクエスト
+   ↓  共通のミドルウェア（登録順）
+   ↓  ルートに付けたもの（書いた順）
+   ↓  ハンドラ
+レスポンス（逆順に戻る）
+```
+
+外側のミドルウェアほど、最後にレスポンスへ手を入れます。
+
+## ルートに当たらなくても通る
+
+共通のミドルウェアは、ルートに当たらなかったリクエストにも掛かります。
+
+| リクエスト                              | 共通のもの         | ルートに付けたもの |
+|-----------------------------------------|--------------------|--------------------|
+| ルートに当たった                        | 通る               | 通る               |
+| 404・405・静的ファイル                  | 通る               | 通らない           |
+| 本文を受け取れなかった（413・400・408） | 通る               | 通らない           |
+| `.stream_body()` のルート               | 本文を読む前に通る | 本文を読む前に通る |
+
+- 本文の受け取りは [requests-and-responses.md](requests-and-responses.md) にあります。
+- 本文を受け取れなかったときは、ハンドラの代わりにそのエラー（413 など）が返ります。
+  共通のものは、そのエラーの応答に手を入れられます（CORS の見出しを付けるなど）。
+- 組み込みの `StartSession` と `VerifyCsrfToken` は、ルートが無いと動きを変えます（[session.md](session.md)）。
+- `VerifyCsrfToken` は、本文を受け取れなかった要求を確かめずに通します。ハンドラは動かないからです。
+
+自分のミドルウェアで分けたいときは `req.route_matched()` を見ます。
+
+```rust
+pub async fn handle(req: Request, next: Next) -> Result<Response> {
+    if !req.route_matched() {
+        return next.run(req).await;   // 404 には何もしない
+    }
+    // ルートがあるときだけの処理
+    next.run(req).await
+}
+```
+
+## エラーのときも通る
+
+`next.run(req).await` は**いつも成功**を返します。
+内側で `abort(403)` が起きても、ここではもうレスポンスになっています。
+
+```rust
+pub async fn handle(req: Request, next: Next) -> Result<Response> {
+    let response = next.run(req).await?;   // 403 でもここへ来る
+    Ok(response.with_header("x-powered-by", "bengara"))
+}
+```
+
+- 内側のエラーの中身は見えません。見えるのはステータスだけです。
+- ミドルウェアがパニックしても、そのリクエストだけが 500 になります。
+
+## 起動時に止まる場合
+
+| 状況                                          | 止まるときに出るもの |
+|-----------------------------------------------|----------------------|
+| 登録していない名前を `.middleware()` で使った | 登録済みの名前の一覧 |
+| 同じ名前を 2 回 `alias` した                  | 重なった名前         |
+
+## 設定を持たせる
+
+値を持つミドルウェアは、`Middleware` トレイトを自分で実装します。
+
+```rust
+// app/Http/Middleware/MaxLength.rs
+pub struct MaxLength(pub usize);
+
+impl Middleware for MaxLength {
+    fn handle(&self, req: Request, next: Next) -> BoxFuture {
+        let limit = self.0;
+        Box::pin(async move {
+            if req.body().len() > limit {
+                return abort_with(413, "本文が長すぎます");
+            }
+            next.run(req).await
+        })
+    }
+}
+```
+
+```rust
+// bootstrap/app.rs
+.alias("max_length", MaxLength(1024))
+```
+
+`self` は `async move` の中へ持ち込めません。要る値を先に取り出します。
+
+## 回数の制限（Throttle）
+
+同じ相手から短い間に何度も来るのを止めます。超えると **429** を返します。
+
+```rust
+// bootstrap/app.rs
+.alias("throttle", Throttle::per_minute(60))
+
+// routes/web.rs
+Route::post("/login", AuthController::login).middleware("throttle");
+```
+
+| 作り方                                       | 意味                                              |
+|----------------------------------------------|---------------------------------------------------|
+| `Throttle::per_minute(60)`                   | 1 分に 60 回                                      |
+| `Throttle::new(10, Duration::from_secs(30))` | 30 秒に 10 回                                     |
+| `Throttle::from_spec("60,1")?`               | 1 分に 60 回。Laravel の `throttle:60,1` と同じ形 |
+| `Throttle::per_minute(5).by_ip()`            | ログイン中でも接続元のアドレスで数える            |
+
+- `from_spec` の 2 つ目（分）は省けます。省くと 1 分です。回数か分が 0 ならエラーです。
+- `new` と `per_minute` は、回数 0 か期間 0 を渡すと**起動時にパニック**します。
+- 最初の 1 回から数え始め、期間が過ぎたら 0 に戻ります。
+
+| 結果    | 付くヘッダー                                                             |
+|---------|--------------------------------------------------------------------------|
+| 通った  | `X-RateLimit-Limit` と `X-RateLimit-Remaining`                           |
+| **429** | `X-RateLimit-Limit` と `X-RateLimit-Remaining: 0` と `Retry-After`（秒） |
+
+### 誰を数えるか
+
+数えるのは「相手とルートの組」です。
+
+| 相手の状況           | 数える単位                 |
+|----------------------|----------------------------|
+| ログインしている     | 利用者の ID                |
+| していない           | 接続元のアドレス           |
+| アドレスが分からない | 数えない（制限せずに通す） |
+
+- **ログイン・登録・パスワード再設定の口には `by_ip()` を付けます。**
+  ID で数えると、登録し直すたびに新しい枠ができるためです。
+- 共通のミドルウェアにするときは、`StartSession` より後ろに置きます。前に置くと、いつもアドレスで数えます。
+- `#[bengara::test]` から送ると `127.0.0.1` です。テストでも制限が掛かります（[testing.md](testing.md)）。
+
+ルートは「ルート名」、無ければ「登録したパス（`/api/items/{id}`）」で見分けます。
+
+- **枠はルートごとです。** 同じ `throttle` を 2 つのルートに付けると、別々に数えます。
+- パス引数を変えても、末尾に `/` を足しても、枠は増えません。
+- 名前の無いルートは、メソッドが違っても同じパスなら同じ枠です。分けたいときは名前を付けます。
+
+Laravel の名前の無い `throttle:60,1` は、**ルートをまたいで**相手ごとに 1 つの枠で数えます。
+bengara はルートごとに数えるので、そこが違います（[laravel-differences.md](laravel-differences.md)）。
+
+### 前段のプロキシ
+
+前にプロキシ（中継するサーバー）がいると、接続元はいつもプロキシです。
+本当の相手を知るために `X-Forwarded-For` と `X-Real-IP` を見ます。 **見るのは、`TRUSTED_PROXIES`
+に載っている相手から届いたときだけです。**
+
+| `TRUSTED_PROXIES` | 動き                                        |
+|-------------------|---------------------------------------------|
+| 空（既定）        | どちらのヘッダーも見ない                    |
+| アドレスの列      | 載っている相手からだけ見る                  |
+| `*`               | 接続元を信頼する（Laravel の `'*'` と同じ） |
+
+- アドレスはカンマで 1 つずつ並べます。`10.0.0.0/8` のような範囲は読めず、警告を出して捨てます。
+- `*` でも `X-Forwarded-For` の**先頭は採りません。** 先頭は相手が自由に書けるためです。
+- くわしくは [configuration.md](configuration.md) にあります。
+
+### 気をつけること
+
+| 制限                           | どうするか                                                     |
+|--------------------------------|----------------------------------------------------------------|
+| 回数はプロセスのメモリで数える | プロセスを 2 つ動かすと、実際の上限はおよそ 2 倍になる         |
+| 数えるときは 1 本ずつ処理する  | 全部のルートには掛けない。ログイン・登録・送信の口だけに付ける |
+| 覚える枠は 1 万件まで          | 超えたら、回数の少ない枠から忘れる                             |
+
+厳密に守りたいときは、前段のプロキシ（nginx の `limit_req` など）で掛けます。
+
+## 別のオリジンから呼ぶ（HandleCors）
+
+別のドメインで動く画面（JavaScript）から、API を呼べるようにします。
+CORS（ブラウザが別のオリジンへの呼び出しを許すかを決める仕組み）のヘッダーを付けます。
+Laravel の `HandleCors` に当たります。
+
+- オリジンは「方式・ホスト・ポート」の組です（`https://example.com:443`）。
+
+```rust
+// bootstrap/app.rs
+.with_middleware(|m| {
+    m.append(StartSession::file())
+        .append(VerifyCsrfToken::new())
+        .prepend(bengara::HandleCors::from_config())
+})
+```
+
+- **`init` の雛形には入っていません。** 使うときに自分で足します。
+  既定の設定のままだと、全部のオリジンに `api/*` を開くためです。
+- **`prepend` で先頭に置きます。**
+
+  | 先頭に置く理由                                   | 後ろに置くと                               |
+  |--------------------------------------------------|--------------------------------------------|
+  | 事前確認にセッションを配らない                   | 事前確認のたびにセッションの Cookie が出る |
+  | 419（CSRF）・429（回数の制限）にもヘッダーが付く | ブラウザがエラーの中身を読めない           |
+
+- `prelude` には入っていません。`bengara::HandleCors` と `bengara::CorsConfig` で使います。
+
+| 作り方                               | 意味                                        |
+|--------------------------------------|---------------------------------------------|
+| `HandleCors::from_config()`          | `config/cors.rs` の設定で作る。無ければ既定 |
+| `HandleCors::new(CorsConfig { .. })` | 設定を直接渡す                              |
+
+設定の欄は [configuration.md](configuration.md#cors-の設定) にあります。
+
+### 動き
+
+対象のパス（既定は `api/*`）だけで動きます。ほかのパスには何もしません。
+
+| 要求                                                            | 動き                                                       |
+|-----------------------------------------------------------------|------------------------------------------------------------|
+| 事前確認（`OPTIONS` で `Access-Control-Request-Method` がある） | 先へ進めずに **204** を返す。ルートが無くても 405 にしない |
+| それ以外                                                        | 先へ進め、戻ってきた応答にヘッダーを足す                   |
+
+相手のオリジンが許されていれば、次のヘッダーを付けます。許されていなければ付けません（ブラウザが止めます）。
+
+| ヘッダー                           | 事前確認 | それ以外     | 値                                                   |
+|------------------------------------|----------|--------------|------------------------------------------------------|
+| `Access-Control-Allow-Origin`      | 付ける   | 付ける       | 全部を許すときは `*`。ほかは相手のオリジンをそのまま |
+| `Access-Control-Allow-Methods`     | 付ける   | —            | `allowed_methods`。`*` なら聞かれたメソッド          |
+| `Access-Control-Allow-Headers`     | 付ける   | —            | `allowed_headers`。`*` なら聞かれたヘッダー          |
+| `Access-Control-Max-Age`           | 付ける   | —            | `max_age`（0 も付ける）                              |
+| `Access-Control-Allow-Credentials` | 真のとき | 真のとき     | `true`                                               |
+| `Access-Control-Expose-Headers`    | —        | 空でないとき | `exposed_headers`                                    |
+
+- 全部のオリジンを許すときは、`Origin` の無い要求にも `*` を付けます（Laravel と同じ）。
+- 許すメソッドやヘッダーが `*` のときは、`*` でなく聞かれた値を返します。
+  ブラウザの `*` は `Authorization` を含まず、Cookie 付きの呼び出しでは `*` を名前として扱うためです。
+- 事前確認には `Vary: Origin, Access-Control-Request-Method, Access-Control-Request-Headers` を付けます。
+- 相手を選ぶ設定のときは、許さなかった応答にも `Vary: Origin` を付けます。
+  前段のキャッシュが、別の相手に古い答えを返さないためです。
+- 比べるのは届いたパスそのままです（`%xx` は戻しません）。ルートの照合と同じです。
+
+### エラーの応答
+
+404・405・413・419・422・429・500 にも付きます。付かないと、ブラウザの JavaScript がエラーの中身を読めません。
+
+- 本文を受け取れなかった応答（413・400・408）に付くのは、`HandleCors` を共通のミドルウェア
+  （`append` / `prepend`）に入れたときだけです。ルートに付けたミドルウェアは、このとき通りません。
+- **パニックの 500 には付きません。** この応答はミドルウェアの並びの外で作るためです。
+  ブラウザからは「CORS で止められた」と見えます。
+
+### 起動時に止まる設定
+
+次の設定は、`HandleCors` を作るときにパニックします。
+
+| 設定                                                    | 理由                                                       |
+|---------------------------------------------------------|------------------------------------------------------------|
+| `supports_credentials` が真で、`allowed_origins` に `*` | どのサイトにも Cookie 付きの呼び出しを許すことになる       |
+| `supports_credentials` が真で、`exposed_headers` に `*` | Cookie 付きの呼び出しでは、ブラウザが `*` を名前として扱う |
+| `allowed_origins` で、ホストの先頭以外に `*`            | 書けるのは `https://*.example.com` の形だけ                |
+| `allowed_origins` にパス（末尾の `/` を含む）           | オリジンにパスは付かないので、当たらない                   |
+| `paths` に `https://...` のような URL                   | パスだけを比べるので、当たらない                           |
+
+Laravel は `supports_credentials` と `*` を同時に書くと、相手のオリジンをそのまま返します。bengara は起動時に止めます。
+
+## 一覧を見る
+
+`cargo artisan route:list` の MIDDLEWARE の列に、ルートに付けた名前が出ます。共通のミドルウェアは出ません。
+
+## 関連
+
+- [routing.md](routing.md)
+- [requests-and-responses.md](requests-and-responses.md)
+- [session.md](session.md)

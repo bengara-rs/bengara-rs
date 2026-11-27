@@ -1,0 +1,828 @@
+//! ドライバごとの SQL の書き分けと、名前・演算子の検査。
+//!
+//! 引用符、プレースホルダ、`offset` だけのときの `limit`、`truncate`、表を全部消す文、
+//! `returning`、`like` の逃がしの文字などを、ドライバごとに書き分けます。
+//! 列の型名だけは `schema.rs` にあります。
+//!
+//! 利用者が書いた SQL の `?` と `$` の数え方・振り直し方、名前と演算子の許可一覧も
+//! ここに集めてあります。数え方を 1 か所にして、食い違わせないためです。
+
+/// 使うデータベース。
+///
+/// **`#[non_exhaustive]` です。** 後からドライバを足せるように、`match` には
+/// `_ =>` の腕を書いてください。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum Driver {
+    /// SQLite。
+    Sqlite,
+    /// MySQL / MariaDB。
+    MySql,
+    /// PostgreSQL。
+    Postgres,
+}
+
+impl Driver {
+    /// 設定に書く名前。
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Driver::Sqlite => "sqlite",
+            Driver::MySql => "mysql",
+            Driver::Postgres => "pgsql",
+        }
+    }
+
+    /// 設定の文字列から読む。Laravel の名前（`pgsql`）も受け付けます。
+    pub fn parse(name: &str) -> Option<Driver> {
+        match name.trim().to_ascii_lowercase().as_str() {
+            "sqlite" | "sqlite3" => Some(Driver::Sqlite),
+            "mysql" | "mariadb" => Some(Driver::MySql),
+            "pgsql" | "postgres" | "postgresql" => Some(Driver::Postgres),
+            _ => None,
+        }
+    }
+
+    /// いまの作りで実際につなげるか。
+    ///
+    /// ドライバごとに Cargo の機能フラグが必要です。
+    ///
+    /// | ドライバ   | フラグ                  |
+    /// |------------|-------------------------|
+    /// | SQLite     | `sqlite`                |
+    /// | MySQL      | `mysql`（`mariadb` も） |
+    /// | PostgreSQL | `postgres`              |
+    ///
+    /// SQL の組み立てはフラグが無くてもできます。つなぐところだけが変わります。
+    pub fn is_available(&self) -> bool {
+        match self {
+            Driver::Sqlite => cfg!(feature = "sqlite"),
+            Driver::MySql => cfg!(feature = "mysql"),
+            Driver::Postgres => cfg!(feature = "postgres"),
+        }
+    }
+}
+
+impl std::fmt::Display for Driver {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// 値を渡す場所の書き方。`index` は1から数えます。
+pub(crate) fn placeholder(driver: Driver, index: usize) -> String {
+    match driver {
+        Driver::Postgres => format!("${index}"),
+        _ => "?".to_string(),
+    }
+}
+
+/// 利用者が書いた SQL を 1 文字ずつ見て、引用の外にあるかを添えて返す。
+///
+/// `?` と `$` を見る 3 か所（[`count_placeholders`]・[`number_placeholders`]・
+/// [`has_dollar`]）が、すべてこれを通ります。数え方と振り直し方を食い違わせないためです。
+///
+/// 次の中は「外」としません。
+///
+/// - 文字列リテラル `'...'`。`''` の逃がしは、閉じてすぐ開き直すのと同じなので、そのまま扱えます。
+/// - 引用した名前 `"..."` と `` `...` ``。
+///
+/// 以前は SQL 全体の `?` と `$` を数えていました。`where_raw("label = '$100'")` が
+/// PostgreSQL で断られ、`'?'` の入った SQL は値の数が合わないと言われていました。
+///
+/// **バックスラッシュの逃がし（MySQL の `'it\'s'`）は見ません。** 標準の SQL と
+/// PostgreSQL・SQLite では `\` はただの文字です。ドライバで数え方を変えると、
+/// 組み立ての検査と終端の振り直しが食い違うので、どのドライバでも同じにしています。
+/// コメント（`--` / `/* */`）の中も「外」として数えます。
+fn outside_quotes(sql: &str) -> impl Iterator<Item = (char, bool)> + '_ {
+    let mut open: Option<char> = None;
+    sql.chars().map(move |c| match open {
+        Some(quote) => {
+            if c == quote {
+                open = None;
+            }
+            (c, false)
+        }
+        None => {
+            if matches!(c, '\'' | '"' | '`') {
+                open = Some(c);
+                (c, false)
+            } else {
+                (c, true)
+            }
+        }
+    })
+}
+
+/// 利用者が書いた SQL の `?` の数。
+///
+/// 文字列リテラルと引用した名前の中の `?` は数えません（[`outside_quotes`]）。
+///
+/// **PostgreSQL の JSONB の演算子 `?` `?|` `?&` も置き場所として数えます。**
+/// 値の置き場所と区別できないためです。`jsonb_exists(列, 'キー')` のような関数で書いてください。
+pub(crate) fn count_placeholders(sql: &str) -> usize {
+    outside_quotes(sql)
+        .filter(|&(c, outside)| outside && c == '?')
+        .count()
+}
+
+/// 利用者が書いた SQL の、引用の外に `$` があるか。
+///
+/// PostgreSQL の `$1` の直書きを見つけるために使います。`'$100'` のような
+/// 文字列リテラルの中の `$` は見ません（[`outside_quotes`]）。
+pub(crate) fn has_dollar(sql: &str) -> bool {
+    outside_quotes(sql).any(|(c, outside)| outside && c == '$')
+}
+
+/// 利用者が書いた SQL の `?` を、ドライバの書き方に直す。
+///
+/// PostgreSQL だけ `$n` に振り直します。`already` はこの SQL より前に渡した値の数で、
+/// 番号はその次から振ります。ほかのドライバでは `?` のまま返します。
+pub(crate) fn number_placeholders(driver: Driver, sql: &str, already: usize) -> String {
+    if driver != Driver::Postgres {
+        return sql.to_string();
+    }
+    let mut out = String::with_capacity(sql.len() + 8);
+    let mut index = already;
+    // 振り直すのは `count_placeholders` が数える `?` だけ。文字列の中の `?` は残す。
+    for (c, outside) in outside_quotes(sql) {
+        if outside && c == '?' {
+            index += 1;
+            out.push_str(&placeholder(driver, index));
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+/// 大文字小文字と空白をそろえた演算子が `is` / `is not` か。
+///
+/// `NULL` 以外の値を `is` / `is not` と組にした書き方を断るために使います
+/// （PostgreSQL と MySQL は `is` の右にプレースホルダを置けません）。
+pub(crate) fn is_null_operator(operator: &str) -> Option<bool> {
+    match normalize_operator(operator).as_str() {
+        "is" => Some(false),
+        "is not" => Some(true),
+        _ => None,
+    }
+}
+
+/// `NULL` と比べたときに `is null` / `is not null` に読み替える演算子か。
+///
+/// 返すのは「否定か」です。`=` と `is` は `Some(false)`、`!=` `<>` `is not` は
+/// `Some(true)`、それ以外は `None`。
+///
+/// `"c" = NULL` は SQL では真にも偽にもならず、必ず 0 件になります。
+/// Laravel の `where('c', null)` と同じく、`is null` に読み替えます。
+pub(crate) fn null_comparison(operator: &str) -> Option<bool> {
+    match normalize_operator(operator).as_str() {
+        "=" | "is" => Some(false),
+        "!=" | "<>" | "is not" => Some(true),
+        _ => None,
+    }
+}
+
+/// 名前を引用符でくくる。`users.id` は `"users"."id"` になります。
+///
+/// `*`、`count(*)`、`id as key` のような式はそのまま返します。
+///
+/// **そのまま返す経路は意図した逃げ道です。** `select(&["count(*) as total"])` が
+/// これに頼っています。引用符を含む名前は素通しせず、`""` に逃がしてくくります。
+/// そのうえで、外から来た文字列が入りうる場所（`where_` / `order_by` / `join` の
+/// 列名など）では [`is_plain_identifier`] で先に検査します。
+///
+/// **素通しの判定は `is_expression` です。** 空白・`(`・`*` のどれかを含む名前は
+/// くくらずそのまま返します。`drop table x` のような文字列も素通しします。
+///
+/// `schema.rs` も、表名・列名・索引名を先に検査します（外れたら SQL を流す前のエラー）。
+/// 決まりは [`is_plain_identifier`] に `-` を足したものです。
+/// ただし `raw_column` の型・`default_raw`・`Schema::raw` は SQL をそのまま置きます。
+/// 外から来た文字列（リクエストの値、設定ファイルの値）を渡してはいけません。
+pub(crate) fn quote(driver: Driver, name: &str) -> String {
+    let trimmed = name.trim();
+    if is_expression(trimmed) {
+        return trimmed.to_string();
+    }
+    trimmed
+        .split('.')
+        .map(|part| quote_part(driver, part))
+        .collect::<Vec<_>>()
+        .join(".")
+}
+
+/// 名前を**必ず**引用符でくくる。式とみなして素通しする経路はありません。
+///
+/// データベースから読んだ名前（`table_names()` の結果など）に使います。
+/// [`quote`] は空白・`(`・`*` を含む名前を式として素通しし、`.` で分けます。
+/// 表の名前にそれらの文字が入っていると、壊れた SQL や別の文になります。
+/// ここでは名前全体を 1 つの名前としてくくり、引用符は二重にして逃がします。
+pub(crate) fn quote_name(driver: Driver, name: &str) -> String {
+    match driver {
+        Driver::MySql => format!("`{}`", name.replace('`', "``")),
+        _ => format!("\"{}\"", name.replace('"', "\"\"")),
+    }
+}
+
+/// 引用符でくくらずにそのまま置く式か。
+///
+/// 引用符（`"` と `` ` ``）は見ません。`quote_part` が `""` に逃がすので、
+/// 素通しさせる必要がないためです。素通しすると、引用符を1つ混ぜるだけで
+/// 検査を抜けられてしまいます。
+fn is_expression(name: &str) -> bool {
+    name == "*" || name.contains('(') || name.contains(' ')
+}
+
+/// ただの列名か。英数字と `_` `.` だけを許します。
+///
+/// 英数字は Unicode で見ます。日本語の列名も通ります。`"` `;` `(` `-` と空白は
+/// Unicode でも英数字ではないので、検査の強さは変わりません。
+///
+/// `*` も式も通しません。式を書きたいときは `order_by_raw` / `having_raw` /
+/// `where_raw` を使ってください。
+///
+/// **`.` で区切った各部は空にできません。** `.`・`a..b`・`users.` は断ります。
+/// 通すと `"".""` や `"users".""` のような壊れた SQL になります。
+///
+/// **呼ぶのはクエリビルダ（`query.rs`）だけです。** 移行（`schema.rs`）は `-` も通す
+/// 自前の決まりで検査します。
+pub(crate) fn is_plain_identifier(name: &str) -> bool {
+    name.trim().split('.').all(is_identifier_part)
+}
+
+/// 表名を付けていない、ただの列名か。英数字と `_` だけを許します。
+///
+/// 書き込み（`insert` / `update` / `increment`）の列名に使います。
+/// `set "posts"."title" = ?` は SQLite と PostgreSQL で SQL エラーになるためです
+/// （通るのは MySQL だけ）。
+pub(crate) fn is_bare_identifier(name: &str) -> bool {
+    is_identifier_part(name.trim())
+}
+
+/// `.` で区切った1つぶん。空は通しません。
+fn is_identifier_part(part: &str) -> bool {
+    !part.is_empty() && part.chars().all(|c| c.is_alphanumeric() || c == '_')
+}
+
+/// 列と列を比べるのに使える演算子の一覧。これ以外は受け付けません。
+///
+/// 大文字小文字は区別しません。語の間の空白はいくつでもかまいません。
+///
+/// **`in` / `between` 系と `is` / `is not` は入れていません。** 列と列の間に置くと
+/// SQL として成り立たないためです（`is` は SQLite だけが通し、PostgreSQL と MySQL では
+/// 構文エラーになります）。以前は入っていて、実行するまで気づけませんでした。
+///
+/// `<=>` は入っています。MySQL だけの演算子です。値1つと比べる側の一覧は
+/// [`VALUE_OPERATORS`] を見てください。
+pub(crate) const OPERATORS: &[&str] = &[
+    "=",
+    "!=",
+    "<>",
+    "<",
+    "<=",
+    ">",
+    ">=",
+    "<=>",
+    "like",
+    "not like",
+    "ilike",
+    "not ilike",
+];
+
+/// 値1つと比べるのに使える演算子の一覧。
+///
+/// `in` / `between` 系を外しています。値1つでは SQL が成り立たないためです。
+/// `<=>` も外しています。MySQL だけの書き方なので、方言で結果が変わります。
+pub(crate) const VALUE_OPERATORS: &[&str] = &[
+    "=",
+    "!=",
+    "<>",
+    "<",
+    "<=",
+    ">",
+    ">=",
+    "like",
+    "not like",
+    "ilike",
+    "not ilike",
+    "is",
+    "is not",
+];
+
+/// 値を2つ以上とる演算子の一覧。専用のメソッドへ案内するために使います。
+pub(crate) const SET_OPERATORS: &[&str] = &["in", "not in", "between", "not between"];
+
+/// 大文字小文字と空白をそろえる。
+///
+/// クエリビルダは、そろえた後の演算子を SQL に書きます（`query.rs`）。
+/// 照合だけをそろえた形で行い、SQL には打ったままの形を書いていた頃は、
+/// `"not\u{3000}like"` のような全角の空白入りが一覧を通って、壊れた SQL になっていました。
+pub(crate) fn normalize_operator(operator: &str) -> String {
+    operator
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_ascii_lowercase()
+}
+
+/// 列と列を比べる演算子として受け付けるか。
+pub(crate) fn is_allowed_operator(operator: &str) -> bool {
+    OPERATORS.contains(&normalize_operator(operator).as_str())
+}
+
+/// 値1つと比べる演算子として受け付けるか。
+pub(crate) fn is_allowed_value_operator(operator: &str) -> bool {
+    VALUE_OPERATORS.contains(&normalize_operator(operator).as_str())
+}
+
+/// そのドライバだけが持つ演算子なら、そのドライバ。どこでも使えるなら `None`。
+///
+/// | 演算子                 | 使えるドライバ | ほかのドライバでは                         |
+/// |------------------------|----------------|--------------------------------------------|
+/// | `ilike` / `not ilike`  | PostgreSQL     | SQLite と MySQL は構文エラー               |
+/// | `<=>`                  | MySQL          | SQLite は構文エラー、PostgreSQL は演算子が無い |
+pub(crate) fn operator_driver(operator: &str) -> Option<Driver> {
+    match normalize_operator(operator).as_str() {
+        "ilike" | "not ilike" => Some(Driver::Postgres),
+        "<=>" => Some(Driver::MySql),
+        _ => None,
+    }
+}
+
+/// 値を2つ以上とる演算子か。
+pub(crate) fn is_set_operator(operator: &str) -> bool {
+    SET_OPERATORS.contains(&normalize_operator(operator).as_str())
+}
+
+/// `like` / `not like` の後ろに足す、逃がしの文字の指定。
+///
+/// 渡す演算子は [`normalize_operator`] でそろえた後のものです。
+///
+/// | ドライバ   | 足すもの      | 理由                                               |
+/// |------------|---------------|----------------------------------------------------|
+/// | SQLite     | ` escape '\'` | 既定では逃がしの文字が無い。`\%` が `\` と `%` になる |
+/// | MySQL      | 無し          | 既定の逃がしの文字が `\`                           |
+/// | PostgreSQL | 無し          | 既定の逃がしの文字が `\`                           |
+///
+/// どのドライバでも、`100\%` が「`100%` という文字列」に当たるようにそろえます。
+/// MySQL と PostgreSQL は既定のままにします（値はプレースホルダで渡すので、
+/// 文字列リテラルの `\` の扱いには左右されません）。
+pub(crate) fn like_escape(driver: Driver, operator: &str) -> &'static str {
+    match (driver, operator) {
+        (Driver::Sqlite, "like" | "not like") => " escape '\\'",
+        _ => "",
+    }
+}
+
+/// 利用者が書いた SQL の、引用の外の文字だけを残した文字列。
+///
+/// 引用の中の文字は空白に置き換えます（[`outside_quotes`] と同じ見分け方）。
+/// 語を探すとき（`do update` など）に、文字列の中の語を拾わないために使います。
+#[cfg(feature = "sqlite")]
+pub(crate) fn outside_text(sql: &str) -> String {
+    outside_quotes(sql)
+        .map(|(c, outside)| if outside { c } else { ' ' })
+        .collect()
+}
+
+/// `offset` だけを付けたときに補う `limit`。
+///
+/// `offset` は `limit` が無いと受け付けないデータベースがあるので、
+/// 「上限なし」を表す書き方を足します。方言で違います。
+///
+/// | ドライバ   | 書き方                           |
+/// |------------|----------------------------------|
+/// | PostgreSQL | `limit all`                      |
+/// | MySQL      | `limit 18446744073709551615`     |
+/// | SQLite     | `limit -1`                       |
+///
+/// `limit -1` が通るのは SQLite だけです。MySQL では構文エラーになります。
+pub(crate) fn no_limit(driver: Driver) -> &'static str {
+    match driver {
+        Driver::Postgres => " limit all",
+        Driver::MySql => " limit 18446744073709551615",
+        Driver::Sqlite => " limit -1",
+    }
+}
+
+fn quote_part(driver: Driver, part: &str) -> String {
+    if part == "*" {
+        return part.to_string();
+    }
+    match driver {
+        Driver::MySql => format!("`{}`", part.replace('`', "``")),
+        _ => format!("\"{}\"", part.replace('"', "\"\"")),
+    }
+}
+
+/// 表を空にする文（MySQL と PostgreSQL）。
+///
+/// **PostgreSQL だけ `restart identity` を付けます。** PostgreSQL の `truncate` は
+/// 既定で採番を続けます（`continue identity`）。MySQL の `truncate` は
+/// `auto_increment` を必ず戻すので、何も足しません。
+///
+/// SQLite に `truncate` は無いので、ここは通りません（`QueryBuilder::truncate` が
+/// `delete` と採番の戻しに分けます）。
+pub(crate) fn truncate(driver: Driver, table: &str) -> String {
+    let quoted = quote(driver, table);
+    match driver {
+        Driver::Postgres => format!("truncate table {quoted} restart identity"),
+        _ => format!("truncate table {quoted}"),
+    }
+}
+
+/// 1つの文に束縛できる値の数の上限。
+///
+/// | ドライバ   | 上限   | 決まる所                                           |
+/// |------------|--------|----------------------------------------------------|
+/// | SQLite     | 32,766 | `SQLITE_MAX_VARIABLE_NUMBER` の既定（3.32.0 以降） |
+/// | MySQL      | 65,535 | プリペアドステートメントの値の数が 16 ビット       |
+/// | PostgreSQL | 65,535 | Bind メッセージの値の数が 16 ビット                |
+///
+/// 超えるとドライバのエラーになり、文から原因が読み取りにくいので、
+/// クエリビルダが投げる前に確かめます。
+pub(crate) fn max_bindings(driver: Driver) -> usize {
+    match driver {
+        Driver::Sqlite => 32_766,
+        Driver::MySql | Driver::Postgres => 65_535,
+    }
+}
+
+/// 表を全部消す文。外部キーの向きを気にせず消せる形にします。
+///
+/// | ドライバ   | 形                                              |
+/// |------------|-------------------------------------------------|
+/// | PostgreSQL | 1文にまとめて `cascade` を付ける                |
+/// | MySQL      | 1表ずつ。確かめの止め方は [`defer_foreign_keys`] |
+/// | SQLite     | 1表ずつ。同上                                   |
+///
+/// PostgreSQL の `cascade` は、**この文で消す表を指している外部キーも一緒に**
+/// 落とします。表を全部消す場面だけで使います。
+pub(crate) fn drop_all(driver: Driver, tables: &[String]) -> Vec<String> {
+    if tables.is_empty() {
+        return Vec::new();
+    }
+    // データベースから読んだ名前なので、式として素通ししない（`quote_name`）。
+    let quoted: Vec<String> = tables.iter().map(|t| quote_name(driver, t)).collect();
+    match driver {
+        Driver::Postgres => vec![format!(
+            "drop table if exists {} cascade",
+            quoted.join(", ")
+        )],
+        _ => quoted
+            .iter()
+            .map(|t| format!("drop table if exists {t}"))
+            .collect(),
+    }
+}
+
+/// 表を全部消す間だけ、外部キーの確かめを止める SQL。
+///
+/// 返すのは（始めに流す文、終わりに流す文）です。終わりが `None` のときは、
+/// 流しっぱなしにしてかまいません。
+///
+/// | ドライバ   | 始め                                | 終わり                              |
+/// |------------|-------------------------------------|-------------------------------------|
+/// | SQLite     | `pragma defer_foreign_keys = on`    | 無し（確定のときに自動で戻る）      |
+/// | MySQL      | `set session foreign_key_checks = 0` | `set session foreign_key_checks = 1` |
+/// | PostgreSQL | 無し（`cascade` で足りる）          | 無し                                |
+pub(crate) fn defer_foreign_keys(driver: Driver) -> (Option<&'static str>, Option<&'static str>) {
+    match driver {
+        Driver::Sqlite => (Some("pragma defer_foreign_keys = on"), None),
+        Driver::MySql => (
+            Some("set session foreign_key_checks = 0"),
+            Some("set session foreign_key_checks = 1"),
+        ),
+        Driver::Postgres => (None, None),
+    }
+}
+
+/// `insert` の後に自動採番の ID を受け取るための追記（PostgreSQL だけ必要）。
+pub(crate) fn returning_id(driver: Driver, primary_key: &str) -> String {
+    match driver {
+        Driver::Postgres => format!(" returning {}", quote(driver, primary_key)),
+        _ => String::new(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn 名前の引用はドライバごとに変わる() {
+        assert_eq!(quote(Driver::Sqlite, "title"), "\"title\"");
+        assert_eq!(quote(Driver::MySql, "title"), "`title`");
+        assert_eq!(quote(Driver::Postgres, "users.id"), "\"users\".\"id\"");
+        assert_eq!(quote(Driver::Sqlite, "users.*"), "\"users\".*");
+    }
+
+    #[test]
+    fn 式はそのまま置く() {
+        assert_eq!(quote(Driver::Sqlite, "*"), "*");
+        assert_eq!(quote(Driver::Sqlite, "count(*)"), "count(*)");
+        assert_eq!(quote(Driver::Sqlite, "id as key"), "id as key");
+    }
+
+    #[test]
+    fn 引用符を含む名前は素通しせず逃がす() {
+        // `"` を混ぜて検査を抜ける道を塞ぐ。
+        assert_eq!(quote(Driver::Sqlite, "a\"b"), "\"a\"\"b\"");
+        assert_eq!(quote(Driver::MySql, "a`b"), "`a``b`");
+        // バックティックは SQLite では普通の文字なので、そのままくくる。
+        assert_eq!(quote(Driver::Sqlite, "a`b"), "\"a`b\"");
+    }
+
+    #[test]
+    fn プレースホルダはpostgresだけ番号付き() {
+        assert_eq!(placeholder(Driver::Sqlite, 1), "?");
+        assert_eq!(placeholder(Driver::MySql, 3), "?");
+        assert_eq!(placeholder(Driver::Postgres, 3), "$3");
+    }
+
+    #[test]
+    fn ただの列名だけを通す() {
+        assert!(is_plain_identifier("title"));
+        assert!(is_plain_identifier("users.id"));
+        assert!(is_plain_identifier("views_2"));
+        assert!(!is_plain_identifier(""));
+        assert!(!is_plain_identifier("*"));
+        assert!(!is_plain_identifier("count(*)"));
+        assert!(!is_plain_identifier("id desc"));
+        assert!(!is_plain_identifier("id; drop table posts"));
+        assert!(!is_plain_identifier("\"id\""));
+        assert!(!is_plain_identifier("a`b"));
+        assert!(!is_plain_identifier("id-1"));
+    }
+
+    #[test]
+    fn 点で区切った部分が空の名前は断る() {
+        // 通すと `"".""` のような壊れた SQL になる。
+        for broken in [".", "..", "a..b", "users.", ".id", " . ", "a.b."] {
+            assert!(!is_plain_identifier(broken), "{broken}");
+        }
+        // 区切りが正しければ、何段でも通る。前後の空白は今までどおり見ない。
+        assert!(is_plain_identifier("main.users.id"));
+        assert!(is_plain_identifier(" users.id "));
+    }
+
+    #[test]
+    fn 書き込みの列名は表名を付けられない() {
+        assert!(is_bare_identifier("title"));
+        assert!(is_bare_identifier("views_2"));
+        assert!(is_bare_identifier("題名"));
+        assert!(!is_bare_identifier("posts.title"));
+        assert!(!is_bare_identifier(""));
+        assert!(!is_bare_identifier("."));
+        assert!(!is_bare_identifier("title = 0, body"));
+    }
+
+    #[test]
+    fn 表を空にする文はpostgresだけ採番を戻す指定を付ける() {
+        // PostgreSQL の truncate は、既定では採番を続ける。
+        assert_eq!(
+            truncate(Driver::Postgres, "posts"),
+            "truncate table \"posts\" restart identity"
+        );
+        // MySQL の truncate は必ず戻すので、何も足さない。
+        assert_eq!(truncate(Driver::MySql, "posts"), "truncate table `posts`");
+    }
+
+    #[test]
+    fn 束縛できる値の数の上限はドライバで違う() {
+        assert_eq!(max_bindings(Driver::Sqlite), 32_766);
+        assert_eq!(max_bindings(Driver::MySql), 65_535);
+        assert_eq!(max_bindings(Driver::Postgres), 65_535);
+    }
+
+    #[test]
+    fn 日本語の列名も通る() {
+        // 英数字を Unicode で見るので、`where_` と `order_by` で結果がそろう。
+        assert!(is_plain_identifier("題名"));
+        assert!(is_plain_identifier("posts.題名"));
+        assert_eq!(quote(Driver::Sqlite, "題名"), "\"題名\"");
+    }
+
+    #[test]
+    fn 演算子は許可一覧で照合する() {
+        assert!(is_allowed_operator("="));
+        assert!(is_allowed_operator(">="));
+        assert!(is_allowed_operator("LIKE"));
+        assert!(is_allowed_operator("not   like"));
+        assert!(is_allowed_operator(" not   ilike "));
+        assert!(!is_allowed_operator(""));
+        assert!(!is_allowed_operator("= 1 or 1"));
+        assert!(!is_allowed_operator("glob"));
+    }
+
+    #[test]
+    fn 値と比べる演算子は一覧が狭い() {
+        // 値1つと比べられるもの。
+        assert!(is_allowed_value_operator("="));
+        assert!(is_allowed_value_operator("NOT LIKE"));
+        assert!(is_allowed_value_operator("is not"));
+        // 値1つでは SQL が成り立たないもの。
+        assert!(!is_allowed_value_operator("in"));
+        assert!(!is_allowed_value_operator("between"));
+        assert!(!is_allowed_value_operator("not between"));
+        // MySQL だけの書き方。
+        assert!(!is_allowed_value_operator("<=>"));
+        // 列と列を比べる側では `<=>` だけが通る。
+        assert!(is_allowed_operator("<=>"));
+    }
+
+    #[test]
+    fn 列と列を比べる演算子に_in_や_is_は入らない() {
+        // 列と列の間に置くと SQL として成り立たない。`is` は SQLite だけが通す。
+        for operator in ["in", "NOT IN", "is", "is not", "between", "not  between"] {
+            assert!(!is_allowed_operator(operator), "{operator}");
+        }
+    }
+
+    #[test]
+    fn 値を2つ以上とる演算子が分かる() {
+        assert!(is_set_operator("IN"));
+        assert!(is_set_operator("not  between"));
+        assert!(!is_set_operator("="));
+        assert!(!is_set_operator("like"));
+    }
+
+    #[test]
+    fn 上限なしのlimitは方言で違う() {
+        // `limit -1` が通るのは SQLite だけ。
+        assert_eq!(no_limit(Driver::Sqlite), " limit -1");
+        assert_eq!(no_limit(Driver::MySql), " limit 18446744073709551615");
+        assert_eq!(no_limit(Driver::Postgres), " limit all");
+    }
+
+    #[test]
+    fn 生のsqlのプレースホルダはpostgresだけ番号に直す() {
+        assert_eq!(count_placeholders("a = ? and b in (?, ?)"), 3);
+        assert_eq!(
+            number_placeholders(Driver::Postgres, "a = ? and b in (?, ?)", 0),
+            "a = $1 and b in ($2, $3)"
+        );
+        // 前に 2 つ渡していれば 3 から振る（where_raw と having_raw を続けたとき）。
+        assert_eq!(number_placeholders(Driver::Postgres, "c > ?", 2), "c > $3");
+        // ほかのドライバは触らない。
+        assert_eq!(number_placeholders(Driver::MySql, "a = ?", 0), "a = ?");
+        assert_eq!(number_placeholders(Driver::Sqlite, "a = ?", 5), "a = ?");
+    }
+
+    #[test]
+    fn 引用の中の_question_と_dollar_は数えない() {
+        // 以前は SQL 全体を数えていた。`'?'` の入った SQL は値の数が合わないと言われ、
+        // `'$100'` は PostgreSQL で `$1` の直書きとして断られていた。
+        assert_eq!(count_placeholders("label = '?' and id = ?"), 1);
+        assert_eq!(
+            count_placeholders(r#"select "a?b", `c?d` from t where x = ?"#),
+            1
+        );
+        // `''` の逃がしをはさんでも、文字列の中のまま。
+        assert_eq!(count_placeholders("note = 'it''s ?' and id = ?"), 1);
+        assert_eq!(
+            number_placeholders(Driver::Postgres, "note = 'it''s ?' and id = ?", 0),
+            "note = 'it''s ?' and id = $1"
+        );
+        assert!(!has_dollar("label = '$100'"));
+        assert!(!has_dollar(r#""price$" > 0"#));
+        assert!(has_dollar("views > $1"));
+        assert!(has_dollar("label = '$100' and views > $1"));
+        // JSONB の `?` は従来どおり置き場所として数える。
+        assert_eq!(count_placeholders("data ? 'key'"), 1);
+    }
+
+    #[test]
+    fn like_の逃がしの文字はsqliteだけ足す() {
+        assert_eq!(like_escape(Driver::Sqlite, "like"), " escape '\\'");
+        assert_eq!(like_escape(Driver::Sqlite, "not like"), " escape '\\'");
+        assert_eq!(like_escape(Driver::Sqlite, "="), "");
+        // MySQL と PostgreSQL は既定の逃がしの文字が `\`。
+        assert_eq!(like_escape(Driver::MySql, "like"), "");
+        assert_eq!(like_escape(Driver::Postgres, "not like"), "");
+        // 全角の空白もそろえる。
+        assert_eq!(normalize_operator(" NOT\u{3000}LIKE "), "not like");
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[test]
+    fn 引用の外の文字だけを残す() {
+        assert_eq!(
+            outside_text("a 'do update' b"),
+            format!("a{}b", " ".repeat(13))
+        );
+        assert_eq!(outside_text(r#"x "y" z"#), format!("x{}z", " ".repeat(5)));
+    }
+
+    #[test]
+    fn nullと比べる演算子が分かる() {
+        assert_eq!(is_null_operator("is"), Some(false));
+        assert_eq!(is_null_operator(" IS  NOT "), Some(true));
+        assert_eq!(is_null_operator("="), None);
+    }
+
+    #[test]
+    fn nullと比べたときに読み替える演算子が分かる() {
+        assert_eq!(null_comparison("="), Some(false));
+        assert_eq!(null_comparison(" IS "), Some(false));
+        assert_eq!(null_comparison("!="), Some(true));
+        assert_eq!(null_comparison("<>"), Some(true));
+        assert_eq!(null_comparison("is  not"), Some(true));
+        // 大小や like は読み替えない。
+        assert_eq!(null_comparison(">"), None);
+        assert_eq!(null_comparison("like"), None);
+    }
+
+    #[test]
+    fn ドライバだけの演算子を見分ける() {
+        assert_eq!(operator_driver("ilike"), Some(Driver::Postgres));
+        assert_eq!(operator_driver(" NOT   ILIKE "), Some(Driver::Postgres));
+        assert_eq!(operator_driver("<=>"), Some(Driver::MySql));
+        assert_eq!(operator_driver("like"), None);
+        assert_eq!(operator_driver("="), None);
+    }
+
+    #[test]
+    fn 名前から読める() {
+        assert_eq!(Driver::parse("sqlite"), Some(Driver::Sqlite));
+        assert_eq!(Driver::parse("PgSQL"), Some(Driver::Postgres));
+        assert_eq!(Driver::parse("oracle"), None);
+    }
+    #[test]
+    fn 表を全部消す文は方言で違う() {
+        let tables = vec!["posts".to_string(), "users".to_string()];
+
+        // PostgreSQL は1文にまとめて cascade を付ける。
+        assert_eq!(
+            drop_all(Driver::Postgres, &tables),
+            vec![r#"drop table if exists "posts", "users" cascade"#.to_string()]
+        );
+        // MySQL と SQLite は1表ずつ。
+        assert_eq!(
+            drop_all(Driver::MySql, &tables),
+            vec![
+                "drop table if exists `posts`".to_string(),
+                "drop table if exists `users`".to_string(),
+            ]
+        );
+        assert_eq!(
+            drop_all(Driver::Sqlite, &tables),
+            vec![
+                r#"drop table if exists "posts""#.to_string(),
+                r#"drop table if exists "users""#.to_string(),
+            ]
+        );
+        // 表が無いときは何も出さない（空の文を投げないため）。
+        assert!(drop_all(Driver::Postgres, &[]).is_empty());
+    }
+
+    #[test]
+    fn 表を全部消す文はデータベースから読んだ名前を必ずくくる() {
+        // 以前は `quote` を通していたので、空白や `(` を含む名前を素通しし、
+        // `.` で分けていた。`drop table if exists my table` のような壊れた文になる。
+        let tables = vec![
+            "my table".to_string(),
+            "odd(name".to_string(),
+            "a.b".to_string(),
+            "*".to_string(),
+            "x\"y`z".to_string(),
+        ];
+        assert_eq!(
+            drop_all(Driver::Sqlite, &tables),
+            vec![
+                r#"drop table if exists "my table""#.to_string(),
+                r#"drop table if exists "odd(name""#.to_string(),
+                r#"drop table if exists "a.b""#.to_string(),
+                r#"drop table if exists "*""#.to_string(),
+                r#"drop table if exists "x""y`z""#.to_string(),
+            ]
+        );
+        assert_eq!(
+            drop_all(Driver::MySql, &tables[..1]),
+            vec!["drop table if exists `my table`".to_string()]
+        );
+        assert_eq!(
+            drop_all(Driver::MySql, &tables[4..]),
+            vec!["drop table if exists `x\"y``z`".to_string()]
+        );
+        assert_eq!(
+            drop_all(Driver::Postgres, &tables[..2]),
+            vec![r#"drop table if exists "my table", "odd(name" cascade"#.to_string()]
+        );
+    }
+
+    #[test]
+    fn 外部キーの止め方は方言で違う() {
+        // SQLite は確定のときに自動で戻るので、戻す文が無い。
+        let (before, after) = defer_foreign_keys(Driver::Sqlite);
+        assert_eq!(before, Some("pragma defer_foreign_keys = on"));
+        assert_eq!(after, None);
+
+        // MySQL は接続ごとの設定なので、必ず戻す。
+        let (before, after) = defer_foreign_keys(Driver::MySql);
+        assert_eq!(before, Some("set session foreign_key_checks = 0"));
+        assert_eq!(after, Some("set session foreign_key_checks = 1"));
+
+        // PostgreSQL は cascade で足りる。
+        assert_eq!(defer_foreign_keys(Driver::Postgres), (None, None));
+    }
+}

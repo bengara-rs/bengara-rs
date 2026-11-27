@@ -1,0 +1,682 @@
+//! トランザクション。ガード方式です（決定記録 #021）。
+//!
+//! ```ignore
+//! let tx = DB::begin().await?;
+//! tx.table("posts").insert(&[("title", "x".into())]).await?;
+//! tx.commit().await?;
+//! ```
+//!
+//! `commit()` を呼ばずに落ちた場合は巻き戻します。
+
+use std::sync::{Arc, Mutex};
+
+use super::backend::{Backend, RawTx};
+use super::grammar::Driver;
+use super::query::QueryBuilder;
+use super::value::{Affected, Row, Value};
+use super::Source;
+use crate::error::{Error, Result};
+
+/// 始まっているトランザクション。
+///
+/// `tx.table(...)` で作ったクエリは、このトランザクションの中で動きます。
+pub struct Transaction {
+    shared: Arc<TxShared>,
+}
+
+/// クエリビルダと共有する中身。
+///
+/// 問い合わせのたびに中身を取り出し、終わったら戻します。
+/// **ロックを `await` の向こうへ持ち越しません。**
+pub(crate) struct TxShared {
+    driver: Driver,
+    inner: Mutex<State>,
+}
+
+/// トランザクションの状態。
+enum State {
+    /// 使える。
+    Ready(Box<dyn RawTx>),
+    /// いま別の問い合わせが走っている。
+    Busy,
+    /// `commit` か `rollback` が済んだ。
+    Finished,
+    /// 問い合わせが失敗したか、途中で落とされた。もう使えません。
+    Poisoned,
+}
+
+/// 取り出した中身を持つ入れ物。
+///
+/// **Drop で必ず状態を戻します。** 問い合わせの future が途中で落とされると
+/// （`tokio::select!`・`timeout`・接続切断）、戻す処理まで進みません。
+/// 手で戻していた頃は、そこで `Busy` のまま固まって `commit` も `rollback` も
+/// できなくなっていました。
+struct Borrowed<'a> {
+    shared: &'a TxShared,
+    raw: Option<Box<dyn RawTx>>,
+    /// 問い合わせが終わりまで進んで、しかも成功したか。Drop のときに見ます。
+    done: bool,
+}
+
+impl Borrowed<'_> {
+    /// 中身を借りる。
+    fn raw(&mut self) -> &mut Box<dyn RawTx> {
+        self.raw
+            .as_mut()
+            .expect("取り出した直後から Drop までは必ず入っている")
+    }
+
+    /// 中身を取り上げて終わりにする。Drop で `Finished` になります。
+    fn into_finished(mut self) -> Box<dyn RawTx> {
+        self.raw.take().expect("take() の直後なので必ず入っている")
+    }
+}
+
+impl Drop for Borrowed<'_> {
+    fn drop(&mut self) {
+        let raw = self.raw.take();
+        let mut guard = self.shared.inner.lock().unwrap_or_else(|e| e.into_inner());
+        match raw {
+            // 問い合わせが終わって中身が戻ってきた。
+            //
+            // **借りたときの `Busy` のままなら**、次の問い合わせに使える。
+            // 以前はいまの状態を見ずに `Ready` を入れていたので、問い合わせ中に
+            // `Transaction` が落ちて `Poisoned` になった後、その問い合わせが
+            // 終わると `Ready` に戻っていました。生き残ったクエリビルダから
+            // 書けてしまい、最後の `Arc` が落ちる時に黙って巻き戻ります。
+            //
+            // `Poisoned` と `Finished` はそのまま保ちます。ここで `raw` を
+            // 落とすので、下回りが巻き戻します。
+            Some(raw) => {
+                if matches!(&*guard, State::Busy) {
+                    *guard = if self.done {
+                        State::Ready(raw)
+                    } else {
+                        // 失敗したか、途中で落とされた。どちらも、もう使いません。
+                        //
+                        // PostgreSQL は 1 本失敗するとトランザクションのブロックごと
+                        // aborted になり、以後のコマンドを断ります。`commit` も
+                        // エラーを返さずに巻き戻すので、ここで `Ready` に戻すと
+                        // 「`commit()` が Ok なのに何も書かれていない」になります。
+                        State::Poisoned
+                    };
+                }
+            }
+            // `commit` か `rollback` が持って行った。
+            None => *guard = State::Finished,
+        }
+    }
+}
+
+impl TxShared {
+    pub(crate) fn driver(&self) -> Driver {
+        self.driver
+    }
+
+    /// 中身を取り出す。戻すのは `Borrowed` の Drop に任せます。
+    fn take(&self) -> Result<Borrowed<'_>> {
+        let mut guard = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        match std::mem::replace(&mut *guard, State::Busy) {
+            State::Ready(raw) => Ok(Borrowed {
+                shared: self,
+                raw: Some(raw),
+                done: false,
+            }),
+            // すでに `Busy` だったので、`Busy` に置き換えたままでよい。
+            State::Busy => Err(Error::msg(
+                "このトランザクションは別の問い合わせを処理しています。1本ずつ await してください",
+            )),
+            State::Finished => {
+                *guard = State::Finished;
+                Err(Error::msg(
+                    "このトランザクションは終わっています（commit か rollback が済んでいます）",
+                ))
+            }
+            State::Poisoned => {
+                *guard = State::Poisoned;
+                Err(Error::msg(
+                    "直前の問い合わせが失敗したか中断されたので、このトランザクションは\
+                     使えません。中身は巻き戻されます。DB::begin() からやり直してください",
+                ))
+            }
+        }
+    }
+
+    /// 使えない状態なら、終わった状態にして `true` を返す（`rollback` 用）。
+    ///
+    /// 使えない状態では中身をすでに落としてあり、下回りが巻き戻しています。
+    fn finish_poisoned(&self) -> bool {
+        let mut guard = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        if matches!(&*guard, State::Poisoned) {
+            *guard = State::Finished;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// 終わりにする。
+    fn finish(&self) -> Result<Box<dyn RawTx>> {
+        Ok(self.take()?.into_finished())
+    }
+
+    pub(crate) async fn fetch_all(&self, sql: &str, bindings: &[Value]) -> Result<Vec<Row>> {
+        let mut borrowed = self.take()?;
+        let result = borrowed.raw().fetch_all(sql, bindings).await;
+        // 中断されず、しかも成功したときだけ使い続けられる。
+        borrowed.done = result.is_ok();
+        result
+    }
+
+    pub(crate) async fn execute(&self, sql: &str, bindings: &[Value]) -> Result<Affected> {
+        let mut borrowed = self.take()?;
+        let result = borrowed.raw().execute(sql, bindings).await;
+        borrowed.done = result.is_ok();
+        result
+    }
+}
+
+impl Transaction {
+    /// 接続からトランザクションを始める。
+    pub(crate) async fn start(found: Arc<dyn Backend>) -> Result<Self> {
+        let driver = found.driver();
+        let raw = found.begin().await?;
+        Ok(Self {
+            shared: Arc::new(TxShared {
+                driver,
+                inner: Mutex::new(State::Ready(raw)),
+            }),
+        })
+    }
+
+    /// このトランザクションの中でクエリを組み立てる。
+    pub fn table(&self, table: impl Into<String>) -> QueryBuilder {
+        QueryBuilder::new(Source::Tx(Arc::clone(&self.shared)), table)
+    }
+
+    /// このトランザクションを指す `Source`。モデルのクエリに渡します。
+    pub(crate) fn source(&self) -> Source {
+        Source::Tx(Arc::clone(&self.shared))
+    }
+
+    /// SQL を直接投げて行を受け取る。
+    ///
+    /// 値の置き場所は `?` で書きます。PostgreSQL でも `?` のままでよく、
+    /// 投げる前に `$1` `$2` … へ振り直します（[`super::DB::select`] と同じ決まり）。
+    pub async fn select(&self, sql: &str, bindings: &[Value]) -> Result<Vec<Row>> {
+        let sql = super::prepare_raw_sql(self.shared.driver, sql, bindings)?;
+        self.shared.fetch_all(&sql, bindings).await
+    }
+
+    /// SQL を直接投げる。値の置き場所の決まりは [`Transaction::select`] と同じです。
+    pub async fn statement(&self, sql: &str, bindings: &[Value]) -> Result<Affected> {
+        let sql = super::prepare_raw_sql(self.shared.driver, sql, bindings)?;
+        self.shared.execute(&sql, bindings).await
+    }
+
+    /// 枠組みが組み立てた SQL を、生 SQL の検査を通さずに流す（マイグレーション用）。
+    ///
+    /// `?` の数と値の数を見る検査は、**文字列の中の `?` も数えます**。
+    /// `t.string("label").default("どっち?")` のような既定値を持つ DDL が、
+    /// それだけで弾かれていました。PostgreSQL では `?` が `$1` に書き換わって
+    /// 壊れた DDL になります。
+    ///
+    /// 公開 API の [`Transaction::statement`] はそのままにしてあります。
+    /// 利用者が手で書く生 SQL には検査が要るためです。
+    pub(crate) async fn statement_raw(&self, sql: &str) -> Result<Affected> {
+        self.shared.execute(sql, &[]).await
+    }
+
+    /// つながっているデータベースの種類。
+    pub fn driver(&self) -> Driver {
+        self.shared.driver
+    }
+
+    /// 確定する。
+    pub async fn commit(self) -> Result<()> {
+        let raw = self.shared.finish()?;
+        raw.commit().await
+    }
+
+    /// 巻き戻す。
+    ///
+    /// 問い合わせが失敗した後（使えない状態）でも `Ok(())` を返します。
+    /// 中身はその時点で落としてあり、下回りが巻き戻しているためです。
+    /// `if let Err(e) = ... { tx.rollback().await?; return Err(e); }` と書いたときに、
+    /// 元のエラーが「使えません」のエラーに隠れないようにしています。
+    /// `commit()` は従来どおりエラーを返します。
+    pub async fn rollback(self) -> Result<()> {
+        if self.shared.finish_poisoned() {
+            return Ok(());
+        }
+        let raw = self.shared.finish()?;
+        raw.rollback().await
+    }
+}
+
+impl Drop for Transaction {
+    /// 落とされたら、確定していないので使えなくする。
+    ///
+    /// `tx.table(...)` が作ったクエリビルダは `TxShared` を `Arc` で持つので、
+    /// `Transaction` を落としても中身は生き残ります。
+    /// `let q = DB::begin().await?.table("p");` のように `Transaction` が
+    /// 一時値だと、`q` 経由の書き込みが黙って捨てられていました。
+    ///
+    /// ここで `Poisoned` にすると中身が落ちるので、下回りが巻き戻します。
+    /// 以後のクエリビルダは「使えません」のエラーになります。
+    fn drop(&mut self) {
+        let mut guard = self.shared.inner.lock().unwrap_or_else(|e| e.into_inner());
+        if !matches!(&*guard, State::Finished) {
+            *guard = State::Poisoned;
+        }
+    }
+}
+
+impl std::fmt::Debug for Transaction {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Transaction")
+            .field("driver", &self.shared.driver)
+            .finish()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::future::Future;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::task::{Context, Poll, Waker};
+
+    use super::super::backend::DbFuture;
+    use super::*;
+
+    /// テスト用の中身。SQL は受け取るだけで、すぐ返します。
+    struct FakeTx;
+
+    impl RawTx for FakeTx {
+        fn fetch_all<'a>(
+            &'a mut self,
+            _sql: &'a str,
+            _bindings: &'a [Value],
+        ) -> DbFuture<'a, Vec<Row>> {
+            Box::pin(async { Ok(Vec::new()) })
+        }
+
+        fn execute<'a>(
+            &'a mut self,
+            _sql: &'a str,
+            _bindings: &'a [Value],
+        ) -> DbFuture<'a, Affected> {
+            Box::pin(async { Ok(Affected::default()) })
+        }
+
+        fn commit(self: Box<Self>) -> DbFuture<'static, ()> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn rollback(self: Box<Self>) -> DbFuture<'static, ()> {
+            Box::pin(async { Ok(()) })
+        }
+    }
+
+    /// 問い合わせが必ず失敗する中身。
+    ///
+    /// `commit` は成功を返します。PostgreSQL の `COMMIT` と同じ形です。
+    /// 1 本失敗したブロックの `COMMIT` はエラーを返さず、黙って巻き戻します。
+    struct FailingTx;
+
+    impl RawTx for FailingTx {
+        fn fetch_all<'a>(
+            &'a mut self,
+            _sql: &'a str,
+            _bindings: &'a [Value],
+        ) -> DbFuture<'a, Vec<Row>> {
+            Box::pin(async { Err(Error::msg("UNIQUE constraint failed: users.email")) })
+        }
+
+        fn execute<'a>(
+            &'a mut self,
+            _sql: &'a str,
+            _bindings: &'a [Value],
+        ) -> DbFuture<'a, Affected> {
+            Box::pin(async { Err(Error::msg("UNIQUE constraint failed: users.email")) })
+        }
+
+        fn commit(self: Box<Self>) -> DbFuture<'static, ()> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn rollback(self: Box<Self>) -> DbFuture<'static, ()> {
+            Box::pin(async { Ok(()) })
+        }
+    }
+
+    /// 返ってこない中身。問い合わせの中断を試すために使います。
+    struct SlowTx;
+
+    impl RawTx for SlowTx {
+        fn fetch_all<'a>(
+            &'a mut self,
+            _sql: &'a str,
+            _bindings: &'a [Value],
+        ) -> DbFuture<'a, Vec<Row>> {
+            Box::pin(async {
+                std::future::pending::<()>().await;
+                Ok(Vec::new())
+            })
+        }
+
+        fn execute<'a>(
+            &'a mut self,
+            _sql: &'a str,
+            _bindings: &'a [Value],
+        ) -> DbFuture<'a, Affected> {
+            Box::pin(async {
+                std::future::pending::<()>().await;
+                Ok(Affected::default())
+            })
+        }
+
+        fn commit(self: Box<Self>) -> DbFuture<'static, ()> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn rollback(self: Box<Self>) -> DbFuture<'static, ()> {
+            Box::pin(async { Ok(()) })
+        }
+    }
+
+    /// 合図を待つ中身。問い合わせの途中で `Transaction` を落とすために使います。
+    struct GatedTx {
+        gate: Arc<AtomicBool>,
+    }
+
+    impl GatedTx {
+        /// 合図が出るまで待つ。
+        fn wait(&self) -> impl Future<Output = ()> + Send + 'static {
+            let gate = Arc::clone(&self.gate);
+            async move {
+                while !gate.load(Ordering::SeqCst) {
+                    tokio::task::yield_now().await;
+                }
+            }
+        }
+    }
+
+    impl RawTx for GatedTx {
+        fn fetch_all<'a>(
+            &'a mut self,
+            _sql: &'a str,
+            _bindings: &'a [Value],
+        ) -> DbFuture<'a, Vec<Row>> {
+            let wait = self.wait();
+            Box::pin(async move {
+                wait.await;
+                Ok(Vec::new())
+            })
+        }
+
+        fn execute<'a>(
+            &'a mut self,
+            _sql: &'a str,
+            _bindings: &'a [Value],
+        ) -> DbFuture<'a, Affected> {
+            let wait = self.wait();
+            Box::pin(async move {
+                wait.await;
+                Ok(Affected::default())
+            })
+        }
+
+        fn commit(self: Box<Self>) -> DbFuture<'static, ()> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn rollback(self: Box<Self>) -> DbFuture<'static, ()> {
+            Box::pin(async { Ok(()) })
+        }
+    }
+
+    fn shared(raw: Box<dyn RawTx>) -> TxShared {
+        TxShared {
+            driver: Driver::Sqlite,
+            inner: Mutex::new(State::Ready(raw)),
+        }
+    }
+
+    fn is_ready(shared: &TxShared) -> bool {
+        let guard = shared.inner.lock().unwrap_or_else(|e| e.into_inner());
+        matches!(&*guard, State::Ready(_))
+    }
+
+    #[tokio::test]
+    async fn 問い合わせを往復しても使い続けられる() {
+        let shared = shared(Box::new(FakeTx));
+        shared.fetch_all("select 1", &[]).await.expect("読める");
+        assert!(is_ready(&shared), "問い合わせの後は使える状態に戻る");
+        shared.execute("delete from t", &[]).await.expect("流せる");
+        assert!(is_ready(&shared));
+        shared.finish().expect("終わりにできる");
+    }
+
+    #[test]
+    fn ガードはdropで状態を戻す() {
+        let shared = shared(Box::new(FakeTx));
+        {
+            let mut borrowed = shared.take().expect("取り出せる");
+            // 問い合わせが終わったところ。
+            borrowed.done = true;
+        }
+        assert!(is_ready(&shared), "Drop で Ready に戻る");
+    }
+
+    #[test]
+    fn 終わった後の操作は断られる() {
+        let shared = shared(Box::new(FakeTx));
+        drop(shared.finish().expect("終わりにできる"));
+        // `Box<dyn RawTx>` は Debug を持たないので、`expect_err` ではなく場合分けで取り出す。
+        let message = match shared.finish() {
+            Ok(_) => panic!("2回目は断られるはず"),
+            Err(error) => error.to_string(),
+        };
+        assert!(message.contains("終わっています"), "{message}");
+    }
+
+    #[tokio::test]
+    async fn 落としたトランザクションのクエリは断られる() {
+        let tx = Transaction {
+            shared: Arc::new(shared(Box::new(FakeTx))),
+        };
+        let query = tx.table("posts");
+        // `Transaction` が一時値のときと同じ形。クエリビルダだけが残る。
+        drop(tx);
+        let message = query
+            .insert(&[("title", Value::Text("x".into()))])
+            .await
+            .expect_err("断られる")
+            .to_string();
+        assert!(message.contains("使えません"), "{message}");
+    }
+
+    #[tokio::test]
+    async fn mysqlのトランザクションの中のtruncateは断る() {
+        // MySQL の `truncate table` は暗黙に確定する。流すと rollback() が効かない。
+        let tx = Transaction {
+            shared: Arc::new(TxShared {
+                driver: Driver::MySql,
+                inner: Mutex::new(State::Ready(Box::new(FakeTx))),
+            }),
+        };
+        let message = tx
+            .table("posts")
+            .truncate()
+            .await
+            .expect_err("断られる")
+            .to_string();
+        assert!(message.contains("delete()"), "{message}");
+        assert!(message.contains("暗黙に確定"), "{message}");
+        // 断っただけなので、トランザクションはそのまま使える。
+        assert!(is_ready(&tx.shared), "使える状態のまま");
+
+        // SQLite と PostgreSQL のトランザクションでは断らない。
+        for driver in [Driver::Sqlite, Driver::Postgres] {
+            let tx = Transaction {
+                shared: Arc::new(TxShared {
+                    driver,
+                    inner: Mutex::new(State::Ready(Box::new(FakeTx))),
+                }),
+            };
+            tx.table("posts").truncate().await.expect("流せる");
+        }
+    }
+
+    #[tokio::test]
+    async fn 確定したトランザクションはdropで巻き戻さない() {
+        let tx = Transaction {
+            shared: Arc::new(shared(Box::new(FakeTx))),
+        };
+        let shared = Arc::clone(&tx.shared);
+        tx.commit().await.expect("確定できる");
+        let guard = shared.inner.lock().unwrap_or_else(|e| e.into_inner());
+        assert!(matches!(&*guard, State::Finished), "確定のまま残る");
+    }
+
+    #[tokio::test]
+    async fn 枠組みが組み立てた_ddl_は生_sql_の検査を通さない() {
+        let tx = Transaction {
+            shared: Arc::new(shared(Box::new(FakeTx))),
+        };
+        // 文字列の中の `?` は、利用者の口でも数えない。
+        let quoted =
+            r#"alter table "t" add column "label" varchar(255) not null default 'どっち?'"#;
+        tx.statement(quoted, &[])
+            .await
+            .expect("文字列の中は数えない");
+        // 引用の外の `?`（PostgreSQL の JSONB の演算子など）は、利用者が書く生 SQL の口では
+        // 値の置き場所として数える。
+        let ddl = r#"alter table "t" add constraint "c" check ("data" ? 'key')"#;
+        let message = match tx.statement(ddl, &[]).await {
+            Ok(_) => panic!("検査に引っかかるはず"),
+            Err(error) => error.to_string(),
+        };
+        assert!(message.contains("合っていません"), "{message}");
+        // 枠組みの口はそのまま流す。
+        tx.statement_raw(ddl).await.expect("流せる");
+    }
+
+    #[tokio::test]
+    async fn 失敗した問い合わせの後は使えなくなる() {
+        let shared = shared(Box::new(FailingTx));
+        let first = match shared.execute("insert into users values (1)", &[]).await {
+            Ok(_) => panic!("失敗するはず"),
+            Err(error) => error.to_string(),
+        };
+        // 失敗の元のエラーはそのまま返る。
+        assert!(first.contains("UNIQUE constraint failed"), "{first}");
+        assert!(!is_ready(&shared), "失敗の後は使える状態に戻らない");
+
+        // 以後の問い合わせは断られる。
+        let next = match shared.fetch_all("select 1", &[]).await {
+            Ok(_) => panic!("断られるはず"),
+            Err(error) => error.to_string(),
+        };
+        assert!(next.contains("使えません"), "{next}");
+    }
+
+    #[tokio::test]
+    async fn 問い合わせが失敗した後の確定はエラーになる() {
+        // PostgreSQL は 1 本失敗するとブロックごと aborted になり、`COMMIT` は
+        // エラーを返さずに巻き戻す。黙って消えないように、こちらで断る。
+        let tx = Transaction {
+            shared: Arc::new(shared(Box::new(FailingTx))),
+        };
+        assert!(
+            tx.statement("insert into users values (1)", &[])
+                .await
+                .is_err(),
+            "失敗するはず"
+        );
+        let message = tx.commit().await.expect_err("確定は断られる").to_string();
+        assert!(message.contains("使えません"), "{message}");
+        assert!(message.contains("DB::begin()"), "{message}");
+    }
+
+    #[tokio::test]
+    async fn 問い合わせが失敗した後の巻き戻しは成功を返す() {
+        // `if let Err(e) = ... { tx.rollback().await?; return Err(e); }` の形で、
+        // 元のエラーが「使えません」に隠れないようにする。
+        let tx = Transaction {
+            shared: Arc::new(shared(Box::new(FailingTx))),
+        };
+        let shared = Arc::clone(&tx.shared);
+        let query = tx.table("posts");
+        let original = tx
+            .statement("insert into users values (1)", &[])
+            .await
+            .expect_err("失敗するはず");
+        assert!(original.to_string().contains("UNIQUE"), "{original}");
+        tx.rollback().await.expect("巻き戻しは成功を返す");
+
+        // 終わった状態になり、残ったクエリビルダは断られる。
+        let message = query
+            .insert(&[("title", Value::Text("x".into()))])
+            .await
+            .expect_err("断られる")
+            .to_string();
+        assert!(message.contains("終わっています"), "{message}");
+        assert!(!is_ready(&shared));
+    }
+
+    #[test]
+    fn 中断された問い合わせの後は理由が分かる() {
+        let shared = shared(Box::new(SlowTx));
+        // 返ってこない問い合わせを1回だけ進めて、途中で落とす。
+        // `tokio::select!` や `timeout` で起きることと同じです。
+        let mut pending = Box::pin(shared.fetch_all("select 1", &[]));
+        let mut cx = Context::from_waker(Waker::noop());
+        assert!(matches!(pending.as_mut().poll(&mut cx), Poll::Pending));
+        drop(pending);
+
+        let message = match shared.finish() {
+            Ok(_) => panic!("中断された後は使えないはず"),
+            Err(error) => error.to_string(),
+        };
+        assert!(message.contains("中断"), "{message}");
+    }
+
+    #[tokio::test]
+    async fn 問い合わせ中に落とした後は使えないままになる() {
+        let gate = Arc::new(AtomicBool::new(false));
+        let tx = Transaction {
+            shared: Arc::new(shared(Box::new(GatedTx {
+                gate: Arc::clone(&gate),
+            }))),
+        };
+        let shared = Arc::clone(&tx.shared);
+        let query = tx.table("posts");
+
+        // 問い合わせを別のタスクで走らせる。
+        let running = {
+            let shared = Arc::clone(&shared);
+            tokio::spawn(async move { shared.fetch_all("select 1", &[]).await })
+        };
+        // 問い合わせが始まる（`Busy` になる）まで待つ。
+        while is_ready(&shared) {
+            tokio::task::yield_now().await;
+        }
+
+        // ここで `Transaction` が落ちると `Poisoned` になる。
+        drop(tx);
+        // その後に問い合わせが終わる。
+        gate.store(true, Ordering::SeqCst);
+        running.await.expect("走り切る").expect("読める");
+
+        // 以前はここで `Ready` に戻り、生き残ったクエリビルダから書けていた。
+        let message = query
+            .insert(&[("title", Value::Text("x".into()))])
+            .await
+            .expect_err("断られる")
+            .to_string();
+        assert!(message.contains("使えません"), "{message}");
+        assert!(!is_ready(&shared), "使えない状態のまま");
+    }
+}

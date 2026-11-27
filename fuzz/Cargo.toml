@@ -1,0 +1,83 @@
+# ファジング（`cargo +nightly fuzz run <ターゲット>`）。
+#
+# workspace の外に置きます（下の空の [workspace]）。`cargo test --workspace` にも、
+# 利用者のビルドにも入りません。依存（libfuzzer-sys・sha2・hmac・pbkdf2）はここだけです。
+# 内部の関数は、bengara と bengara-build が `cfg(fuzzing)` のときだけ出す `fuzzing` モジュールから呼びます。
+
+[package]
+name = "bengara-fuzz"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+bengara = { path = "../crates/bengara" }
+bengara-build = { path = "../crates/bengara-build" }
+hmac = "0.13.0"
+libfuzzer-sys = "0.4.13"
+pbkdf2 = "0.13.0"
+sha2 = "0.11.2"
+
+[workspace]
+
+[profile.release]
+debug = 1
+
+[[bin]]
+name = "multipart"
+path = "fuzz_targets/multipart.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "cookie_header"
+path = "fuzz_targets/cookie_header.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "percent"
+path = "fuzz_targets/percent.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "dotenv"
+path = "fuzz_targets/dotenv.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "cargo_toml"
+path = "fuzz_targets/cargo_toml.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "lang_toml"
+path = "fuzz_targets/lang_toml.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "crypto"
+path = "fuzz_targets/crypto.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "log_line"
+path = "fuzz_targets/log_line.rs"
+test = false
+doc = false
+bench = false

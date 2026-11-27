@@ -1,0 +1,205 @@
+# テンプレート
+
+HTML の画面を、テンプレート（`resources/views/*.html`）から作ります。Laravel の `view()` に当たります。
+
+| できること       | 中身                                                             |
+|------------------|------------------------------------------------------------------|
+| 画面を返す       | `req.view("posts.index", json!({ .. }))`                         |
+| 文字列だけを作る | `bengara::view::render(..)`（メールの本文などに）                |
+| 部品に分ける     | 継承（`{% extends %}` / `{% block %}`）・`{% include %}`・マクロ |
+| 値を逃がす       | `{{ title }}` の値は自動で HTML の逃がし方をする                 |
+
+- 書き方は **Jinja 系**です（中身は minijinja）。**Blade の構文ではありません。**
+- `req.view(..)` のほかの関数は `prelude` に入っていません。`bengara::view` から使います。
+
+## 使えるようにする
+
+Cargo の機能フラグ `view` を足します。**既定では入りません。**
+
+```toml
+[dependencies]
+bengara = { version = "0.1.0-alpha.1", features = ["sqlite", "view"] }
+```
+
+- フラグが無いときも関数はあります。呼ぶと「features に "view" を足してください」のエラー（500）になります。
+- フラグが無いとき、`bengara::view::exists(..)` は常に偽です。
+
+## 書いてみる
+
+テンプレートは `resources/views/` に置きます。拡張子は `.html` です。
+
+```html
+<!-- resources/views/layouts/app.html -->
+<!doctype html>
+<title>{% block title %}{% endblock %}</title>
+<main>{% block body %}{% endblock %}</main>
+```
+
+```html
+<!-- resources/views/posts/index.html -->
+{% extends "layouts.app" %}
+{% block title %}記事{% endblock %}
+{% block body %}
+  {% for post in posts %}
+    <a href="{{ route('posts.show', {'post': post.id}) }}">{{ post.title }}</a>
+  {% else %}
+    <p>{{ __('posts.empty') }}</p>
+  {% endfor %}
+{% endblock %}
+```
+
+```rust
+// app/Http/Controllers/PostController.rs
+use bengara::prelude::*;
+use bengara::serde_json::json;
+
+pub struct PostController;
+
+impl PostController {
+    pub async fn index(req: Request) -> Result<Response> {
+        let posts = Post::query().latest().get().await?;
+        req.view("posts.index", json!({ "posts": posts }))
+    }
+}
+```
+
+- 返すのは 200、`text/html; charset=utf-8` のレスポンスです。
+- 2 つ目の引数は、構造体（`Serialize`）か `json!({ .. })` のオブジェクトです。
+- 何も渡さないなら `()` です。配列や数を渡すと 500 です。
+
+### 描くための関数
+
+| 関数                                   | 返すもの           | 使いどころ                                        |
+|----------------------------------------|--------------------|---------------------------------------------------|
+| `req.view(name, context)`              | `Result<Response>` | ふつうはこれ。CSRF と前の入力が使える             |
+| `bengara::view(name, context)`         | `Result<Response>` | リクエストが手元に無いとき                        |
+| `bengara::view::render(name, context)` | `Result<String>`   | 描いた文字列だけが欲しいとき（メールの本文など）  |
+| `bengara::view::exists(name)`          | `bool`             | テンプレートがあるか（Laravel の `View::exists`） |
+
+```rust
+let body = bengara::view::render("emails.welcome", json!({ "name": user.name }))?;
+```
+
+## 名前の決まり
+
+`view(..)` に渡す名前にも、`{% extends %}` と `{% include %}` に書く名前にも、同じ決まりを使います。
+
+| 名前                                                 | 読むファイル（`resources/views/` から） |
+|------------------------------------------------------|-----------------------------------------|
+| `.html` で終わらない（`posts.index`・`posts/index`） | `posts/index.html`                      |
+| `.html` で終わる（`layouts/app.html`）               | `layouts/app.html`（そのまま）          |
+
+- 名前に使えるのは、英数字と `_` `-`（と区切りの `.` `/`）だけです。`..` や先頭の `/` は使えません。
+- 決まりに合わない名前と、ファイルが無いときは 500 です。
+
+## Blade との対応
+
+| Blade                                             | bengara（minijinja）                                                 |
+|---------------------------------------------------|----------------------------------------------------------------------|
+| `{{ $title }}`                                    | `{{ title }}`（逃がされる）                                          |
+| `{!! $html !!}`                                   | `{{ html\|safe }}`                                                   |
+| `@if` / `@foreach` / `@forelse`                   | `{% if %}` / `{% for %}` / `{% for %}…{% else %}`                    |
+| `@extends('layouts.app')` / `@section` / `@yield` | `{% extends "layouts.app" %}` / `{% block %}`                        |
+| `@include('partials.nav')`                        | `{% include "partials.nav" %}`                                       |
+| `@csrf`                                           | `{{ csrf_field() }}`                                                 |
+| `route('posts.show', $post)`                      | `{{ route('posts.show', {'post': post.id}) }}`                       |
+| `__('posts.empty')`                               | `{{ __('posts.empty') }}`                                            |
+| `old('title')`                                    | `{{ old('title') }}`                                                 |
+| `@error('title') {{ $message }} @enderror`        | `{% if errors.has('title') %}{{ errors.first('title') }}{% endif %}` |
+| `$errors->any()` / `$errors->all()`               | `errors.any()` / `errors.all()`                                      |
+
+- 変数に `$` は付けません。
+- **渡していない名前（未定義の変数）はエラーです。** 打ち間違いが空の画面にならないようにしています。
+- あるか分からない値は `{% if title is defined %}` で確かめます。
+- 値は自動で逃がされます。`<script>` は `&lt;script&gt;` になります。逃がしたくない値だけに `|safe` を付けます。
+
+## テンプレートで使える関数
+
+### どこでも使える
+
+| 関数                  | 中身                                                                    |
+|-----------------------|-------------------------------------------------------------------------|
+| `route(name, params)` | `route_with(..)` と同じ。`params` は `{'post': 1}` のような形（省略可） |
+| `url(path)`           | `url(..)` と同じ。`APP_URL` をつないだ URL                              |
+| `__(key, values)`     | `__(..)` と同じ。`values` があれば `__with(..)`（省略可）               |
+
+- `params` と `values` の値は、文字列か数です。
+- 名前の無いルートなど、関数が失敗したときは描画のエラー（500）になります。
+
+### `req.view(..)` のときだけ使える
+
+| 関数                | 中身                                                                           |
+|---------------------|--------------------------------------------------------------------------------|
+| `csrf_field()`      | `<input type="hidden" name="_token" value="..">`                               |
+| `csrf_token()`      | CSRF のトークン（`req.csrf_token()` と同じ）                                   |
+| `old(key, default)` | 前のリクエストの入力（`session.old(key)`）。無ければ `default`（省略すると空） |
+
+```html
+<form method="post" action="{{ route('posts.store') }}">
+  {{ csrf_field() }}
+  <input name="title" value="{{ old('title') }}">
+</form>
+```
+
+- `bengara::view(..)` と `render(..)` の中で呼ぶと、描画のエラーになります。
+- セッションが無い（`StartSession` を通っていない）と、`csrf_field()` と `csrf_token()` はエラーです。
+  `old()` は `default` を返します。
+- `context` に `csrf_token`・`csrf_field`・`old`・`errors` の鍵があると 500 です。別の名前にしてください。
+
+## 検査に落ちた理由（`errors`）
+
+検査に落ちて前の画面に戻ったとき、理由を `errors` で読めます。Laravel の `$errors` に当たります。
+
+| 書き方                  | 返すもの                             |
+|-------------------------|--------------------------------------|
+| `errors.any()`          | 1 件でもあれば真                     |
+| `errors.has("title")`   | その項目に理由があれば真             |
+| `errors.first("title")` | その項目の最初の理由。無ければ空文字 |
+| `errors.first()`        | 全項目で最初の理由。無ければ空文字   |
+| `errors.get("title")`   | その項目の理由の一覧                 |
+| `errors.all()`          | 全項目の理由を並べた一覧             |
+
+```html
+{% if errors.any() %}
+  <ul>{% for message in errors.all() %}<li>{{ message }}</li>{% endfor %}</ul>
+{% endif %}
+
+<input name="title" value="{{ old('title') }}">
+{% if errors.has('title') %}<p class="error">{{ errors.first('title') }}</p>{% endif %}
+```
+
+- `errors` は関数ではなく値です。`errors()` とは書きません。
+- `{% if errors %}` は `errors.any()` と同じです。
+- 理由は次のリクエストで 1 回だけ読めます（`old()` と同じ）。
+- 理由の文は、ほかの値と同じく自動で逃がされます。
+- 理由が無いとき・セッションが無いときは空です。エラーにはなりません。
+- `bengara::view(..)` と `render(..)` でも使えますが、いつも空です。
+- 並びは項目の名前の順です。1 つの項目の中では、足した順です。
+- いつ前の画面に戻るかは [validation.md](validation.md) の「落ちたとき」を見てください。
+
+## デバッグとリリースの違い
+
+| ビルド                              | どこから読むか                          | 直したとき                   |
+|-------------------------------------|-----------------------------------------|------------------------------|
+| デバッグ（`cargo artisan serve`）   | 描くたびにディスクの `resources/views/` | 次のリクエストから反映される |
+| リリース（`cargo build --release`） | 実行ファイルに埋め込んだもの            | ビルドし直す                 |
+
+- リリースでは `resources/views/` を本番に置く必要はありません。
+- 埋め込むのは `.html` だけです。中身が UTF-8 でない `.html` があると、リリースビルドが止まります。
+- リリースは、起動時に全部のテンプレートを読み込みます。構文の誤りがあれば起動しません。
+- `cargo artisan serve` はテンプレートを見張りません。直してもアプリを作り直さず、次のリクエストで読み直します。
+
+## エラーの見方
+
+描けなかったときは 500 になり、エラーの文にファイルと行が入ります。
+
+```
+テンプレート `posts.index` を描けません: undefined value (in posts/index.html:5)
+```
+
+## Laravel と違うところ
+
+- `$errors` は `errors` です。名前で分けた袋（`$errors->login`）はありません。1 つの袋だけです。
+- 利用者の `context` に `errors` という名前は使えません（Laravel は渡した値で上書きできます）。
+- `@method('PUT')` はありません。フォームからは POST のルートで受けます。
+- メールの本文は、`render(..)` で描いた文字列を `Mail::to(..)` の `.html(..)` に渡します。

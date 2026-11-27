@@ -1,0 +1,496 @@
+//! 置き場所の決め方。
+//!
+//! 本番では実行ファイルの隣に `.env` と `storage/` を置きます。開発中は cargo が渡す
+//! `CARGO_MANIFEST_DIR` を使います。
+//!
+//! 見る順番は次のとおりです。
+//!
+//! | 順 | 見るもの | 目印の確認 |
+//! |---|---|---|
+//! | 1 | 環境変数 `APP_BASE_PATH`（絶対パスのみ） | しない |
+//! | 2 | 環境変数 `CARGO_MANIFEST_DIR` | **しない** |
+//! | 3 | 実行ファイルの隣 | する |
+//! | 4 | カレントディレクトリ | する |
+//!
+//! 1 は目印（`.env` / `storage/`）を確かめませんが、**その場所があるかは確かめます**。
+//! 打ち間違いを通すと、無い場所の下に `storage/` を作り始めてしまうためです。
+//!
+//! 1 と 2 は、空の値（空白だけの値も）を「無い」と見て次へ進みます。
+//!
+//! 2 だけ目印を確かめません。`init` は `.env` も `storage/` も無い状態で動くためです。
+//! この変数は子プロセスに引き継がれるので、`cargo run` から起動した子プロセスも
+//! cargo のプロジェクトを基準にします。別の場所を見せたいときは `APP_BASE_PATH` を使ってください。
+//!
+//! **決まらないときは起動を止めます**（決定記録 #064）。カレントディレクトリに落とすと、
+//! 関係ない場所で動き出し、空の `storage/` を作ってしまうためです。
+
+use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
+
+use crate::error::{Error, Result};
+
+/// 基準ディレクトリがそこにあると判断する目印。
+const MARKERS: &[&str] = &[".env", "storage"];
+
+static BASE: OnceLock<Resolved> = OnceLock::new();
+static STORAGE: OnceLock<PathBuf> = OnceLock::new();
+
+/// 基準ディレクトリをどう決めたか。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Source {
+    /// 環境変数 `APP_BASE_PATH`。
+    Explicit,
+    /// 環境変数 `CARGO_MANIFEST_DIR`（cargo 経由）。
+    Cargo,
+    /// 実行ファイルのあるディレクトリ。
+    Exe,
+    /// カレントディレクトリ。
+    Current,
+    /// 決まらなかった（カレントディレクトリで代用している）。
+    Unknown,
+}
+
+impl Source {
+    /// ログに出す言い方。
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Source::Explicit => "APP_BASE_PATH",
+            Source::Cargo => "cargo のプロジェクト",
+            Source::Exe => "実行ファイルの隣",
+            Source::Current => "カレントディレクトリ",
+            Source::Unknown => "決まらなかった",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct Resolved {
+    path: PathBuf,
+    source: Source,
+    /// `APP_BASE_PATH` が相対パスだったときの理由。
+    bad_explicit: Option<String>,
+}
+
+fn resolve() -> &'static Resolved {
+    BASE.get_or_init(|| {
+        // 1. 明示された場所。絶対パスでなければ、理由を覚えておいて後で止める。
+        if let Some(raw) = set_var_os("APP_BASE_PATH") {
+            let path = PathBuf::from(&raw);
+            if path.is_absolute() {
+                return Resolved {
+                    path,
+                    source: Source::Explicit,
+                    bad_explicit: None,
+                };
+            }
+            return Resolved {
+                path: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+                source: Source::Unknown,
+                bad_explicit: Some(format!(
+                    "APP_BASE_PATH には絶対パスを指定してください（いまの値: {}）",
+                    path.display()
+                )),
+            };
+        }
+
+        // 2. cargo 経由。開発中はここで決まる。
+        //
+        // ここだけ目印（.env / storage）を確かめずに採用し、実行ファイルの隣より
+        // 優先します。**意図どおりです。** `cargo artisan init` はまだ .env も
+        // storage/ も無い状態で動くので、目印を求めると init が通りません。
+        //
+        // 代わりに、この変数は子プロセスに引き継がれる点に注意してください。
+        // `cargo run` から別の実行ファイルを起動すると、その子も cargo の
+        // プロジェクトを基準にします。本番の場所を見せたいときは、
+        // APP_BASE_PATH に絶対パスを渡してください（1 が優先されます）。
+        //
+        // 空の値は「無い」と見る（`APP_BASE_PATH` と同じ）。そのまま使うと基準が `""`
+        // になり、カレントディレクトリからの相対パスで動いてしまう。
+        if let Some(p) = set_var_os("CARGO_MANIFEST_DIR") {
+            return Resolved {
+                path: PathBuf::from(p),
+                source: Source::Cargo,
+                bad_explicit: None,
+            };
+        }
+
+        // 3. 実行ファイルの隣。本番はここで決まる。
+        if let Some(dir) = exe_dir() {
+            if has_marker(&dir) {
+                return Resolved {
+                    path: dir,
+                    source: Source::Exe,
+                    bad_explicit: None,
+                };
+            }
+        }
+
+        // 4. カレントディレクトリ。目印があるときだけ使う。
+        if let Ok(dir) = std::env::current_dir() {
+            if has_marker(&dir) {
+                return Resolved {
+                    path: dir,
+                    source: Source::Current,
+                    bad_explicit: None,
+                };
+            }
+        }
+
+        // 5. 決まらなかった。guard() が起動を止める。
+        Resolved {
+            path: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+            source: Source::Unknown,
+            bad_explicit: None,
+        }
+    })
+}
+
+/// 実行ファイルのあるディレクトリ。
+fn exe_dir() -> Option<PathBuf> {
+    std::env::current_exe()
+        .ok()?
+        .parent()
+        .map(|p| p.to_path_buf())
+}
+
+/// そのディレクトリが基準ディレクトリらしいか。
+fn has_marker(dir: &Path) -> bool {
+    MARKERS.iter().any(|m| dir.join(m).exists())
+}
+
+/// 基準ディレクトリ。
+///
+/// 決まらなかったときはカレントディレクトリを返します。
+/// **起動の前に [`guard`] を呼んで、決まっているか確かめてください。**
+pub fn base_path() -> &'static Path {
+    resolve().path.as_path()
+}
+
+/// 基準ディレクトリをどう決めたか（ログ用）。
+pub(crate) fn base_source() -> Source {
+    resolve().source
+}
+
+/// 基準ディレクトリが決まっているか確かめる。
+///
+/// 決まっていなければ、探した場所と直し方を添えてエラーにします。
+pub(crate) fn guard() -> Result<()> {
+    let resolved = resolve();
+    if let Some(reason) = &resolved.bad_explicit {
+        return Err(Error::msg(reason.clone()));
+    }
+    // 絶対パスでも、その場所が無ければ断る。打ち間違いをそのまま採用すると、
+    // 無い場所の下に storage/ を作り始めて原因が分からなくなる。
+    if resolved.source == Source::Explicit && !resolved.path.is_dir() {
+        return Err(Error::msg(explicit_missing_message(&resolved.path)));
+    }
+    if resolved.source != Source::Unknown {
+        return Ok(());
+    }
+
+    let exe = exe_dir()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|| "（分かりません）".to_string());
+    let current = std::env::current_dir()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|_| "（分かりません）".to_string());
+
+    Err(Error::msg(format!(
+        "基準ディレクトリが決まりません。\n\
+         探した場所:\n\
+         \x20 実行ファイルの隣: {exe}\n\
+         \x20 カレントディレクトリ: {current}\n\
+         どちらにも .env と storage/ がありません。\n\
+         直し方（どちらか）:\n\
+         \x20 1. 実行ファイルの隣に .env を置き、{STORAGE_INIT_HINT} を実行する\n\
+         \x20 2. 環境変数 APP_BASE_PATH に絶対パスを指定する"
+    )))
+}
+
+/// `storage:init` の案内に使う言い方。
+///
+/// **`cargo artisan storage:init` だけを書きません。** この案内が出るのは
+/// 主に本番で、そこに cargo はありません。コマンド名を先に出し、開発と本番の
+/// 打ち方を両方添えます。
+pub(crate) const STORAGE_INIT_HINT: &str =
+    "storage:init（開発では `cargo artisan storage:init`、本番では `./<実行ファイル> storage:init`）";
+
+/// `storage/` が無いときの案内。
+///
+/// **起動時の案内（`ops.rs`）・`Storage`・キャッシュ・セッション・スケジュールが
+/// 同じ文を出します。** 以前は置き場所ごとに文が違い、「デプロイのときに
+/// storage/ を作ってください」だけの所は、何を実行すればよいかが分かりませんでした。
+/// 本番には cargo が無いので、実行ファイルでの呼び方も並べます（[`STORAGE_INIT_HINT`]）。
+pub(crate) fn missing_storage_message(storage: &Path) -> String {
+    format!(
+        "{} がありません。{STORAGE_INIT_HINT} を実行してください",
+        storage.display()
+    )
+}
+
+/// `APP_BASE_PATH` の場所が無いときのエラー文。
+fn explicit_missing_message(path: &Path) -> String {
+    format!(
+        "APP_BASE_PATH の場所がありません（いまの値: {}）。\n\
+         直し方（どれか）:\n\
+         \x20 1. 打ち間違いが無いか確かめる\n\
+         \x20 2. そのディレクトリを作る\n\
+         \x20 3. APP_BASE_PATH を外し、実行ファイルの隣を基準にする",
+        path.display()
+    )
+}
+
+/// `storage/` の場所を確かめる。
+///
+/// `APP_STORAGE_PATH` が相対パスのときはエラーにします。
+pub(crate) fn guard_storage() -> Result<()> {
+    check_storage(std::env::var_os("APP_STORAGE_PATH").as_deref())
+}
+
+/// 環境変数を読む。空と空白だけの値は「指定なし」として `None` にする。
+///
+/// `.env` の `APP_STORAGE_PATH=` は、空の環境変数として入ります。
+/// そのまま見ると「相対パス」と判定され、起動が止まります。
+/// `env()` の「空は未設定」と同じ扱いにそろえます。
+pub(crate) fn set_var_os(name: &str) -> Option<std::ffi::OsString> {
+    std::env::var_os(name).filter(|raw| !is_blank(raw))
+}
+
+/// 空か、空白だけの値か。
+fn is_blank(raw: &std::ffi::OsStr) -> bool {
+    raw.is_empty() || raw.to_str().is_some_and(|s| s.trim().is_empty())
+}
+
+/// `APP_STORAGE_PATH` の値を確かめる。`None` と空の値は「指定なし」です。
+///
+/// 値を引数で受けるのは、テストで環境変数を触らずに断る枝を通すためです。
+fn check_storage(raw: Option<&std::ffi::OsStr>) -> Result<()> {
+    if let Some(raw) = raw.filter(|raw| !is_blank(raw)) {
+        let path = Path::new(raw);
+        if !path.is_absolute() {
+            return Err(Error::msg(format!(
+                "APP_STORAGE_PATH には絶対パスを指定してください（いまの値: {}）",
+                path.display()
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// 基準ディレクトリからの相対パスを絶対パスにする。
+pub fn app_path(relative: impl AsRef<Path>) -> PathBuf {
+    base_path().join(relative)
+}
+
+/// `public/` の中のパス。
+///
+/// **場所は変えられません。** リリースビルドではバイナリに埋め込むためです。
+pub fn public_path(relative: impl AsRef<Path>) -> PathBuf {
+    app_path("public").join(relative)
+}
+
+/// `storage/` の中のパス。
+///
+/// `APP_STORAGE_PATH`（絶対パス）で場所を変えられます。
+/// プロセスを2つ以上動かすときは、全プロセスで同じ場所を指してください。
+///
+/// **場所は最初に呼んだときに決まり、以後は変わりません。** 起動（`bengara::run()`）と
+/// `#[bengara::test]` は `.env` を読んでから呼ぶので、`.env` の `APP_STORAGE_PATH` も効きます。
+/// `#[bengara::test]` の付かないテストから先に呼ぶと、`.env` を読む前の場所に決まります。
+/// そのときは `.env` を読んだときに警告のログを出します。
+pub fn storage_path(relative: impl AsRef<Path>) -> PathBuf {
+    storage_root().join(relative)
+}
+
+/// `storage/` そのもの。
+pub(crate) fn storage_root() -> &'static Path {
+    STORAGE
+        .get_or_init(|| storage_from(set_var_os("APP_STORAGE_PATH")))
+        .as_path()
+}
+
+/// `APP_STORAGE_PATH` の値から `storage/` の場所を決める。
+fn storage_from(raw: Option<std::ffi::OsString>) -> PathBuf {
+    match raw {
+        // 相対パスは guard_storage() が止めるので、ここでは絶対パスだけを見る。
+        Some(raw) if Path::new(&raw).is_absolute() => PathBuf::from(raw),
+        _ => app_path("storage"),
+    }
+}
+
+/// `.env` を読んだ後に呼ぶ。`storage/` の場所が `.env` を読む前に決まっていて、
+/// いまの `APP_STORAGE_PATH` と食い違うなら、知らせる文を返す。
+///
+/// 場所は `OnceLock` で固定しているので、後から直せません。止めもしません
+/// （テストのバイナリで起きる形なので、起動を止めるほどではない）。黙って
+/// 違う場所に書かないよう、気づけるようにだけします。
+pub(crate) fn storage_frozen_warning() -> Option<String> {
+    let frozen = STORAGE.get()?;
+    frozen_storage_message(frozen, &storage_from(set_var_os("APP_STORAGE_PATH")))
+}
+
+/// 決まった場所といまの指定が違うときの文。同じなら `None`。
+fn frozen_storage_message(frozen: &Path, now: &Path) -> Option<String> {
+    (frozen != now).then(|| {
+        format!(
+            "storage/ の場所は .env を読む前に {} に決まっていたので、.env の APP_STORAGE_PATH（{}）は効きません。\
+             `#[bengara::test]` の付かないテストで storage_path() などを先に呼んでいないか確かめてください",
+            frozen.display(),
+            now.display()
+        )
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn 目印があるディレクトリを見分ける() {
+        let dir = std::env::temp_dir().join("bengara_paths_marker");
+        let _ = std::fs::create_dir_all(&dir);
+        assert!(!has_marker(&dir), "空のディレクトリは目印なし");
+
+        let _ = std::fs::write(dir.join(".env"), "");
+        assert!(has_marker(&dir), ".env があれば目印あり");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn storageを目印にできる() {
+        let dir = std::env::temp_dir().join("bengara_paths_marker2");
+        let _ = std::fs::create_dir_all(dir.join("storage"));
+        assert!(has_marker(&dir));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn 決め方の言い方がある() {
+        // ログに出るので、空にならないことだけ確かめる。
+        for source in [
+            Source::Explicit,
+            Source::Cargo,
+            Source::Exe,
+            Source::Current,
+            Source::Unknown,
+        ] {
+            assert!(!source.label().is_empty());
+        }
+    }
+
+    #[test]
+    fn テストではcargo経由で決まる() {
+        // cargo test は CARGO_MANIFEST_DIR を渡すので、必ず決まる。
+        assert!(guard().is_ok());
+        assert_eq!(base_source(), Source::Cargo);
+        assert!(base_path().is_absolute());
+    }
+
+    #[test]
+    fn storageは基準の下に来る() {
+        // このテストでは APP_STORAGE_PATH を指定していない。
+        assert_eq!(storage_root(), app_path("storage"));
+        assert_eq!(storage_path("logs"), app_path("storage").join("logs"));
+    }
+
+    #[test]
+    fn 無いapp_base_pathは直し方を添えて断る() {
+        // 実際の環境変数は触らずに、エラー文だけを確かめる（resolve は1回しか走らない）。
+        let missing = std::env::temp_dir().join("bengara_paths_absent");
+        let _ = std::fs::remove_dir_all(&missing);
+        assert!(!missing.is_dir());
+
+        let text = explicit_missing_message(&missing);
+        assert!(text.contains("APP_BASE_PATH"), "{text}");
+        assert!(text.contains("場所がありません"), "{text}");
+        assert!(text.contains("直し方"), "{text}");
+        assert!(text.contains(&missing.display().to_string()), "{text}");
+    }
+
+    #[test]
+    fn 相対のstorageは断る() {
+        use std::ffi::OsStr;
+
+        // 実際の環境変数は触らずに、判定だけを確かめる。
+        // 以前は「指定が無ければ通る」しか見ておらず、断る枝を通していなかった。
+        for relative in ["storage", "./storage", "../shared/storage"] {
+            let error = check_storage(Some(OsStr::new(relative)))
+                .expect_err("相対パスは断る")
+                .to_string();
+            assert!(error.contains("APP_STORAGE_PATH"), "{error}");
+            assert!(error.contains("絶対パス"), "{error}");
+            assert!(error.contains(relative), "いまの値を添える: {error}");
+        }
+
+        // 絶対パスと、指定なしは通る。
+        let absolute = std::env::temp_dir().join("bengara_paths_storage");
+        assert!(absolute.is_absolute());
+        assert!(check_storage(Some(absolute.as_os_str())).is_ok());
+        assert!(check_storage(None).is_ok(), "指定が無ければ通る");
+        // `.env` の `APP_STORAGE_PATH=` は空の環境変数になる。指定なしと同じに扱う。
+        for blank in ["", " ", "\t"] {
+            assert!(check_storage(Some(OsStr::new(blank))).is_ok(), "{blank:?}");
+        }
+        // このテストでは APP_STORAGE_PATH を指定していない。
+        assert!(guard_storage().is_ok());
+    }
+
+    #[test]
+    fn env前に決まったstorageの食い違いを知らせる() {
+        // 以前は黙って `.env` の APP_STORAGE_PATH を無視していた。
+        let frozen = Path::new("/srv/app/storage");
+        assert_eq!(frozen_storage_message(frozen, frozen), None);
+        let text = frozen_storage_message(frozen, Path::new("/data/storage")).unwrap();
+        assert!(text.contains("/srv/app/storage"), "{text}");
+        assert!(text.contains("/data/storage"), "{text}");
+        assert!(text.contains("APP_STORAGE_PATH"), "{text}");
+        // このテストのプロセスでは食い違わない（APP_STORAGE_PATH を指定していない）。
+        let _ = storage_root();
+        assert_eq!(storage_frozen_warning(), None);
+    }
+
+    #[test]
+    fn storageの場所は絶対パスの指定だけを採る() {
+        use std::ffi::OsString;
+
+        let absolute = std::env::temp_dir().join("bengara_paths_from");
+        assert_eq!(storage_from(Some(absolute.clone().into())), absolute);
+        assert_eq!(storage_from(None), app_path("storage"));
+        assert_eq!(
+            storage_from(Some(OsString::from("relative"))),
+            app_path("storage")
+        );
+    }
+
+    #[test]
+    fn 空の値は指定なしと見る() {
+        use std::ffi::OsStr;
+
+        assert!(is_blank(OsStr::new("")));
+        assert!(is_blank(OsStr::new("  ")));
+        assert!(is_blank(OsStr::new("\t\n")));
+        assert!(!is_blank(OsStr::new("/srv/app")));
+        assert!(!is_blank(OsStr::new(" storage ")));
+    }
+
+    #[test]
+    fn storage_initの案内は本番の打ち方も添える() {
+        // 本番に cargo は無い。`cargo artisan` だけを書くと、その場で詰まる。
+        assert!(STORAGE_INIT_HINT.starts_with("storage:init"));
+        assert!(STORAGE_INIT_HINT.contains("cargo artisan storage:init"));
+        assert!(STORAGE_INIT_HINT.contains("./<実行ファイル> storage:init"));
+    }
+
+    #[test]
+    fn storageが無いときの案内はどこでも同じ文になる() {
+        // セッションとスケジュールは「デプロイのときに storage/ を作ってください」
+        // だけで、何を実行すればよいかが分からなかった。起動時の案内・`Storage`・
+        // キャッシュと同じ文を、この 1 つの関数から出す。
+        let text = missing_storage_message(Path::new("/srv/app/storage"));
+        assert!(text.contains("storage がありません"), "{text}");
+        assert!(text.contains(STORAGE_INIT_HINT), "{text}");
+        assert!(text.ends_with("を実行してください"), "{text}");
+        assert!(!text.contains("デプロイのときに"), "{text}");
+    }
+}

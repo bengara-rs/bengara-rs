@@ -1,0 +1,12 @@
+# English strings. Loaded at build time.
+
+[messages]
+welcome = "Welcome"
+greeting = "Hello, :name"
+goodbye = "Goodbye"
+# Two names where one is a prefix of the other (`:name` and `:name_kanji`).
+name_both = ":name (:name_kanji)"
+
+[posts]
+created = "The post was created"
+not_found = "No such post"

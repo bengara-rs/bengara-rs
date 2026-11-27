@@ -1,0 +1,187 @@
+[package]
+name = "bengara"
+description = "Laravel の構成とそのままの書き味で使える Rust 製 Web アプリケーションフレームワーク"
+keywords = ["web", "framework", "laravel", "http"]
+categories = ["web-programming::http-server"]
+readme = "../../README.md"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[features]
+default = ["log-filter"]
+# RUST_LOG による細かい絞り込み（`RUST_LOG=myapp=debug` のような書き方）。
+# 外すと依存クレートが3つ減り（matchers / regex-automata / regex-syntax）、
+# RUST_LOG は trace/debug/info/warn/error/off の1語だけになる。
+log-filter = ["tracing-subscriber/env-filter"]
+
+# データベース。既定では入りません。使うドライバを利用者が選びます。
+#   bengara = { version = "0.1.0-alpha.1", features = ["sqlite"] }
+# フラグが無いときも database モジュールはコンパイルされ、実際に接続しようとした
+# ときだけ「features に "sqlite" を足してください」というエラーになります。
+sqlite = ["database", "sqlx/sqlite"]
+# MySQL と MariaDB。同じドライバで両方につながります。
+# 日付の列を読むために sqlx/time、JSON の列のために sqlx/json を使います。
+# どちらも bengara の公開 API には出ません（database/mysql.rs の中だけ）。
+mysql = ["database", "sqlx/mysql", "sqlx/time", "sqlx/json", "tls"]
+# MariaDB は mysql と同じものです。名前で探した人が見つけられるように置いてあります。
+mariadb = ["mysql"]
+# PostgreSQL。
+# numeric（`t.decimal()` が作る列）を桁を落とさずに読むため sqlx/bigdecimal を使います。
+# MySQL は numeric を文字列で送ってくるので、そちらでは要りません。
+postgres = [
+    "database",
+    "sqlx/postgres",
+    "sqlx/time",
+    "sqlx/json",
+    "sqlx/bigdecimal",
+    "tls",
+]
+# ドライバ共通の土台。単体では指定しません。
+# 依存は `dep:` で書きます。書かないと `sqlx` という名前のフラグが外から選べてしまい、
+# `features = ["sqlx"]` がドライバ無しで通ります（encryption と mail も同じ）。
+database = ["dep:sqlx"]
+# ネットワーク越しの接続を暗号化する。mysql と postgres が内側で付けます。
+# 単体では指定しません。rustls と webpki-roots を使うので、OS の証明書置き場に
+# 依存しません（ビルドには C コンパイラが要ります）。
+# `sqlx?/` と書くのは、tls だけを選んだときに sqlx を引き込まないためです
+# （`?` が無いと、sqlx が入っていなくても入れてしまいます）。
+tls = ["sqlx?/tls-rustls-ring-webpki"]
+
+# 暗号化（encrypt / decrypt）。既定では入りません。
+# 署名（SHA-256 / HMAC）は自前なのでフラグは要りませんが、
+# 暗号は実績のあるクレートに任せます（判断 30）。
+encryption = ["dep:chacha20poly1305"]
+
+# パスワードを Argon2id で作る。既定では入りません。
+# 方式は HASH_DRIVER=argon2id で選びます。フラグが無いときは PBKDF2 のままです。
+# 暗号なので実績のあるクレートに任せます（判断 30 と同じ考え方）。
+argon2 = ["dep:argon2"]
+
+# Laravel（PHP の `password_hash`）で作った bcrypt（`$2y$`）の値を照合する。既定では入りません。
+# **照合だけです。作りません。** ログインのついでに HASH_DRIVER の方式で作り直します。
+# フラグが無いときは偽になり、ログで「features に "bcrypt" を足すと照合できます」と案内します。
+# 暗号（Blowfish）は実績のあるクレートに任せ、値の読み取りと手順は自前です（判断 30 と同じ考え方）。
+bcrypt = ["dep:blowfish"]
+
+# SMTP でメールを送る。既定では入りません。
+# フラグが無いときも mail モジュールはコンパイルされ、MAIL_MAILER=smtp に
+# したときだけ「features に "mail" を足してください」というエラーになります。
+mail = ["dep:lettre"]
+
+# WebSocket（`req.websocket()` で切り替える受け口）。既定では入りません。
+# フラグが無いときも websocket / broadcast モジュールはコンパイルされ、
+# `req.websocket()` を呼んだときだけ「features に "websocket" を足してください」
+# というエラーになります。`Broadcast::publish` はフラグが無くても呼べます。
+# フレームの処理は tokio-tungstenite に任せます（判断 10）。
+websocket = ["dep:tokio-tungstenite", "dep:hyper", "dep:hyper-util", "dep:futures-util"]
+
+# テンプレート（resources/views/*.html）。既定では入りません。
+# 書き方は Jinja 系（minijinja）です。Blade の構文ではありません。
+# フラグが無いときも view などの関数はあり、呼ぶと「features に "view" を足してください」の
+# エラーになります。
+view = ["dep:minijinja"]
+
+# CPU・メモリー・ディスクの空きをメトリクスに足す。既定では入りません。
+# 依存の木にすでにある libc と windows-sys を直接使うだけで、クレートは増えません。
+metrics-system = ["dep:libc", "dep:windows-sys"]
+
+[dependencies]
+bengara-macros = { workspace = true }
+axum = { version = "0.8", default-features = false, features = ["http1", "tokio"] }
+matchit = "0.8"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = [
+    "rt-multi-thread",
+    "macros",
+    "io-util", # 外部コマンドの標準入力へ書く（`Process::input`）
+    "net",
+    "process", # 外部コマンドの起動と待ち合わせ（`Process`）。打ち切ると止められる
+    "signal",
+    "sync", # 停止の合図を伝える watch チャネル
+    "time", # 停止の上限時間
+] }
+tracing = "0.1"
+# ログの行は自前の層（logging/layer.rs）で組み立てるので、`fmt` と `ansi` は使いません。
+tracing-subscriber = { version = "0.3", default-features = false, features = ["registry", "std"] }
+getrandom = { version = "0.4.3", features = ["std"] }
+sqlx = { version = "0.8", default-features = false, features = [
+    "runtime-tokio",
+], optional = true }
+chacha20poly1305 = { version = "0.10", default-features = false, features = [
+    "alloc",
+], optional = true }
+# パスワードの Argon2id。既定の機能（alloc・getrandom・password-hash）をそのまま使います。
+# getrandom は bengara が使っているものと同じ 0.4 系です。
+argon2 = { version = "0.6", optional = true }
+# bcrypt の照合。Blowfish の鍵の準備（bcrypt 用の口）だけを使います。
+# 値の読み取り・72 バイトの切り詰め・回す回数は auth/hashing.rs で書きます。
+blowfish = { version = "0.10", features = ["bcrypt"], optional = true }
+# メール。待つ形（同期）の送り口だけを使います。
+# bengara は `Mailer::send` を `spawn_blocking` の中で呼ぶので、
+# tokio 向けの送り口（tokio1-rustls-tls）は要りません。依存も少なくなります。
+lettre = { version = "0.11", default-features = false, features = [
+    "builder", # 文面の組み立て
+    "smtp-transport", # SMTP
+    "rustls-tls", # TLS は rustls + webpki-roots（OS の証明書置き場に依存しない）
+    "pool", # つなぎっぱなしにして TLS の握り直しを減らす
+], optional = true }
+# WebSocket。フレームの処理（マスク・断片・制御フレーム・Close の手順）だけを使います。
+# TLS は前段のプロキシが終端するので入れません。圧縮も使いません。
+# 切り替えの鍵（Sec-WebSocket-Accept）を作るために handshake を入れます。
+tokio-tungstenite = { version = "0.30", default-features = false, features = [
+    "handshake",
+], optional = true }
+# 切り替えの口（`hyper::upgrade::OnUpgrade`）を受け取るため。axum が使う hyper と同じものです。
+hyper = { version = "1.11", default-features = false, features = [
+    "http1",
+], optional = true }
+# 切り替えた後のソケットを tokio の読み書きの形に包む（`TokioIo`）。
+hyper-util = { version = "0.1.21", default-features = false, features = [
+    "tokio",
+], optional = true }
+# tokio-tungstenite の読み書き（Stream / Sink）を使うため。
+futures-util = { version = "0.3.34", default-features = false, features = [
+    "sink",
+    "std",
+], optional = true }
+# テンプレート。継承（extends / block）・include・マクロ・serde の値を使います。
+# minijinja の型は公開 API に出しません（view.rs の中だけ）。
+minijinja = { version = "3.1", default-features = false, features = [
+    "builtins",
+    "macros",
+    "multi_template",
+    "serde",
+], optional = true }
+
+[target.'cfg(unix)'.dependencies]
+# メトリクスの OS の数（機能フラグ metrics-system）。依存の木にすでにある版です。
+libc = { version = "0.2", optional = true }
+
+[target.'cfg(windows)'.dependencies]
+# メトリクスの OS の数（機能フラグ metrics-system）。依存の木にすでにある版です。
+windows-sys = { version = "0.61", optional = true, features = [
+    "Win32_Foundation",
+    "Win32_Storage_FileSystem",
+    "Win32_System_ProcessStatus",
+    "Win32_System_Threading",
+] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+# WebSocket の実ソケットのテストで、相手（クライアント）として使う。
+tokio-tungstenite = { version = "0.30", default-features = false, features = [
+    "connect",
+] }
+
+# docs.rs では、つなげるドライバとメールと WebSocket と Argon2id と bcrypt とテンプレートを入れた状態で説明を出す。
+[package.metadata.docs.rs]
+features = ["sqlite", "mysql", "postgres", "encryption", "argon2", "bcrypt", "mail", "websocket", "view", "metrics-system"]
+
+[lints.rust]
+# `cargo fuzz` が付ける cfg（ファジングのための口）。clippy の警告で落ちないように知らせておく。
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(fuzzing)'] }
