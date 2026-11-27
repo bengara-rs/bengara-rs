@@ -82,7 +82,7 @@ pub use http::{
     RouteGroup, SameSite, Throttle,
 };
 pub use http::{CorsConfig, HandleCors};
-pub use lang::{Lang, LangTable, __with, __};
+pub use lang::{__with, Lang, LangTable, __};
 pub use mail::{Mail, MailConfig, Mailer, Message};
 pub use paths::{app_path, base_path, public_path, storage_path};
 pub use queue::{Job, JobFuture, Queue, QueueConfig};
@@ -257,7 +257,7 @@ pub mod prelude {
     pub use crate::cache::{Cache, CacheConfig, CacheStore};
     pub use crate::console::Command;
     pub use crate::events::{Event, Events};
-    pub use crate::lang::{Lang, __with, __};
+    pub use crate::lang::{__with, Lang, __};
     pub use crate::mail::{Mail, MailConfig, Message};
     pub use crate::queue::{Job, Queue};
     pub use crate::schedule::{Every, Schedule, Task};
