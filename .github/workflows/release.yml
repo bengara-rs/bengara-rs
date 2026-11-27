@@ -1,10 +1,13 @@
 name: Release
 
-# main に push したら crates.io に出す。
+# main の CI（ci.yml）が通ったら crates.io に出す。
+# 検査は CI に任せ、ここでは繰り返さない。CI が落ちたら出さない。
 # workspace の version（Cargo.toml）が crates.io にまだ無いクレートだけを出す。
 # 版を上げずに push したときは、何も出さずに終わる。
 on:
-  push:
+  workflow_run:
+    workflows: [ CI ]
+    types: [ completed ]
     branches: [ main ]
   workflow_dispatch:
 
@@ -14,7 +17,7 @@ env:
 permissions:
   contents: read
 
-# 出している途中で次の push が来ても、止めずに順に流す。
+# 出している途中で次の合図が来ても、止めずに順に流す。
 concurrency:
   group: release
   cancel-in-progress: false
@@ -22,17 +25,17 @@ concurrency:
 jobs:
   publish:
     name: publish
+    # 手で流したとき（main を選んだとき）か、main への push の CI が通ったときだけ。
+    if: >-
+      (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main') ||
+      (github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event == 'push')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
         with:
-          components: rustfmt, clippy
-      - uses: Swatinem/rust-cache@v2
-      # 出す前に、最低限の検査をもう一度通す（ci.yml の check と同じ）。
-      - run: cargo fmt --all --check
-      - run: cargo clippy --workspace --all-targets -- -D warnings
-      - run: cargo test --workspace
+          # CI が検査したコミットを出す（手で流したときは main の先頭）。
+          ref: ${{ github.event.workflow_run.head_sha || github.sha }}
+      - uses: dtolnay/rust-toolchain@stable
       - name: crates.io に出す
         shell: bash
         env:

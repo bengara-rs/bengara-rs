@@ -6,7 +6,10 @@ name: Fuzz
 on:
   push:
     branches: [ main, develop ]
+    # 文書だけの変更では動かさない。
+    paths-ignore: [ "**.md", "docs/**", "LICENSE-*" ]
   pull_request:
+    paths-ignore: [ "**.md", "docs/**", "LICENSE-*" ]
   schedule:
     # 週 1 回（水曜の UTC 5 時 41 分）。
     - cron: "41 5 * * 3"
@@ -17,6 +20,12 @@ env:
 
 permissions:
   contents: read
+
+# 同じブランチに続けて push したら、前の実行を止める。
+# 週 1 回の長い実行は、手で流したもの（workflow_dispatch）と重なっても止めない。
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}-${{ github.event_name }}
+  cancel-in-progress: ${{ github.event_name == 'push' || github.event_name == 'pull_request' }}
 
 jobs:
   build:

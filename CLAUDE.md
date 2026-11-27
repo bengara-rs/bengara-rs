@@ -68,7 +68,8 @@ cargo audit        # 無視するものは .cargo/audit.toml（deny.toml とそ�
 
 crates.io への公開（`.github/workflows/release.yml`）：
 
-- `main` に push すると、workspace の version が crates.io にまだ無いクレートだけを出す。
+- `main` に push し、その CI（`ci.yml`）が通ると、workspace の version が crates.io にまだ無いクレートだけを出す。
+  検査は CI に任せ、`release.yml` では繰り返さない。
   順は `bengara-macros` → `bengara-build` → `bengara`。
 - 版を上げずに push したときは何も出さない。出したい変更は、先に version と `CHANGELOG.md` を上げる。
 - 一度出した版は消せない（取り下げ＝yank だけ）。

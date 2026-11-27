@@ -3,10 +3,19 @@ name: CI
 on:
   push:
     branches: [ main, develop ]
+    # 文書だけの変更では動かさない（テストは .md を読まない）。
+    paths-ignore: [ "**.md", "docs/**", "LICENSE-*" ]
   pull_request:
+    paths-ignore: [ "**.md", "docs/**", "LICENSE-*" ]
 
 env:
   CARGO_TERM_COLOR: always
+
+# 同じブランチに続けて push したら、前の実行を止める。
+# main は止めない（release.yml が、main の CI が通ったのを合図に出すため）。
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 jobs:
   # フレームワーク単体の検査。

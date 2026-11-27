@@ -5,7 +5,10 @@ name: CodeQL
 on:
   push:
     branches: [ main, develop ]
+    # 文書だけの変更では動かさない。
+    paths-ignore: [ "**.md", "docs/**", "LICENSE-*" ]
   pull_request:
+    paths-ignore: [ "**.md", "docs/**", "LICENSE-*" ]
   schedule:
     # 週 1 回（月曜の UTC 4 時 23 分）。
     - cron: "23 4 * * 1"
@@ -14,6 +17,11 @@ permissions:
   contents: read
   security-events: write
   actions: read
+
+# 同じブランチに続けて push したら、前の実行を止める。
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   analyze:
