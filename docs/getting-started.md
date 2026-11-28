@@ -9,22 +9,21 @@
 cargo new myapp && cd myapp
 ```
 
-**crates.io には公開していません。** そのため `cargo add bengara` は失敗します。
-`Cargo.toml` に依存の行を手で書き、取得したソースを `[patch.crates-io]` で指します。
+bengara を依存に足します。[crates.io](https://crates.io/crates/bengara) から取得します。
+
+```sh
+cargo add bengara@0.1.0-alpha.1 --features sqlite
+```
+
+`Cargo.toml` に次の行が入ります。手で書いても同じです。
 
 ```toml
 [dependencies]
 bengara = { version = "0.1.0-alpha.1", features = ["sqlite"] }
-
-# 取得したソースの場所を書く（下は myapp の隣に置いた例）
-[patch.crates-io]
-bengara = { path = "../bengara-rs/crates/bengara" }
-bengara-build = { path = "../bengara-rs/crates/bengara-build" }
-bengara-macros = { path = "../bengara-rs/crates/bengara-macros" }
 ```
 
+- いまの版は試験版です。版はそのまま書きます（[releases.md](releases.md#試験版alpha)）。
 - `bengara-build` は、手順 3 の `init` が `[build-dependencies]` に足します。
-- それまでは「使われていない patch」の警告が出ます。そのままで構いません。
 
 `features`（機能フラグ）は、使うものに合わせて選びます。データベースを使わないなら書きません。
 

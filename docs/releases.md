@@ -3,7 +3,8 @@
 bengara の版の付け方と、版を上げても壊さないと約束する範囲です。Laravel の「Release Notes」に当たります。
 
 - 変更の中身は [CHANGELOG.md](../CHANGELOG.md) にあります。
-- 版の番号は 0.1.0-alpha.1 です。crates.io には出していません（[README](../README.md#動かす)）。
+- いまの版は 0.1.0-alpha.1 です。[crates.io](https://crates.io/crates/bengara) に出しています。
+- 出すクレートは `bengara`・`bengara-build`・`bengara-macros` の 3 つです。いつも同じ版で出します。
 
 ## 版の付け方
 
