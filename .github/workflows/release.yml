@@ -39,10 +39,11 @@ jobs:
       - name: crates.io に出す
         shell: bash
         env:
-          CARGO_TOKEN: ${{ secrets.CARGO_TOKEN }}
+          # cargo publish はこの名前の環境変数を読む。secrets も同じ名前にそろえる。
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
         run: |
-          if [ -z "$CARGO_TOKEN" ]; then
-            echo "secrets.CARGO_TOKEN がありません"
+          if [ -z "$CARGO_REGISTRY_TOKEN" ]; then
+            echo "secrets.CARGO_REGISTRY_TOKEN がありません"
             exit 1
           fi
           version=$(cargo metadata --no-deps --format-version 1 \
