@@ -8,7 +8,9 @@ bengara の、利用者に見える変更を書きます。
 
 ## [Unreleased]
 
-公開した版はまだありません。最初の版（0.1.0-alpha.1。試験版）には、主に次のものが入ります。
+## [0.1.0-alpha.1] - 2026-11-28
+
+最初の版です（試験版）。`bengara`・`bengara-build`・`bengara-macros` を crates.io に出しました。主に次のものが入ります。
 
 - Laravel と同じディレクトリ構成。`build.rs` がファイルを見つけて取り込むので、`mod`
   を書き並べない（[directory-structure.md](docs/directory-structure.md)）
@@ -18,21 +20,15 @@ bengara の、利用者に見える変更を書きます。
   など）と自分のコマンド（[artisan.md](docs/artisan.md)）
 - ルート・ミドルウェア・回数の制限・CORS・署名付き
   URL（[routing.md](docs/routing.md)・[middleware.md](docs/middleware.md)）
--
-
-リクエストとレスポンス、ファイルのアップロード、少しずつ読む本文（[requests-and-responses.md](docs/requests-and-responses.md)）
-
+- リクエストとレスポンス、ファイルのアップロード、少しずつ読む本文（[requests-and-responses.md](docs/requests-and-responses.md)）
 - 入力の検査（Laravel と同じ規則の文字列、`rules!`、`FormRequest`）（[validation.md](docs/validation.md)）
 - セッション・CSRF（[session.md](docs/session.md)）
 - 認証・認可・パスワードの再設定・API のトークン（Sanctum
   と同じ形）（[authentication.md](docs/authentication.md)・[authorization.md](docs/authorization.md)）
 - SQLite / MySQL / MariaDB /
   PostgreSQL、クエリビルダ、モデル、マイグレーション、シーダー（[database.md](docs/database.md)・[models.md](docs/models.md)・[migrations.md](docs/migrations.md)）
--
-
-キャッシュ・ファイルの置き場所・キュー・定期処理・イベント・メール・外部コマンド・多言語（[docs/README.md](docs/README.md)
-の「周辺の機能」）
-
+- キャッシュ・ファイルの置き場所・キュー・定期処理・イベント・メール・外部コマンド・多言語（[docs/README.md](docs/README.md)
+  の「周辺の機能」）
 - WebSocket とチャンネルへの配信（機能フラグ `websocket`）（[websocket.md](docs/websocket.md)）
 - テンプレート（機能フラグ `view`。Jinja 系）（[views.md](docs/views.md)）
 - テストの道具（`#[bengara::test]`・テスト用のクライアント・データベースの作り直し）（[testing.md](docs/testing.md)）

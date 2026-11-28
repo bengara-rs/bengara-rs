@@ -26,21 +26,18 @@ Laravel と同じディレクトリ構成で、Web アプリを Rust で書け�
 
 ## 動かす
 
-**crates.io には公開していません。** ソースを取得して、`Cargo.toml` から指します。
+[crates.io](https://crates.io/crates/bengara) に公開しています。いまの版は試験版の 0.1.0-alpha.1 です。
 
 ```sh
 cargo new myapp && cd myapp
+cargo add bengara@0.1.0-alpha.1 --features sqlite
 ```
 
+`Cargo.toml` に次の行が入ります。手で書いても同じです。
+
 ```toml
-# Cargo.toml に足す（ソースを myapp の隣に置いた例）
 [dependencies]
 bengara = { version = "0.1.0-alpha.1", features = ["sqlite"] }
-
-[patch.crates-io]
-bengara = { path = "../bengara-rs/crates/bengara" }
-bengara-build = { path = "../bengara-rs/crates/bengara-build" }
-bengara-macros = { path = "../bengara-rs/crates/bengara-macros" }
 ```
 
 `src/main.rs` の中身を、次の 1 行だけにします。`init` を動かすための仮の入口です。
